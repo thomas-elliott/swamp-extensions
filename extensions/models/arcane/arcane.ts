@@ -1,8 +1,14 @@
-// deno-lint-ignore-file no-explicit-any -- method execute() params are typed
-// `any` to avoid TS7006 when arcane_test.ts imports the model source directly
-// (see swamp-extension typing.md). Return types stay explicit; adopting
-// `satisfies ModelDefinition<...>` for full param narrowing is a tracked follow-up.
 import { z } from "npm:zod@4";
+// Type-only imports — erased at compile time, never bundled. They anchor the
+// `satisfies ModelDefinition<typeof GlobalArgs>` clause on `model` (and the
+// factory return types) so every method's `execute` is contextually typed
+// without an explicit `any` on its parameters. See swamp-extension typing.md.
+import type {
+  DataHandle,
+  MethodContext,
+  MethodDefinition,
+  ModelDefinition,
+} from "jsr:@systeminit/swamp-testing@0.20260521.16";
 import https from "node:https";
 import http from "node:http";
 import { Buffer } from "node:buffer";
@@ -449,11 +455,11 @@ function slug(s: string): string {
 
 /** Structured info log when a logger is present (no-op otherwise). Never pass secrets. */
 function logInfo(
-  context: any,
+  context: Pick<MethodContext<GlobalArgsT>, "logger">,
   message: string,
   props?: Record<string, unknown>,
 ): void {
-  context?.logger?.info?.(message, props ?? {});
+  context.logger?.info?.(message, props ?? {});
 }
 
 const ENV = (g: GlobalArgsT): string => `/environments/${g.environmentId}`;
@@ -1101,6 +1107,147 @@ async function pollStackRemoved(
   }
 }
 
+// ---------------------------------------------------------------------------
+// Per-method argument schemas.
+//
+// Each method's `arguments` schema is named here so it is the single source of
+// truth: it is referenced both by the method's `arguments:` field and by its
+// `execute` parameter type via `z.infer<typeof ...>`. Swamp validates `args`
+// against the schema before calling `execute`, so the inferred type is an
+// accurate, zero-cost compile-time narrowing of the already-validated input.
+// ---------------------------------------------------------------------------
+
+/** Shared: a single required `name`. */
+const NameArg = z.object({ name: z.string() });
+
+const GitopsSyncEnsureArgs = z.object({
+  prune: z.boolean().default(false).describe(
+    "Delete existing syncs whose name is not in globalArgs.syncs (destructive)",
+  ),
+});
+
+const GitopsSyncTriggerArgs = z.object({
+  names: z.array(z.string()).default([]).describe(
+    "Sync names to trigger; empty means all",
+  ),
+});
+
+const ProjectValidateArgs = z.object({
+  target: z.string().optional().describe(
+    "Label for the result (defaults to composePath or 'inline')",
+  ),
+  composePath: z.string().optional().describe("Path to a local compose file"),
+  composeContent: z.string().optional().describe(
+    "Inline compose content (instead of composePath)",
+  ),
+  envPath: z.string().optional().describe("Path to a local .env file"),
+  envContent: z.string().optional().describe(
+    "Inline .env content (instead of envPath)",
+  ),
+});
+
+const ProjectGetArgs = z.object({
+  name: z.string().describe("Project name"),
+});
+
+const ProjectCreateArgs = z.object({
+  name: z.string().describe("Project name"),
+  composePath: z.string().optional(),
+  composeContent: z.string().optional(),
+  envPath: z.string().optional(),
+  envContent: z.string().optional(),
+  validate: z.boolean().default(true).describe(
+    "Run local compose validation before pushing (fail-closed)",
+  ),
+});
+
+const ProjectUpdateArgs = z.object({
+  name: z.string().describe("Project name"),
+  composePath: z.string().optional(),
+  composeContent: z.string().optional(),
+  envPath: z.string().optional(),
+  envContent: z.string().optional(),
+  validate: z.boolean().default(true),
+});
+
+const ProjectDeployArgs = z.object({
+  name: z.string().describe("Project name"),
+  composePath: z.string().optional().describe(
+    "Direct mode: new compose file to deploy",
+  ),
+  composeContent: z.string().optional().describe(
+    "Direct mode: inline compose content",
+  ),
+  envPath: z.string().optional(),
+  envContent: z.string().optional(),
+  rollback: z.boolean().default(true).describe(
+    "Roll back to prior state on failure (direct mode). false = stop and report, leaving the failed state for inspection.",
+  ),
+  healthTimeoutSec: z.number().int().default(120).describe(
+    "How long to wait for the project to become healthy",
+  ),
+  pollIntervalSec: z.number().int().default(5),
+});
+
+const SwarmServiceForceUpdateArgs = z.object({
+  name: z.string().describe("Swarm service name (e.g. unifi_unifi)"),
+  convergeTimeoutSec: z.number().int().default(180),
+  pollIntervalSec: z.number().int().default(5),
+});
+
+const SwarmStackValidateArgs = z.object({
+  name: z.string().describe("Stack name"),
+  composePath: z.string().optional(),
+  composeContent: z.string().optional(),
+  envPath: z.string().optional(),
+  envContent: z.string().optional(),
+});
+
+const SwarmStackDeployArgs = z.object({
+  name: z.string().describe("Stack name"),
+  composePath: z.string().optional(),
+  composeContent: z.string().optional(),
+  envPath: z.string().optional(),
+  envContent: z.string().optional(),
+  prune: z.boolean().default(false).describe(
+    "Remove services no longer present in the compose file",
+  ),
+  convergeTimeoutSec: z.number().int().default(180),
+  pollIntervalSec: z.number().int().default(5),
+});
+
+const SwarmStackRemoveArgs = z.object({
+  name: z.string(),
+  removeTimeoutSec: z.number().int().default(30).describe(
+    "Max seconds to keep re-issuing DELETE until the stack record 404s",
+  ),
+  pollIntervalSec: z.number().int().default(2),
+});
+
+const SwarmStackTasksArgs = z.object({
+  name: z.string().describe("Stack name"),
+  onlyProblems: z.boolean().default(false).describe(
+    "Emit only tasks whose currentState is rejected/failed/orphaned (the error-bearing ones)",
+  ),
+});
+
+const VolumeRemoveArgs = z.object({
+  name: z.string(),
+  force: z.boolean().default(false).describe(
+    "Force removal even if Docker reports the volume in use (discouraged)",
+  ),
+});
+
+const ImagePruneArgs = z.object({
+  dangling: z.boolean().default(true).describe(
+    "true = only dangling layers (safe); false = all unused images",
+  ),
+});
+
+const LifecycleArgs = z.object({
+  names: z.array(z.string()).min(1).describe("Project names to operate on"),
+});
+
 export const model = {
   type: "@thomas/arcane",
   version: "2026.05.22.1",
@@ -1220,16 +1367,16 @@ export const model = {
         "List Arcane git repository connections (factory: one `repository` per entry, keyed by name)",
       arguments: z.object({}),
       execute: async (
-        _args: unknown,
-        context: any,
-      ): Promise<{ dataHandles: unknown[] }> => {
+        _args,
+        context,
+      ): Promise<{ dataHandles: DataHandle[] }> => {
         const g: GlobalArgsT = context.globalArgs;
         logInfo(context, "Listing Arcane git repositories");
         const rows = coerceList(
           await arcane(g, "GET", "/customize/git-repositories"),
         );
         const observedAt = new Date().toISOString();
-        const handles = [];
+        const handles: DataHandle[] = [];
         for (const r of rows) {
           const name = asString(pick(r, "name")) ?? "unnamed";
           handles.push(
@@ -1257,9 +1404,9 @@ export const model = {
         "Reconcile the git repository connection from globalArgs.repository (create or update). Secrets are sent only when present in the spec.",
       arguments: z.object({}),
       execute: async (
-        _args: unknown,
-        context: any,
-      ): Promise<{ dataHandles: unknown[] }> => {
+        _args,
+        context,
+      ): Promise<{ dataHandles: DataHandle[] }> => {
         const g: GlobalArgsT = context.globalArgs;
         const desired = g.repository;
         if (!desired) {
@@ -1327,16 +1474,16 @@ export const model = {
         "List Arcane GitOps syncs (factory: one `sync` per entry, keyed by name)",
       arguments: z.object({}),
       execute: async (
-        _args: unknown,
-        context: any,
-      ): Promise<{ dataHandles: unknown[] }> => {
+        _args,
+        context,
+      ): Promise<{ dataHandles: DataHandle[] }> => {
         const g: GlobalArgsT = context.globalArgs;
         logInfo(context, "Listing Arcane GitOps syncs");
         const rows = coerceList(
           await arcane(g, "GET", `${ENV(g)}/gitops-syncs`),
         );
         const observedAt = new Date().toISOString();
-        const handles = [];
+        const handles: DataHandle[] = [];
         for (const s of rows) {
           const name = asString(pick(s, "name")) ?? "unnamed";
           const v = syncView(s);
@@ -1369,15 +1516,11 @@ export const model = {
     gitops_sync_ensure: {
       description:
         "Reconcile GitOps syncs from globalArgs.syncs against Arcane (create missing, update drifted). With prune=true, deletes syncs not in the desired list.",
-      arguments: z.object({
-        prune: z.boolean().default(false).describe(
-          "Delete existing syncs whose name is not in globalArgs.syncs (destructive)",
-        ),
-      }),
+      arguments: GitopsSyncEnsureArgs,
       execute: async (
-        args: any,
-        context: any,
-      ): Promise<{ dataHandles: unknown[] }> => {
+        args: z.infer<typeof GitopsSyncEnsureArgs>,
+        context,
+      ): Promise<{ dataHandles: DataHandle[] }> => {
         const g: GlobalArgsT = context.globalArgs;
         logInfo(context, "Reconciling Arcane GitOps syncs", {
           desired: g.syncs.length,
@@ -1390,7 +1533,7 @@ export const model = {
           await arcane(g, "GET", `${ENV(g)}/gitops-syncs`),
         );
         const observedAt = new Date().toISOString();
-        const handles = [];
+        const handles: DataHandle[] = [];
 
         const repoId = (repoName: string | undefined): string => {
           const wanted = repoName ?? g.repository?.name;
@@ -1493,15 +1636,11 @@ export const model = {
     gitops_sync_trigger: {
       description:
         "Trigger a git pull for the named syncs (fan-out). Empty `names` triggers all syncs.",
-      arguments: z.object({
-        names: z.array(z.string()).default([]).describe(
-          "Sync names to trigger; empty means all",
-        ),
-      }),
+      arguments: GitopsSyncTriggerArgs,
       execute: async (
-        args: any,
-        context: any,
-      ): Promise<{ dataHandles: unknown[] }> => {
+        args: z.infer<typeof GitopsSyncTriggerArgs>,
+        context,
+      ): Promise<{ dataHandles: DataHandle[] }> => {
         const g: GlobalArgsT = context.globalArgs;
         logInfo(context, "Triggering Arcane syncs", {
           names: args.names ?? [],
@@ -1521,7 +1660,7 @@ export const model = {
           throw new Error(`sync(s) not found in Arcane: ${missing.join(", ")}`);
         }
         const timestamp = new Date().toISOString();
-        const handles = [];
+        const handles: DataHandle[] = [];
         for (const s of targets) {
           const name = asString(pick(s, "name")) ?? "unnamed";
           const id = asString(pick(s, "id")) ?? "";
@@ -1546,16 +1685,16 @@ export const model = {
         "List Arcane compose projects (factory: one `project` per entry, keyed by name)",
       arguments: z.object({}),
       execute: async (
-        _args: unknown,
-        context: any,
-      ): Promise<{ dataHandles: unknown[] }> => {
+        _args,
+        context,
+      ): Promise<{ dataHandles: DataHandle[] }> => {
         const g: GlobalArgsT = context.globalArgs;
         logInfo(context, "Listing Arcane projects");
         const rows = coerceList(
           await arcane(g, "GET", `${ENV(g)}/projects?limit=-1`),
         );
         const observedAt = new Date().toISOString();
-        const handles = [];
+        const handles: DataHandle[] = [];
         for (const p of rows) {
           const name = asString(pick(p, "name")) ?? "unnamed";
           handles.push(
@@ -1575,25 +1714,11 @@ export const model = {
     project_validate: {
       description:
         "Validate compose content LOCALLY with `docker compose config` (fail-closed, read-only — no Arcane mutation). Takes composePath/envPath or inline composeContent/envContent.",
-      arguments: z.object({
-        target: z.string().optional().describe(
-          "Label for the result (defaults to composePath or 'inline')",
-        ),
-        composePath: z.string().optional().describe(
-          "Path to a local compose file",
-        ),
-        composeContent: z.string().optional().describe(
-          "Inline compose content (instead of composePath)",
-        ),
-        envPath: z.string().optional().describe("Path to a local .env file"),
-        envContent: z.string().optional().describe(
-          "Inline .env content (instead of envPath)",
-        ),
-      }),
+      arguments: ProjectValidateArgs,
       execute: async (
-        args: any,
-        context: any,
-      ): Promise<{ dataHandles: unknown[] }> => {
+        args: z.infer<typeof ProjectValidateArgs>,
+        context,
+      ): Promise<{ dataHandles: DataHandle[] }> => {
         const { composeContent, envContent } = await resolveComposeInput(args);
         const target = args.target ?? args.composePath ?? "inline";
         logInfo(context, "Validating compose content", { target });
@@ -1619,13 +1744,11 @@ export const model = {
     project_get: {
       description:
         "Read a compose project's full detail (compose + env content, status, gitOps mode) into a `project-detail` resource. Used for rollback snapshots.",
-      arguments: z.object({
-        name: z.string().describe("Project name"),
-      }),
+      arguments: ProjectGetArgs,
       execute: async (
-        args: any,
-        context: any,
-      ): Promise<{ dataHandles: unknown[] }> => {
+        args: z.infer<typeof ProjectGetArgs>,
+        context,
+      ): Promise<{ dataHandles: DataHandle[] }> => {
         const g: GlobalArgsT = context.globalArgs;
         const id = await resolveProjectId(g, args.name);
         const d = unwrap(
@@ -1644,20 +1767,11 @@ export const model = {
     project_create: {
       description:
         "Create a compose project in Arcane (direct mode), pushing compose content via the API. Validates locally first (fail-closed unless validate:false).",
-      arguments: z.object({
-        name: z.string().describe("Project name"),
-        composePath: z.string().optional(),
-        composeContent: z.string().optional(),
-        envPath: z.string().optional(),
-        envContent: z.string().optional(),
-        validate: z.boolean().default(true).describe(
-          "Run local compose validation before pushing (fail-closed)",
-        ),
-      }),
+      arguments: ProjectCreateArgs,
       execute: async (
-        args: any,
-        context: any,
-      ): Promise<{ dataHandles: unknown[] }> => {
+        args: z.infer<typeof ProjectCreateArgs>,
+        context,
+      ): Promise<{ dataHandles: DataHandle[] }> => {
         const g: GlobalArgsT = context.globalArgs;
         const { composeContent, envContent } = await resolveComposeInput(args);
         if (args.validate !== false) {
@@ -1684,18 +1798,11 @@ export const model = {
     project_update: {
       description:
         "Update a compose project's content in Arcane (direct mode). Validates locally first (fail-closed unless validate:false). Does NOT redeploy — use project_redeploy or project_deploy.",
-      arguments: z.object({
-        name: z.string().describe("Project name"),
-        composePath: z.string().optional(),
-        composeContent: z.string().optional(),
-        envPath: z.string().optional(),
-        envContent: z.string().optional(),
-        validate: z.boolean().default(true),
-      }),
+      arguments: ProjectUpdateArgs,
       execute: async (
-        args: any,
-        context: any,
-      ): Promise<{ dataHandles: unknown[] }> => {
+        args: z.infer<typeof ProjectUpdateArgs>,
+        context,
+      ): Promise<{ dataHandles: DataHandle[] }> => {
         const g: GlobalArgsT = context.globalArgs;
         const id = await resolveProjectId(g, args.name);
         const { composeContent, envContent } = await resolveComposeInput(args);
@@ -1724,31 +1831,14 @@ export const model = {
         "Validated, mode-aware deploy of a compose project. Snapshots prior state, applies, polls health, and rolls back by default on failure. " +
         "Direct mode: validate -> create/update compose -> redeploy -> on failure re-apply prior content (or destroy a failed first deploy). " +
         "GitOps mode: trigger sync -> redeploy -> on failure report (git revert is left to the user; auto git rollback needs the gitops authoring helpers).",
-      arguments: z.object({
-        name: z.string().describe("Project name"),
-        composePath: z.string().optional().describe(
-          "Direct mode: new compose file to deploy",
-        ),
-        composeContent: z.string().optional().describe(
-          "Direct mode: inline compose content",
-        ),
-        envPath: z.string().optional(),
-        envContent: z.string().optional(),
-        rollback: z.boolean().default(true).describe(
-          "Roll back to prior state on failure (direct mode). false = stop and report, leaving the failed state for inspection.",
-        ),
-        healthTimeoutSec: z.number().int().default(120).describe(
-          "How long to wait for the project to become healthy",
-        ),
-        pollIntervalSec: z.number().int().default(5),
-      }),
+      arguments: ProjectDeployArgs,
       execute: async (
-        args: any,
-        context: any,
-      ): Promise<{ dataHandles: unknown[] }> => {
+        args: z.infer<typeof ProjectDeployArgs>,
+        context,
+      ): Promise<{ dataHandles: DataHandle[] }> => {
         const g: GlobalArgsT = context.globalArgs;
         const name: string = args.name;
-        const handles: unknown[] = [];
+        const handles: DataHandle[] = [];
         const record = async (
           operation: string,
           success: boolean,
@@ -2033,15 +2123,15 @@ export const model = {
         "List swarm services (factory: one `swarm-service` per entry, keyed by name)",
       arguments: z.object({}),
       execute: async (
-        _args: unknown,
-        context: any,
-      ): Promise<{ dataHandles: unknown[] }> => {
+        _args,
+        context,
+      ): Promise<{ dataHandles: DataHandle[] }> => {
         const g: GlobalArgsT = context.globalArgs;
         await ensureSwarmManager(g);
         const rows = coerceList(
           await arcane(g, "GET", `${ENV(g)}/swarm/services?limit=-1`),
         );
-        const handles = [];
+        const handles: DataHandle[] = [];
         for (const r of rows) {
           const res = swarmServiceResource(r, "observed");
           handles.push(
@@ -2059,11 +2149,11 @@ export const model = {
 
     swarm_service_get: {
       description: "Get a single swarm service by name",
-      arguments: z.object({ name: z.string() }),
+      arguments: NameArg,
       execute: async (
-        args: any,
-        context: any,
-      ): Promise<{ dataHandles: unknown[] }> => {
+        args: z.infer<typeof NameArg>,
+        context,
+      ): Promise<{ dataHandles: DataHandle[] }> => {
         const g: GlobalArgsT = context.globalArgs;
         await ensureSwarmManager(g);
         const found = await findSwarmService(g, args.name);
@@ -2081,11 +2171,11 @@ export const model = {
     swarm_service_rollback: {
       description:
         "Roll a swarm service back to its previous spec (Arcane POST .../rollback)",
-      arguments: z.object({ name: z.string() }),
+      arguments: NameArg,
       execute: async (
-        args: any,
-        context: any,
-      ): Promise<{ dataHandles: unknown[] }> => {
+        args: z.infer<typeof NameArg>,
+        context,
+      ): Promise<{ dataHandles: DataHandle[] }> => {
         const g: GlobalArgsT = context.globalArgs;
         await ensureSwarmManager(g);
         const found = await findSwarmService(g, args.name);
@@ -2111,15 +2201,11 @@ export const model = {
     swarm_service_force_update: {
       description:
         "Force-redeploy a swarm service via Arcane (bumps spec.TaskTemplate.ForceUpdate + PUT) — recreates its tasks without changing config. Useful after a dependency (e.g. its DB) becomes ready post-deploy. Polls convergence; throws if it does not converge.",
-      arguments: z.object({
-        name: z.string().describe("Swarm service name (e.g. unifi_unifi)"),
-        convergeTimeoutSec: z.number().int().default(180),
-        pollIntervalSec: z.number().int().default(5),
-      }),
+      arguments: SwarmServiceForceUpdateArgs,
       execute: async (
-        args: any,
-        context: any,
-      ): Promise<{ dataHandles: unknown[] }> => {
+        args: z.infer<typeof SwarmServiceForceUpdateArgs>,
+        context,
+      ): Promise<{ dataHandles: DataHandle[] }> => {
         const g: GlobalArgsT = context.globalArgs;
         await ensureSwarmManager(g);
         const found = await findSwarmService(g, args.name);
@@ -2175,15 +2261,15 @@ export const model = {
         "List swarm stacks (factory: one `swarm-stack` per entry, keyed by name)",
       arguments: z.object({}),
       execute: async (
-        _args: unknown,
-        context: any,
-      ): Promise<{ dataHandles: unknown[] }> => {
+        _args,
+        context,
+      ): Promise<{ dataHandles: DataHandle[] }> => {
         const g: GlobalArgsT = context.globalArgs;
         await ensureSwarmManager(g);
         const rows = coerceList(
           await arcane(g, "GET", `${ENV(g)}/swarm/stacks?limit=-1`),
         );
-        const handles = [];
+        const handles: DataHandle[] = [];
         for (const r of rows) {
           const res = swarmStackResource(r, "observed");
           handles.push(
@@ -2197,11 +2283,11 @@ export const model = {
 
     swarm_stack_get: {
       description: "Get a single swarm stack by name",
-      arguments: z.object({ name: z.string() }),
+      arguments: NameArg,
       execute: async (
-        args: any,
-        context: any,
-      ): Promise<{ dataHandles: unknown[] }> => {
+        args: z.infer<typeof NameArg>,
+        context,
+      ): Promise<{ dataHandles: DataHandle[] }> => {
         const g: GlobalArgsT = context.globalArgs;
         await ensureSwarmManager(g);
         const d = unwrap(
@@ -2225,17 +2311,11 @@ export const model = {
       description:
         "Validate a swarm stack via Arcane's config render (POST /swarm/stacks/config/render). " +
         "Fails closed — any render error (4xx) aborts. Records the rendered services/networks/volumes/secrets/configs + warnings.",
-      arguments: z.object({
-        name: z.string().describe("Stack name"),
-        composePath: z.string().optional(),
-        composeContent: z.string().optional(),
-        envPath: z.string().optional(),
-        envContent: z.string().optional(),
-      }),
+      arguments: SwarmStackValidateArgs,
       execute: async (
-        args: any,
-        context: any,
-      ): Promise<{ dataHandles: unknown[] }> => {
+        args: z.infer<typeof SwarmStackValidateArgs>,
+        context,
+      ): Promise<{ dataHandles: DataHandle[] }> => {
         const g: GlobalArgsT = context.globalArgs;
         await ensureSwarmManager(g);
         const { composeContent, envContent } = await resolveComposeInput(args);
@@ -2277,26 +2357,15 @@ export const model = {
       description:
         "Validated deploy of a swarm stack: render (fail-closed, guardrail #2) -> POST the stack -> poll service convergence. " +
         "Records per-step operation-results + a swarm-stack resource. A non-converging deploy is surfaced (not force-removed, not auto-rolled-back).",
-      arguments: z.object({
-        name: z.string().describe("Stack name"),
-        composePath: z.string().optional(),
-        composeContent: z.string().optional(),
-        envPath: z.string().optional(),
-        envContent: z.string().optional(),
-        prune: z.boolean().default(false).describe(
-          "Remove services no longer present in the compose file",
-        ),
-        convergeTimeoutSec: z.number().int().default(180),
-        pollIntervalSec: z.number().int().default(5),
-      }),
+      arguments: SwarmStackDeployArgs,
       execute: async (
-        args: any,
-        context: any,
-      ): Promise<{ dataHandles: unknown[] }> => {
+        args: z.infer<typeof SwarmStackDeployArgs>,
+        context,
+      ): Promise<{ dataHandles: DataHandle[] }> => {
         const g: GlobalArgsT = context.globalArgs;
         await ensureSwarmManager(g);
         const name: string = args.name;
-        const handles: unknown[] = [];
+        const handles: DataHandle[] = [];
         const record = async (
           operation: string,
           success: boolean,
@@ -2409,17 +2478,11 @@ export const model = {
         "Remove a swarm stack by name (docker stack rm via Arcane) and confirm the stored record is cleared. " +
         "Arcane's first DELETE tears down services but RETAINS the stack record, so this polls GET until 404, re-issuing DELETE until the record is gone (the teardown two-call bug). " +
         "In-use conflicts are surfaced by Arcane, never forced (guardrail #5).",
-      arguments: z.object({
-        name: z.string(),
-        removeTimeoutSec: z.number().int().default(30).describe(
-          "Max seconds to keep re-issuing DELETE until the stack record 404s",
-        ),
-        pollIntervalSec: z.number().int().default(2),
-      }),
+      arguments: SwarmStackRemoveArgs,
       execute: async (
-        args: any,
-        context: any,
-      ): Promise<{ dataHandles: unknown[] }> => {
+        args: z.infer<typeof SwarmStackRemoveArgs>,
+        context,
+      ): Promise<{ dataHandles: DataHandle[] }> => {
         const g: GlobalArgsT = context.globalArgs;
         await ensureSwarmManager(g);
         logInfo(context, "Removing swarm stack", { name: args.name });
@@ -2444,16 +2507,11 @@ export const model = {
       description:
         "List a swarm stack's tasks (factory: one `swarm-task` per task) with per-task currentState + error — the deploy debug view that surfaces rejected/failed reasons (missing bind path, non-zero exit, placement). " +
         "NOTE: Arcane exposes no container/service log endpoint, so crash stderr is NOT available here — use the host's docker logs / a log viewer for that.",
-      arguments: z.object({
-        name: z.string().describe("Stack name"),
-        onlyProblems: z.boolean().default(false).describe(
-          "Emit only tasks whose currentState is rejected/failed/orphaned (the error-bearing ones)",
-        ),
-      }),
+      arguments: SwarmStackTasksArgs,
       execute: async (
-        args: any,
-        context: any,
-      ): Promise<{ dataHandles: unknown[] }> => {
+        args: z.infer<typeof SwarmStackTasksArgs>,
+        context,
+      ): Promise<{ dataHandles: DataHandle[] }> => {
         const g: GlobalArgsT = context.globalArgs;
         await ensureSwarmManager(g);
         const rows = coerceList(
@@ -2466,7 +2524,7 @@ export const model = {
           ),
         );
         const problemStates = ["rejected", "failed", "orphaned"];
-        const handles = [];
+        const handles: DataHandle[] = [];
         for (const r of rows) {
           const res = swarmTaskResource(r);
           if (
@@ -2497,12 +2555,12 @@ export const model = {
         "List docker volumes (factory: one `volume` per entry, keyed by name). Includes `inUse` so orphaned volumes are visible.",
       arguments: z.object({}),
       execute: async (
-        _args: unknown,
-        context: any,
-      ): Promise<{ dataHandles: unknown[] }> => {
+        _args,
+        context,
+      ): Promise<{ dataHandles: DataHandle[] }> => {
         const g: GlobalArgsT = context.globalArgs;
         const rows = coerceList(await arcane(g, "GET", `${ENV(g)}/volumes`));
-        const handles = [];
+        const handles: DataHandle[] = [];
         for (const r of rows) {
           const res = volumeResource(r, "observed");
           handles.push(
@@ -2517,16 +2575,11 @@ export const model = {
     volume_remove: {
       description:
         "Remove a docker volume by name. Idempotent (404 = already gone). An in-use volume returns 409 and is surfaced, NOT forced — unless force:true, which bypasses the in-use guard (discouraged, guardrail #5 — risks data loss).",
-      arguments: z.object({
-        name: z.string(),
-        force: z.boolean().default(false).describe(
-          "Force removal even if Docker reports the volume in use (discouraged)",
-        ),
-      }),
+      arguments: VolumeRemoveArgs,
       execute: async (
-        args: any,
-        context: any,
-      ): Promise<{ dataHandles: unknown[] }> => {
+        args: z.infer<typeof VolumeRemoveArgs>,
+        context,
+      ): Promise<{ dataHandles: DataHandle[] }> => {
         const g: GlobalArgsT = context.globalArgs;
         const q = args.force ? "?force=true" : "";
         logInfo(context, "Removing volume", {
@@ -2569,9 +2622,9 @@ export const model = {
         "Prune UNUSED anonymous docker volumes (Docker default — named volumes are NOT removed). Removes only volumes no container references. For a specific named volume use volume_remove.",
       arguments: z.object({}),
       execute: async (
-        _args: unknown,
-        context: any,
-      ): Promise<{ dataHandles: unknown[] }> => {
+        _args,
+        context,
+      ): Promise<{ dataHandles: DataHandle[] }> => {
         const g: GlobalArgsT = context.globalArgs;
         logInfo(context, "Pruning unused volumes");
         const raw = unwrap(await arcane(g, "POST", `${ENV(g)}/volumes/prune`));
@@ -2593,9 +2646,9 @@ export const model = {
         "Prune unused docker networks (no attached containers). Safe — only removes networks nothing is using.",
       arguments: z.object({}),
       execute: async (
-        _args: unknown,
-        context: any,
-      ): Promise<{ dataHandles: unknown[] }> => {
+        _args,
+        context,
+      ): Promise<{ dataHandles: DataHandle[] }> => {
         const g: GlobalArgsT = context.globalArgs;
         logInfo(context, "Pruning unused networks");
         const raw = unwrap(await arcane(g, "POST", `${ENV(g)}/networks/prune`));
@@ -2615,15 +2668,11 @@ export const model = {
     image_prune: {
       description:
         "Prune unused images. dangling:true (default) removes only dangling layers; dangling:false removes ALL images not referenced by a container.",
-      arguments: z.object({
-        dangling: z.boolean().default(true).describe(
-          "true = only dangling layers (safe); false = all unused images",
-        ),
-      }),
+      arguments: ImagePruneArgs,
       execute: async (
-        args: any,
-        context: any,
-      ): Promise<{ dataHandles: unknown[] }> => {
+        args: z.infer<typeof ImagePruneArgs>,
+        context,
+      ): Promise<{ dataHandles: DataHandle[] }> => {
         const g: GlobalArgsT = context.globalArgs;
         logInfo(context, "Pruning images", { dangling: !!args.dangling });
         const raw = unwrap(
@@ -2644,7 +2693,7 @@ export const model = {
       },
     },
   },
-};
+} satisfies ModelDefinition<typeof GlobalArgs>;
 
 /**
  * Build a fan-out project-lifecycle method. Resolves each name to a project id,
@@ -2656,17 +2705,15 @@ function makeLifecycle(
   httpMethod: HttpMethod,
   suffix: string,
   destructive = false,
-) {
+): MethodDefinition<z.ZodTypeAny, GlobalArgsT> {
   return {
     description:
       `${operation} the named projects (fan-out over a list of project names)`,
-    arguments: z.object({
-      names: z.array(z.string()).min(1).describe("Project names to operate on"),
-    }),
+    arguments: LifecycleArgs,
     execute: async (
-      args: any,
-      context: any,
-    ): Promise<{ dataHandles: unknown[] }> => {
+      args: z.infer<typeof LifecycleArgs>,
+      context,
+    ): Promise<{ dataHandles: DataHandle[] }> => {
       const g: GlobalArgsT = context.globalArgs;
       const names: string[] = args.names;
       if (destructive && names.length === 0) {
@@ -2686,7 +2733,7 @@ function makeLifecycle(
         );
       }
       const timestamp = new Date().toISOString();
-      const handles = [];
+      const handles: DataHandle[] = [];
       for (const name of names) {
         const id = asString(pick(byName.get(name)!, "id")) ?? "";
         const path = `${ENV(g)}/projects/${id}${suffix}`;
@@ -2721,23 +2768,34 @@ function makeLifecycle(
  * Build the CRUD methods for a swarm secret or config (their APIs are symmetric).
  * Rotation is separate (see `makeRotate`) because swarm secrets/configs are immutable.
  */
-function makeSwarmObject(kind: "secret" | "config") {
+function makeSwarmObject(
+  kind: "secret" | "config",
+): Record<string, MethodDefinition<z.ZodTypeAny, GlobalArgsT>> {
   const plural = kind === "secret" ? "secrets" : "configs";
   const resourceName = kind === "secret" ? "swarm-secret" : "swarm-config";
   const base = (g: GlobalArgsT): string => `${ENV(g)}/swarm/${plural}`;
+  const createArgs = z.object({
+    name: z.string().describe(`${kind} name`),
+    value: z.string().meta({ sensitive: true }).describe(
+      "Value — supply via vault: ${{ vault.get(name, key) }}; never inline a secret",
+    ),
+    labels: z.record(z.string(), z.string()).optional().describe(
+      "Optional spec labels",
+    ),
+  });
   return {
     [`${kind}_list`]: {
       description:
         `List swarm ${plural} (factory: one \`${resourceName}\` per entry, keyed by name)`,
       arguments: z.object({}),
       execute: async (
-        _args: unknown,
-        context: any,
-      ): Promise<{ dataHandles: unknown[] }> => {
+        _args,
+        context,
+      ): Promise<{ dataHandles: DataHandle[] }> => {
         const g: GlobalArgsT = context.globalArgs;
         await ensureSwarmManager(g);
         const rows = coerceList(await arcane(g, "GET", base(g)));
-        const handles = [];
+        const handles: DataHandle[] = [];
         for (const r of rows) {
           const res = swarmObjectResource(r, "observed");
           handles.push(
@@ -2750,11 +2808,11 @@ function makeSwarmObject(kind: "secret" | "config") {
     },
     [`${kind}_get`]: {
       description: `Get a single swarm ${kind} by name`,
-      arguments: z.object({ name: z.string() }),
+      arguments: NameArg,
       execute: async (
-        args: any,
-        context: any,
-      ): Promise<{ dataHandles: unknown[] }> => {
+        args: z.infer<typeof NameArg>,
+        context,
+      ): Promise<{ dataHandles: DataHandle[] }> => {
         const g: GlobalArgsT = context.globalArgs;
         await ensureSwarmManager(g);
         const found = await findSwarmObject(g, plural, args.name);
@@ -2772,19 +2830,11 @@ function makeSwarmObject(kind: "secret" | "config") {
       description:
         `Create a swarm ${kind}. The value is supplied via vault (sensitive) and base64-encoded into spec.Data. ` +
         `Swarm ${plural} are immutable — to change a value, use ${kind}_rotate.`,
-      arguments: z.object({
-        name: z.string().describe(`${kind} name`),
-        value: z.string().meta({ sensitive: true }).describe(
-          "Value — supply via vault: ${{ vault.get(name, key) }}; never inline a secret",
-        ),
-        labels: z.record(z.string(), z.string()).optional().describe(
-          "Optional spec labels",
-        ),
-      }),
+      arguments: createArgs,
       execute: async (
-        args: any,
-        context: any,
-      ): Promise<{ dataHandles: unknown[] }> => {
+        args: z.infer<typeof createArgs>,
+        context,
+      ): Promise<{ dataHandles: DataHandle[] }> => {
         const g: GlobalArgsT = context.globalArgs;
         await ensureSwarmManager(g);
         const spec: Json = { Name: args.name, Data: b64(args.value) };
@@ -2805,11 +2855,11 @@ function makeSwarmObject(kind: "secret" | "config") {
     [`${kind}_remove`]: {
       description:
         `Remove a swarm ${kind} by name. Docker blocks removal of an in-use ${kind} (409); that conflict is surfaced, never forced (guardrail #5).`,
-      arguments: z.object({ name: z.string() }),
+      arguments: NameArg,
       execute: async (
-        args: any,
-        context: any,
-      ): Promise<{ dataHandles: unknown[] }> => {
+        args: z.infer<typeof NameArg>,
+        context,
+      ): Promise<{ dataHandles: DataHandle[] }> => {
         const g: GlobalArgsT = context.globalArgs;
         await ensureSwarmManager(g);
         const found = await findSwarmObject(g, plural, args.name);
@@ -2835,39 +2885,42 @@ function makeSwarmObject(kind: "secret" | "config") {
  * same mount path) → wait for convergence → remove v1 (never forced; skipped if the
  * old object is still referenced or `removeOld:false`).
  */
-function makeRotate(kind: "secret" | "config") {
+function makeRotate(
+  kind: "secret" | "config",
+): Record<string, MethodDefinition<z.ZodTypeAny, GlobalArgsT>> {
   const plural = kind === "secret" ? "secrets" : "configs";
   const resourceName = kind === "secret" ? "swarm-secret" : "swarm-config";
+  const rotateArgs = z.object({
+    name: z.string().describe(`Existing ${kind} name to rotate`),
+    value: z.string().meta({ sensitive: true }).describe(
+      "New value — supply via vault",
+    ),
+    newName: z.string().optional().describe(
+      `Name for the new ${kind} version (default: <name>-v<UTC timestamp>)`,
+    ),
+    services: z.array(z.string()).optional().describe(
+      "Service names to re-point (default: every service referencing the old name)",
+    ),
+    removeOld: z.boolean().default(true).describe(
+      `Remove the old ${kind} after successful convergence`,
+    ),
+    healthTimeoutSec: z.number().int().default(180),
+    pollIntervalSec: z.number().int().default(5),
+  });
   return {
     [`${kind}_rotate`]: {
       description:
         `Rotate a swarm ${kind} (they are immutable). Creates a new version, re-points referencing ` +
         `services to it (same mount path), waits for convergence, then removes the old ${kind} ` +
         `(unless still referenced or removeOld:false). Never forces an in-use removal.`,
-      arguments: z.object({
-        name: z.string().describe(`Existing ${kind} name to rotate`),
-        value: z.string().meta({ sensitive: true }).describe(
-          "New value — supply via vault",
-        ),
-        newName: z.string().optional().describe(
-          `Name for the new ${kind} version (default: <name>-v<UTC timestamp>)`,
-        ),
-        services: z.array(z.string()).optional().describe(
-          "Service names to re-point (default: every service referencing the old name)",
-        ),
-        removeOld: z.boolean().default(true).describe(
-          `Remove the old ${kind} after successful convergence`,
-        ),
-        healthTimeoutSec: z.number().int().default(180),
-        pollIntervalSec: z.number().int().default(5),
-      }),
+      arguments: rotateArgs,
       execute: async (
-        args: any,
-        context: any,
-      ): Promise<{ dataHandles: unknown[] }> => {
+        args: z.infer<typeof rotateArgs>,
+        context,
+      ): Promise<{ dataHandles: DataHandle[] }> => {
         const g: GlobalArgsT = context.globalArgs;
         await ensureSwarmManager(g);
-        const handles = [];
+        const handles: DataHandle[] = [];
         const record = async (
           operation: string,
           target: string,
