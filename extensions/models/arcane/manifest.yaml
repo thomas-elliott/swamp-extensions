@@ -1,0 +1,29 @@
+manifestVersion: 1
+name: '@thomas/arcane'
+version: 2026.05.22.1
+description: >-
+  Management of an Arcane Docker instance via its REST API — GitOps sync setup,
+  compose project lifecycle with validated mode-aware deploy, swarm stack deploy
+  (render-validated, convergence-polled) + secret/config rotation, and
+  volume/prune cleanup.
+repository: https://github.com/thomas-elliott/swamp-extensions
+paths:
+  base: manifest
+models:
+  - arcane.ts
+workflows: []
+vaults: []
+drivers: []
+datastores: []
+reports: []
+skills: []
+additionalFiles:
+  - README.md
+  - LICENSE
+labels:
+  - docker
+  - arcane
+  - gitops
+  - compose
+  - swarm
+dependencies: []
