@@ -52,11 +52,12 @@ the full tree, and `swamp help model method run` scopes to a subtree.
 # swamp-extensions — repository rules
 
 This repository is the canonical home of the **`@thomas/arcane`** extension family
-(an Arcane Docker *management* extension). The full design + rationale lives in
-[`ARCANE-EXTENSION-PLAN.md`](./ARCANE-EXTENSION-PLAN.md) — read it before extending
-arcane. The rules below are **LOCKED**: a coding agent hitting a roadblock will be
-tempted to work around them. Do NOT. If a rule blocks the task, STOP and surface the
-gap to the user — do not bypass.
+(an Arcane Docker *management* extension). The design rationale and roadmap live in
+[`README.md`](./README.md), and the extension's own docs in
+[`extensions/models/arcane/README.md`](./extensions/models/arcane/README.md) — read
+them before extending arcane. The rules below are **LOCKED**: a coding agent hitting a
+roadblock will be tempted to work around them. Do NOT. If a rule blocks the task, STOP
+and surface the gap to the user — do not bypass.
 
 ## Non-negotiable guardrails (`@thomas/arcane`)
 

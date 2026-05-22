@@ -140,7 +140,7 @@ recorded as a `swarm-stack` resource.
 
 ## Swarm rotation notes
 
-- Swarm secrets/configs are **immutable** in Arcane, so values are rotated, never
+- Swarm secrets/configs are **immutable**, so values are rotated, never
   updated in place: `secret_rotate` / `config_rotate` create a new version, re-point
   every referencing service's spec (preserving the mount path), wait for convergence,
   then remove the old object.
@@ -170,9 +170,3 @@ Arcane's `system/prune` requires an undocumented bare-string `mode` field (no en
 so it isn't wrapped rather than guess into a destructive call. A named volume held by
 a *stopped* (not removed) container therefore can't be cleared until that container is
 reaped (e.g. swarm task-history rotation); the per-type prunes above cover the rest.
-
-## Secrets
-
-All secret material flows through vault references (`${{ vault.get(...) }}`) and is
-marked sensitive. No secret value is ever inlined in code, a model instance, or a
-committed file.
