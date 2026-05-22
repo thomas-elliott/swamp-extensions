@@ -1,3 +1,7 @@
+// deno-lint-ignore-file no-explicit-any -- method execute() params are typed
+// `any` to avoid TS7006 when arcane_test.ts imports the model source directly
+// (see swamp-extension typing.md). Return types stay explicit; adopting
+// `satisfies ModelDefinition<...>` for full param narrowing is a tracked follow-up.
 import { z } from "npm:zod@4";
 import https from "node:https";
 import http from "node:http";

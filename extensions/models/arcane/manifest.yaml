@@ -19,7 +19,7 @@ reports: []
 skills: []
 additionalFiles:
   - README.md
-  - LICENSE
+  - LICENSE.txt
 labels:
   - docker
   - arcane
