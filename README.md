@@ -7,9 +7,14 @@ Custom [swamp](https://github.com/systeminit/swamp) extensions by **@thomas**.
 | Extension | Type | Status | Docs |
 |---|---|---|---|
 | [`@thomas/arcane`](./extensions/models/arcane/README.md) | model | Built, live-validated, publish-ready (`2026.05.22.1`, 41 methods) | [README](./extensions/models/arcane/README.md) |
+| [`@thomas/technitium`](./extensions/models/technitium/README.md) | model | Built, unit-tested; pending live smoke test (`2026.05.23.1`, 28 methods) | [README](./extensions/models/technitium/README.md) |
 
 `@thomas/arcane` manages an [Arcane](https://getarcane.app) Docker instance entirely through Arcane's REST API.
 See its [README](./extensions/models/arcane/README.md) for installation, configuration, and every method section.
+
+`@thomas/technitium` manages a [Technitium DNS Server](https://technitium.com/dns/) through its HTTP API —
+built-in blocking, zone/record lifecycle, allow/block lists, DNS-client + query-log debugging, cache, and
+settings backup/restore. See its [README](./extensions/models/technitium/README.md).
 
 ## Roadmap
 
