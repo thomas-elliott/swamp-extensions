@@ -1,0 +1,28 @@
+manifestVersion: 1
+name: "@thomas/technitium"
+version: 2026.05.23.1
+description: >-
+  Management of a Technitium DNS Server via its HTTP API — built-in ad-blocking
+  control (enable/disable, temporary disable, allow/block list URLs), authoritative
+  zone + record lifecycle, allowed/blocked custom domains, dashboard stats, DNS
+  client + query-log debugging, cache flush, and settings backup/restore.
+repository: https://github.com/thomas-elliott/swamp-extensions
+paths:
+  base: manifest
+models:
+  - technitium.ts
+workflows: []
+vaults: []
+drivers: []
+datastores: []
+reports: []
+skills: []
+additionalFiles:
+  - README.md
+  - LICENSE.txt
+labels:
+  - dns
+  - technitium
+  - blocking
+  - adblock
+dependencies: []
