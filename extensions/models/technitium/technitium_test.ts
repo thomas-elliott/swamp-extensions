@@ -15,6 +15,7 @@ import {
   model,
   namesFrom,
   prefixNew,
+  recordInstanceName,
   slug,
   unwrapEnvelope,
 } from "./technitium.ts";
@@ -44,6 +45,21 @@ function assertThrows(fn: () => unknown, includes?: string): void {
     }
   }
   if (!threw) throw new Error("expected function to throw");
+}
+async function assertRejects(
+  fn: () => Promise<unknown>,
+  includes?: string,
+): Promise<void> {
+  let threw = false;
+  try {
+    await fn();
+  } catch (e) {
+    threw = true;
+    if (includes && !(e instanceof Error && e.message.includes(includes))) {
+      throw new Error(`expected error including "${includes}", got: ${e}`);
+    }
+  }
+  if (!threw) throw new Error("expected promise to reject");
 }
 
 // ----- pure helpers --------------------------------------------------------
@@ -122,6 +138,46 @@ Deno.test("slug flattens dotted domains into a safe instance-name fragment", () 
   assertEquals(slug("foo.example.com"), "foo-example-com");
   assertEquals(slug("_dmarc.example.com"), "_dmarc-example-com");
   assertEquals(slug(""), "root");
+});
+
+Deno.test("recordInstanceName is identity-stable, case-normalized, and collision-free per record", () => {
+  // deterministic: same record → same name no matter which method produced it
+  assertEquals(
+    recordInstanceName("ex.com", "nas.ex.com", "A", { ipAddress: "10.0.0.5" }),
+    recordInstanceName("ex.com", "nas.ex.com", "A", { ipAddress: "10.0.0.5" }),
+  );
+  // DNS is case-insensitive: name case and type case don't fork the identity
+  assertEquals(
+    recordInstanceName("ex.com", "NAS.ex.com", "app", {
+      appName: "S",
+      classPath: "S.A",
+      data: "{}",
+    }),
+    recordInstanceName("ex.com", "nas.ex.com", "APP", {
+      appName: "S",
+      classPath: "S.A",
+      data: "{}",
+    }),
+  );
+  // two A records at one name stay distinct — no positional index to collide on
+  assert(
+    recordInstanceName("ex.com", "nas.ex.com", "A", {
+      ipAddress: "10.0.0.5",
+    }) !==
+      recordInstanceName("ex.com", "nas.ex.com", "A", {
+        ipAddress: "10.0.0.6",
+      }),
+    "distinct rData must yield distinct instance names",
+  );
+  // shape: rec-<zone>-<name>-<TYPE>-<hash>
+  assert(
+    /^rec-ex-com-nas-ex-com-A-[0-9a-z]+$/.test(
+      recordInstanceName("ex.com", "nas.ex.com", "A", {
+        ipAddress: "10.0.0.5",
+      }),
+    ),
+    "unexpected instance-name shape",
+  );
 });
 
 Deno.test("buildMultipart frames a single file part with the boundary", () => {
@@ -204,6 +260,17 @@ function scriptTransport(
       return Promise.resolve(responder(call));
     },
   );
+}
+
+/**
+ * Responder for write tests: the read-back GET (`/zones/records/get`) returns
+ * `records`; every other call (the mutation POST) returns an empty envelope.
+ * Lets a test stage the live state that post-write verification reads back.
+ */
+function recordsResponder(
+  records: Record<string, unknown>[],
+): (c: Call) => Record<string, unknown> {
+  return (c) => c.path.endsWith("/zones/records/get") ? { records } : {};
 }
 
 Deno.test("blocking_set_state posts only enableBlocking and emits settings", async () => {
@@ -309,7 +376,10 @@ Deno.test("zone_list is a factory with unique slugged instance names", async () 
 
 Deno.test("record_add spreads rData into flat query params", async () => {
   const calls: Call[] = [];
-  scriptTransport(calls, () => ({}));
+  scriptTransport(
+    calls,
+    recordsResponder([{ type: "A", rData: { ipAddress: "1.2.3.4" } }]),
+  );
   try {
     const { context } = makeContext();
     await method("record_add").execute(
@@ -330,6 +400,8 @@ Deno.test("record_add spreads rData into flat query params", async () => {
       ttl: 300,
       ipAddress: "1.2.3.4",
     });
+    // a read-back GET follows the mutating POST
+    assertEquals(calls[1].path, "/zones/records/get");
   } finally {
     __setTechnitiumTransport(null);
   }
@@ -337,7 +409,10 @@ Deno.test("record_add spreads rData into flat query params", async () => {
 
 Deno.test("record_update maps newRData to new* params and keeps identifying rData", async () => {
   const calls: Call[] = [];
-  scriptTransport(calls, () => ({}));
+  scriptTransport(
+    calls,
+    recordsResponder([{ type: "A", rData: { ipAddress: "2.2.2.2" } }]),
+  );
   try {
     const { context } = makeContext();
     await method("record_update").execute(
@@ -357,6 +432,250 @@ Deno.test("record_update maps newRData to new* params and keeps identifying rDat
       ipAddress: "1.1.1.1",
       newIpAddress: "2.2.2.2",
     });
+  } finally {
+    __setTechnitiumTransport(null);
+  }
+});
+
+Deno.test("record_add maps APP rData to appName/classPath/recordData (not raw data)", async () => {
+  const calls: Call[] = [];
+  scriptTransport(
+    calls,
+    recordsResponder([{
+      type: "APP",
+      rData: {
+        appName: "SplitHorizon",
+        classPath: "SplitHorizon.SimpleAddress",
+        data: '{"local":["A"],"tailscale":["B"]}',
+      },
+    }]),
+  );
+  try {
+    const { context } = makeContext();
+    await method("record_add").execute(
+      {
+        zone: "zone",
+        domain: "x.zone",
+        type: "APP",
+        // `data` is the key record_list reads APP content back under
+        rData: {
+          appName: "SplitHorizon",
+          classPath: "SplitHorizon.SimpleAddress",
+          data: '{"local":["A"],"tailscale":["B"]}',
+        },
+      },
+      context,
+    );
+    assertEquals(calls[0].path, "/zones/records/add");
+    assertEquals(calls[0].params, {
+      domain: "x.zone",
+      type: "APP",
+      zone: "zone",
+      appName: "SplitHorizon",
+      classPath: "SplitHorizon.SimpleAddress",
+      recordData: '{"local":["A"],"tailscale":["B"]}',
+    });
+    // the bug: a raw `data` param would be ignored by Technitium → empty record
+    assert(!("data" in (calls[0].params ?? {})), "no raw `data` param sent");
+  } finally {
+    __setTechnitiumTransport(null);
+  }
+});
+
+Deno.test("record_update writes APP content via recordData with no new* params", async () => {
+  const calls: Call[] = [];
+  scriptTransport(
+    calls,
+    recordsResponder([{
+      type: "APP",
+      rData: {
+        appName: "SplitHorizon",
+        classPath: "SplitHorizon.SimpleAddress",
+        data: '{"local":["C"]}',
+      },
+    }]),
+  );
+  try {
+    const { context } = makeContext();
+    await method("record_update").execute(
+      {
+        zone: "zone",
+        domain: "x.zone",
+        type: "APP",
+        rData: {
+          appName: "SplitHorizon",
+          classPath: "SplitHorizon.SimpleAddress",
+          data: "{}",
+        },
+        newRData: {
+          appName: "SplitHorizon",
+          classPath: "SplitHorizon.SimpleAddress",
+          data: '{"local":["C"]}',
+        },
+      },
+      context,
+    );
+    assertEquals(calls[0].path, "/zones/records/update");
+    assertEquals(calls[0].params, {
+      domain: "x.zone",
+      type: "APP",
+      zone: "zone",
+      appName: "SplitHorizon",
+      classPath: "SplitHorizon.SimpleAddress",
+      recordData: '{"local":["C"]}',
+    });
+    // the bug: prefixNew would emit `newData`, which Technitium ignores → empty
+    const p = calls[0].params ?? {};
+    assert(!("newData" in p), "no newData param");
+    assert(!("data" in p), "no raw `data` param");
+    assert(!("newRData" in p), "no newRData param");
+  } finally {
+    __setTechnitiumTransport(null);
+  }
+});
+
+Deno.test("record_get reads one domain live (listZone false) and writes a zoneRecord each", async () => {
+  const calls: Call[] = [];
+  scriptTransport(calls, () => ({
+    records: [
+      { name: "x.zone", type: "A", ttl: 300, rData: { ipAddress: "1.2.3.4" } },
+      {
+        name: "x.zone",
+        type: "APP",
+        rData: {
+          appName: "SplitHorizon",
+          classPath: "SplitHorizon.SimpleAddress",
+          data: '{"local":["A"]}',
+        },
+      },
+    ],
+  }));
+  try {
+    const { context, written } = makeContext();
+    const out = await method("record_get").execute(
+      { zone: "zone", domain: "x.zone" },
+      context,
+    );
+    assertEquals(calls[0].path, "/zones/records/get");
+    assertEquals(calls[0].params, {
+      domain: "x.zone",
+      listZone: false,
+      zone: "zone",
+    });
+    assertEquals(out.dataHandles.length, 2);
+    // deterministic identity-based names (shared with the mutators), live rData verbatim
+    assertEquals(written.map((w) => w.name), [
+      recordInstanceName("zone", "x.zone", "A", { ipAddress: "1.2.3.4" }),
+      recordInstanceName("zone", "x.zone", "APP", {
+        appName: "SplitHorizon",
+        classPath: "SplitHorizon.SimpleAddress",
+        data: '{"local":["A"]}',
+      }),
+    ]);
+    assertEquals(written[0].data.rData, { ipAddress: "1.2.3.4" });
+    assertEquals(written[1].data.action, "observed");
+  } finally {
+    __setTechnitiumTransport(null);
+  }
+});
+
+Deno.test("record_add and record_get address the same instance for one record (no duplicate)", async () => {
+  const calls: Call[] = [];
+  scriptTransport(
+    calls,
+    recordsResponder([{
+      name: "www.example.com",
+      type: "A",
+      rData: { ipAddress: "1.2.3.4" },
+    }]),
+  );
+  try {
+    const { context: addCtx, written: addWritten } = makeContext();
+    await method("record_add").execute(
+      {
+        zone: "example.com",
+        domain: "www.example.com",
+        type: "A",
+        rData: { ipAddress: "1.2.3.4" },
+      },
+      addCtx,
+    );
+    const { context: getCtx, written: getWritten } = makeContext();
+    await method("record_get").execute(
+      { zone: "example.com", domain: "www.example.com" },
+      getCtx,
+    );
+    // the whole point of identity-based naming: one record → one instance name,
+    // whether it was added or later read back
+    assertEquals(addWritten[0].name, getWritten[0].name);
+  } finally {
+    __setTechnitiumTransport(null);
+  }
+});
+
+Deno.test("record_update throws when read-back shows empty APP data (SERVFAIL landmine)", async () => {
+  const calls: Call[] = [];
+  // Technitium accepts the POST but the live APP record has empty data — the
+  // exact silent-corruption that took the zone down. Verification must catch it.
+  scriptTransport(
+    calls,
+    recordsResponder([{
+      type: "APP",
+      rData: {
+        appName: "SplitHorizon",
+        classPath: "SplitHorizon.SimpleAddress",
+        data: "",
+      },
+    }]),
+  );
+  try {
+    const { context, written } = makeContext();
+    await assertRejects(
+      () =>
+        method("record_update").execute(
+          {
+            zone: "zone",
+            domain: "x.zone",
+            type: "APP",
+            newRData: {
+              appName: "SplitHorizon",
+              classPath: "SplitHorizon.SimpleAddress",
+              data: '{"local":["C"]}',
+            },
+          },
+          context,
+        ),
+      "read-back failed",
+    );
+    // a false success must NOT be recorded
+    assertEquals(written.length, 0);
+  } finally {
+    __setTechnitiumTransport(null);
+  }
+});
+
+Deno.test("record_delete throws when read-back shows the record still present", async () => {
+  const calls: Call[] = [];
+  scriptTransport(
+    calls,
+    recordsResponder([{ type: "A", rData: { ipAddress: "1.2.3.4" } }]),
+  );
+  try {
+    const { context, written } = makeContext();
+    await assertRejects(
+      () =>
+        method("record_delete").execute(
+          {
+            zone: "example.com",
+            domain: "www.example.com",
+            type: "A",
+            rData: { ipAddress: "1.2.3.4" },
+          },
+          context,
+        ),
+      "still",
+    );
+    assertEquals(written.length, 0);
   } finally {
     __setTechnitiumTransport(null);
   }

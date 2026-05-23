@@ -440,6 +440,41 @@ export function slug(s: string): string {
   return out.length > 0 ? out : "root";
 }
 
+/** Deterministic short hash (FNV-1a → base36) of a record's rData, for stable instance naming. */
+function rDataHash(rData?: Record<string, unknown>): string {
+  const canon = rData
+    ? Object.keys(rData).sort()
+      .map((k) => `${k}=${String(rData[k])}`)
+      .join("&")
+      .toLowerCase()
+    : "";
+  let h = 0x811c9dc5;
+  for (let i = 0; i < canon.length; i++) {
+    h ^= canon.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return (h >>> 0).toString(36).padStart(7, "0");
+}
+
+/**
+ * Deterministic, identity-stable instance name for a zone record, shared by
+ * EVERY record method. Keyed on (zone, name, type, rData) — never on a list
+ * position. This is what lets a record have one instance regardless of which
+ * method wrote it, lets a re-list produce a new version instead of a duplicate,
+ * and keeps two records at one name (e.g. two A records) distinct. DNS names are
+ * case-insensitive, so name/zone are lowercased and type upper-cased.
+ */
+export function recordInstanceName(
+  zone: string,
+  name: string,
+  type: string,
+  rData?: Record<string, unknown>,
+): string {
+  return `rec-${slug(zone.toLowerCase())}-${
+    slug(name.toLowerCase())
+  }-${type.toUpperCase()}-${rDataHash(rData)}`;
+}
+
 /** Pull an array out of a Technitium response under any of the given keys. */
 export function coerceArray(resp: Json, ...keys: string[]): Json[] {
   for (const k of keys) {
@@ -508,6 +543,126 @@ function spreadRData(into: Params, rData?: Record<string, unknown>): Params {
     }
   }
   return into;
+}
+
+/**
+ * Map an APP record's rData to Technitium's APP write params for add/update.
+ * APP content is carried under the `data` key (that's how `record_list` returns
+ * it), but Technitium's write endpoints read it from `recordData` — and the app
+ * is identified by `appName` + `classPath`. APP records use NO `new*` scheme:
+ * the new content goes in `recordData` and the record is matched by domain+type.
+ * Spreading the keys verbatim (as `spreadRData` does) sends an unrecognized
+ * `data` param, so Technitium writes the record with empty data → SERVFAIL.
+ */
+function spreadAppRData(into: Params, rData?: Record<string, unknown>): Params {
+  if (!rData) return into;
+  // `data` is the key record_list reads APP content back under; accept the
+  // Technitium-native `recordData` too for callers working straight from its docs.
+  const recordData = rData.recordData ?? rData.data;
+  if (rData.appName !== undefined && rData.appName !== null) {
+    into.appName = rData.appName as string;
+  }
+  if (rData.classPath !== undefined && rData.classPath !== null) {
+    into.classPath = rData.classPath as string;
+  }
+  if (recordData !== undefined && recordData !== null) {
+    into.recordData = recordData as string;
+  }
+  return into;
+}
+
+type LiveRecord = {
+  name: string;
+  type: string;
+  ttl?: number;
+  disabled?: boolean;
+  rData?: Record<string, unknown>;
+};
+
+/**
+ * Fetch the live records at a single domain (not the whole zone) straight from
+ * Technitium. Backs `record_get` and post-write verification — `record_list`'s
+ * persisted data can go stale, so anything needing ground truth reads here.
+ */
+async function getDomainRecords(
+  g: GlobalArgsT,
+  domain: string,
+  zone?: string,
+): Promise<LiveRecord[]> {
+  const params: Params = { domain, listZone: false };
+  if (zone) params.zone = zone;
+  const r = await apiCall(g, "GET", "/zones/records/get", params);
+  return coerceArray(r, "records").map((rec) => ({
+    name: asString(pick(rec, "name")) ?? domain,
+    type: asString(pick(rec, "type")) ?? "UNKNOWN",
+    ttl: asNumber(pick(rec, "ttl")),
+    disabled: pick(rec, "disabled") as boolean | undefined,
+    rData: (pick(rec, "rData") as Record<string, unknown> | undefined) ??
+      undefined,
+  }));
+}
+
+/**
+ * Does a live record's rData satisfy every field in `want` (subset, string-
+ * compared)? APP content is normalized: Technitium reports it under `data` but
+ * it is written via `recordData`, so the two compare equal.
+ */
+function rDataMatches(
+  want: Record<string, unknown> | undefined,
+  live: Record<string, unknown> | undefined,
+  isApp: boolean,
+): boolean {
+  if (!want) return true;
+  const got = live ?? {};
+  const eq = (a: unknown, b: unknown) => String(a ?? "") === String(b ?? "");
+  if (isApp) {
+    const wantData = want.recordData ?? want.data;
+    return (want.appName == null || eq(got.appName, want.appName)) &&
+      (want.classPath == null || eq(got.classPath, want.classPath)) &&
+      (wantData == null || eq(got.recordData ?? got.data, wantData));
+  }
+  for (const [k, v] of Object.entries(want)) {
+    if (v === undefined || v === null) continue;
+    if (!eq(got[k], v)) return false;
+  }
+  return true;
+}
+
+/**
+ * Read the record back after a mutation and assert it reflects the intended
+ * state. Technitium can return `ok` while silently writing empty data (the APP
+ * bug that caused a zone-wide SERVFAIL): for add/update assert a `type` record
+ * matching `want` now exists at `domain`; for delete assert none remains. Throws
+ * on mismatch so the method surfaces a loud error instead of a false success.
+ */
+async function verifyRecordWrite(
+  g: GlobalArgsT,
+  op: "added" | "updated" | "deleted",
+  domain: string,
+  type: string,
+  want: Record<string, unknown> | undefined,
+  zone?: string,
+): Promise<void> {
+  const isApp = type.toUpperCase() === "APP";
+  const matched = (await getDomainRecords(g, domain, zone))
+    .filter((r) => r.type.toUpperCase() === type.toUpperCase())
+    .some((r) => rDataMatches(want, r.rData, isApp));
+  if (op === "deleted") {
+    if (matched) {
+      throw new Error(
+        `Post-delete read-back failed: a ${type} record at ${domain} still ` +
+          `matches the deleted data — Technitium reported success but the record persists.`,
+      );
+    }
+    return;
+  }
+  if (!matched) {
+    throw new Error(
+      `Post-${op} read-back failed: no ${type} record at ${domain} matches the ` +
+        `intended data — Technitium reported success but the live record is missing ` +
+        `or has different/empty data (e.g. an APP record written with empty recordData).`,
+    );
+  }
 }
 
 /** Build a multipart/form-data body for a single file part. */
@@ -664,6 +819,13 @@ const RecordDeleteArgs = z.object({
   rData: RData.optional(),
 });
 
+const RecordGetArgs = z.object({
+  zone: z.string().optional().describe(
+    "Zone name; inferred by Technitium if omitted",
+  ),
+  domain: z.string().describe("Record owner FQDN to read live"),
+});
+
 const ClientResolveArgs = z.object({
   domain: z.string(),
   type: z.string().default("A"),
@@ -725,7 +887,7 @@ const SettingsRestoreArgs = z.object({
 /** The `@thomas/technitium` swamp model: schema, methods, and lifecycle for managing a Technitium DNS server. */
 export const model = {
   type: "@thomas/technitium",
-  version: "2026.05.23.1",
+  version: "2026.05.24.1",
   globalArguments: GlobalArgs,
   resources: {
     "zone": {
@@ -737,7 +899,11 @@ export const model = {
     "zoneRecord": {
       description: "A resource record within a zone",
       schema: ZoneRecordResource,
-      lifetime: "infinite",
+      // A refreshable projection of live server state, not the source of truth:
+      // re-listing a record refreshes its timer; records that are deleted or
+      // change value stop being refreshed and age out (swamp has no auto-prune
+      // for orphaned instances, so a finite lifetime is what reaps stale entries).
+      lifetime: "30d",
       garbageCollection: 10,
     },
     "settings": {
@@ -1089,23 +1255,23 @@ export const model = {
         });
         const observedAt = new Date().toISOString();
         const handles: DataHandle[] = [];
-        let i = 0;
         for (const rec of coerceArray(r, "records")) {
           const name = asString(pick(rec, "name")) ?? args.zone;
           const type = asString(pick(rec, "type")) ?? "UNKNOWN";
+          const rData =
+            (pick(rec, "rData") as Record<string, unknown> | undefined) ??
+              undefined;
           handles.push(
             await context.writeResource(
               "zoneRecord",
-              `rec-${slug(args.zone)}-${slug(name)}-${type}-${i++}`,
+              recordInstanceName(args.zone, name, type, rData),
               {
                 zone: args.zone,
                 name,
                 type,
                 ttl: asNumber(pick(rec, "ttl")),
                 disabled: pick(rec, "disabled") as boolean | undefined,
-                rData:
-                  (pick(rec, "rData") as Record<string, unknown> | undefined) ??
-                    undefined,
+                rData,
                 action: "observed",
                 observedAt,
               },
@@ -1114,6 +1280,49 @@ export const model = {
         }
         logInfo(context, "Listed zone records", {
           zone: args.zone,
+          count: handles.length,
+        });
+        return { dataHandles: handles };
+      },
+    },
+
+    record_get: {
+      description:
+        "Read the live records at a single domain straight from Technitium (factory: one `zoneRecord` each). Ground-truth read-back for one name — unlike `record_list` it queries a single domain rather than the whole zone.",
+      arguments: RecordGetArgs,
+      execute: async (
+        args: z.infer<typeof RecordGetArgs>,
+        context,
+      ): Promise<{ dataHandles: DataHandle[] }> => {
+        const g: GlobalArgsT = context.globalArgs;
+        const records = await getDomainRecords(g, args.domain, args.zone);
+        const observedAt = new Date().toISOString();
+        const handles: DataHandle[] = [];
+        for (const rec of records) {
+          handles.push(
+            await context.writeResource(
+              "zoneRecord",
+              recordInstanceName(
+                args.zone ?? rec.name,
+                rec.name,
+                rec.type,
+                rec.rData,
+              ),
+              {
+                zone: args.zone ?? rec.name,
+                name: rec.name,
+                type: rec.type,
+                ttl: rec.ttl,
+                disabled: rec.disabled,
+                rData: rec.rData,
+                action: "observed",
+                observedAt,
+              },
+            ),
+          );
+        }
+        logInfo(context, "Read domain records", {
+          domain: args.domain,
           count: handles.length,
         });
         return { dataHandles: handles };
@@ -1132,16 +1341,28 @@ export const model = {
         const params: Params = { domain: args.domain, type: args.type };
         if (args.zone) params.zone = args.zone;
         if (args.ttl !== undefined) params.ttl = args.ttl;
-        spreadRData(params, args.rData);
+        if (args.type.toUpperCase() === "APP") {
+          spreadAppRData(params, args.rData);
+        } else {
+          spreadRData(params, args.rData);
+        }
         logInfo(context, "Adding record", {
           domain: args.domain,
           type: args.type,
         });
         await apiCall(g, "POST", "/zones/records/add", params);
+        await verifyRecordWrite(
+          g,
+          "added",
+          args.domain,
+          args.type,
+          args.rData,
+          args.zone,
+        );
         const zone = args.zone ?? args.domain;
         const handle = await context.writeResource(
           "zoneRecord",
-          `rec-${slug(zone)}-${slug(args.domain)}-${args.type}`,
+          recordInstanceName(zone, args.domain, args.type, args.rData),
           {
             zone,
             name: args.domain,
@@ -1169,19 +1390,36 @@ export const model = {
         if (args.zone) params.zone = args.zone;
         if (args.ttl !== undefined) params.ttl = args.ttl;
         if (args.newDomain) params.newDomain = args.newDomain;
-        spreadRData(params, args.rData);
-        if (args.newRData) Object.assign(params, prefixNew(args.newRData));
+        if (args.type.toUpperCase() === "APP") {
+          // APP records have no `new*` params and only one exists per name:
+          // identify by domain+type and write the desired final state directly.
+          spreadAppRData(params, args.newRData ?? args.rData);
+        } else {
+          spreadRData(params, args.rData);
+          if (args.newRData) Object.assign(params, prefixNew(args.newRData));
+        }
         logInfo(context, "Updating record", {
           domain: args.domain,
           type: args.type,
         });
         await apiCall(g, "POST", "/zones/records/update", params);
+        await verifyRecordWrite(
+          g,
+          "updated",
+          args.newDomain ?? args.domain,
+          args.type,
+          args.newRData ?? args.rData,
+          args.zone,
+        );
         const zone = args.zone ?? args.domain;
         const handle = await context.writeResource(
           "zoneRecord",
-          `rec-${slug(zone)}-${
-            slug(args.newDomain ?? args.domain)
-          }-${args.type}`,
+          recordInstanceName(
+            zone,
+            args.newDomain ?? args.domain,
+            args.type,
+            args.newRData ?? args.rData,
+          ),
           {
             zone,
             name: args.newDomain ?? args.domain,
@@ -1213,10 +1451,18 @@ export const model = {
           type: args.type,
         });
         await apiCall(g, "POST", "/zones/records/delete", params);
+        await verifyRecordWrite(
+          g,
+          "deleted",
+          args.domain,
+          args.type,
+          args.rData,
+          args.zone,
+        );
         const zone = args.zone ?? args.domain;
         const handle = await context.writeResource(
           "zoneRecord",
-          `rec-${slug(zone)}-${slug(args.domain)}-${args.type}`,
+          recordInstanceName(zone, args.domain, args.type, args.rData),
           {
             zone,
             name: args.domain,

@@ -73,10 +73,18 @@ swamp model method run dns-home cache_flush
   `blocking_set_lists` (block/allow list URLs), `blocking_force_update_lists`.
 - **`zone_*`** — `zone_list`, `zone_create`, `zone_delete`, `zone_enable`,
   `zone_disable`.
-- **`record_*`** — `record_list`, `record_add`, `record_update`,
+- **`record_*`** — `record_list`, `record_get`, `record_add`, `record_update`,
   `record_delete`. Type-specific fields go in `rData` (e.g. `{ipAddress}` for A,
   `{cname}` for CNAME, `{exchange, preference}` for MX). Updates carry the new
-  values in `newRData`.
+  values in `newRData`. For **APP** records, put the application payload in
+  `rData.data` (the same key `record_list`/`record_get` read it back under) — it
+  is written via Technitium's `recordData` param, and updates set the new payload
+  directly (APP records have no `new*` scheme and only one exists per name).
+  `record_get` reads a **single** domain's records live from the server (use it
+  for ground truth — `record_list` walks the whole zone). Every `record_add` /
+  `record_update` / `record_delete` **reads the record back and asserts the live
+  state** afterwards, failing loudly if Technitium reported success but the change
+  did not take (e.g. an APP record left with empty data).
 - **`allowed_*` / `blocked_*`** — manage the built-in Allowed/Blocked zones:
   `_add`, `_delete`, `_list`, `_flush`.
 - **`client_resolve`** — resolve a name through the server's DNS client for
@@ -98,6 +106,19 @@ Read methods are factories that persist one resource per item (`zone`,
 from CEL expressions in workflows. Only **blocking-relevant** settings fields
 are surfaced — the full settings blob is intentionally not stored, to avoid
 leaking secrets such as TLS certificate passwords.
+
+`zoneRecord` instances are a **refreshable cache of live server state, not the
+source of truth** (the Technitium server is). Every record method — `record_add`,
+`record_update`, `record_delete`, `record_list`, `record_get` — addresses a
+record by a deterministic identity name derived from `(zone, name, type, rData)`,
+so the same record is one instance regardless of which method wrote it, and two
+records at one name (e.g. two A records) stay distinct. A re-`record_list` writes
+a **new version** of an unchanged record rather than a duplicate. Because swamp
+does not auto-prune instances, `zoneRecord` carries a finite **30-day lifetime**:
+records that still exist refresh their timer on each list/get, while records that
+were deleted or had their value changed stop being refreshed and age out. For
+point-in-time ground truth on a single name, use `record_get` (a live read);
+`swamp data gc` / `swamp data delete` clean up persisted entries on demand.
 
 ## License
 
