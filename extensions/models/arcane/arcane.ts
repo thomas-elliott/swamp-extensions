@@ -1255,7 +1255,7 @@ const LifecycleArgs = z.object({
 /** The `@thomas/arcane` swamp model: schema, methods, and lifecycle for managing Docker via Arcane. */
 export const model = {
   type: "@thomas/arcane",
-  version: "2026.05.22.1",
+  version: "2026.05.23.1",
   globalArguments: GlobalArgs,
   upgrades: [
     {
