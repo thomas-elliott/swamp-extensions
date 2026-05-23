@@ -165,9 +165,12 @@ const API = "/api";
 const REQUEST_TIMEOUT_MS = 30_000;
 
 type GlobalArgsT = z.infer<typeof GlobalArgs>;
-type Json = Record<string, unknown>;
-type HttpMethod = "GET" | "POST" | "PUT" | "DELETE";
-type Params = Record<string, string | number | boolean | undefined>;
+/** A parsed JSON object. */
+export type Json = Record<string, unknown>;
+/** An HTTP verb used by the Technitium transport. */
+export type HttpMethod = "GET" | "POST" | "PUT" | "DELETE";
+/** Query/form parameters for a Technitium API call. */
+export type Params = Record<string, string | number | boolean | undefined>;
 type HttpResult = { status: number; body: Buffer };
 
 /** Low-level HTTPS/HTTP request returning the raw status and body bytes. */
@@ -232,8 +235,9 @@ export function unwrapEnvelope(parsed: unknown, context: string): Json {
   return {};
 }
 
-type TechFn = (
-  g: GlobalArgsT,
+/** Signature of the Technitium HTTP transport, swappable via {@link __setTechnitiumTransport}. */
+export type TechFn = (
+  g: Json,
   method: HttpMethod,
   path: string,
   params?: Params,
@@ -718,6 +722,7 @@ const SettingsRestoreArgs = z.object({
 // Model
 // ---------------------------------------------------------------------------
 
+/** The `@thomas/technitium` swamp model: schema, methods, and lifecycle for managing a Technitium DNS server. */
 export const model = {
   type: "@thomas/technitium",
   version: "2026.05.23.1",

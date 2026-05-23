@@ -267,9 +267,11 @@ const API = "/api";
 const REQUEST_TIMEOUT_MS = 30_000;
 
 type GlobalArgsT = z.infer<typeof GlobalArgs>;
-type Json = Record<string, unknown>;
+/** A parsed JSON object. */
+export type Json = Record<string, unknown>;
 type HttpResult = { status: number; body: string };
-type HttpMethod = "GET" | "POST" | "PUT" | "DELETE";
+/** An HTTP verb used by the Arcane transport. */
+export type HttpMethod = "GET" | "POST" | "PUT" | "DELETE";
 
 /** Low-level HTTPS/HTTP request returning the raw status and body text. */
 function httpRequest(
@@ -309,8 +311,9 @@ function safeJson(body: string): unknown {
   }
 }
 
-type ArcaneFn = (
-  g: GlobalArgsT,
+/** Signature of the Arcane HTTP transport, swappable via {@link __setArcaneTransport}. */
+export type ArcaneFn = (
+  g: Json,
   method: HttpMethod,
   path: string,
   body?: unknown,
@@ -513,7 +516,8 @@ async function dockerComposeVersion(): Promise<string> {
   }
 }
 
-type ValidateFn = (
+/** Signature of the local compose validator, swappable via {@link __setComposeValidator}. */
+export type ValidateFn = (
   composeContent: string,
   envContent?: string,
 ) => Promise<{ version: string }>;
@@ -1248,6 +1252,7 @@ const LifecycleArgs = z.object({
   names: z.array(z.string()).min(1).describe("Project names to operate on"),
 });
 
+/** The `@thomas/arcane` swamp model: schema, methods, and lifecycle for managing Docker via Arcane. */
 export const model = {
   type: "@thomas/arcane",
   version: "2026.05.22.1",
