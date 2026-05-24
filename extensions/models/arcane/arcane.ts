@@ -1255,7 +1255,7 @@ const LifecycleArgs = z.object({
 /** The `@thomas/arcane` swamp model: schema, methods, and lifecycle for managing Docker via Arcane. */
 export const model = {
   type: "@thomas/arcane",
-  version: "2026.05.23.1",
+  version: "2026.05.24.1",
   globalArguments: GlobalArgs,
   upgrades: [
     {
@@ -1270,6 +1270,22 @@ export const model = {
       toVersion: "2026.05.22.1",
       description:
         "Add the swarm_stack_ section (swarm_stack_validate via config/render [fail-closed], swarm_stack_deploy, _list, _get, _remove, _tasks), swarm_service_force_update, volume_list/_remove/_prune, network_prune, image_prune, plus swarm-stack / swarm-stack-render / swarm-task / volume / prune-result resources. globalArguments schema is unchanged, so this is a no-op data migration.",
+      upgradeAttributes: (
+        old: Record<string, unknown>,
+      ): Record<string, unknown> => old,
+    },
+    {
+      toVersion: "2026.05.23.1",
+      description:
+        "Publish version bump (4bcc8df) ships the slow-types fix; globalArguments schema is unchanged, so this is a no-op data migration.",
+      upgradeAttributes: (
+        old: Record<string, unknown>,
+      ): Record<string, unknown> => old,
+    },
+    {
+      toVersion: "2026.05.24.1",
+      description:
+        "Repair the broken 2026.05.23.1 publish (which shipped without its migration entry, leaving the type unloadable). globalArguments schema is unchanged, so this is a no-op data migration; the .23.1 release is yanked in favour of this version.",
       upgradeAttributes: (
         old: Record<string, unknown>,
       ): Record<string, unknown> => old,
