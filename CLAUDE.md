@@ -99,3 +99,29 @@ SSH. The local compose version may differ from Arcane's deployer (**accepted ris
 surface the local version, lean on post-deploy health + rollback as the backstop, and
 keep this risk visible — do not "fix" it by adding server-side validation.
 
+## Authoring conventions (all extensions in this repo)
+
+These keep `swamp extension quality` at **14/14 (100%)** — proven on `@thomas/arcane`,
+`@thomas/technitium`, and `@thomas/postgres-admin`. Apply them to every new extension.
+
+1. **zod + `fast-check` — never leak a `z.infer` type onto the public API.** The
+   `fast-check` ("no slow types") factor FAILS if an **exported** symbol references a
+   `z.infer<typeof Schema>` alias (zod-inferred types are "slow types"). Pattern: keep
+   `type GlobalArgsT = z.infer<typeof GlobalArgs>` **unexported**; the EXPORTED test-seam
+   function type takes the resolved args as the loose **`Json` (`Record<string,unknown>`)**,
+   while a private dispatcher + the real implementation keep the precise `g: GlobalArgsT`
+   (which widens to `Json` at the call site, so no cast). See `ArcaneFn` (arcane), `TechFn`
+   (technitium), `ConnectFn` (postgres-admin). Symptom if you slip: `deno doc --lint` →
+   `private-type-ref: public type 'X' references private type ...`.
+2. **Untyped npm deps break `deno doc` — add a `@ts-types` directive.** A package that
+   ships no types (e.g. `pg`) makes the quality scorer's `deno doc --json` HARD-FAIL with
+   `Could not resolve 'npm:<pkg>'`. Fix: put `// @ts-types="npm:@types/<pkg>@<ver>"`
+   directly above the `import`. It resolves types for both `deno doc` and `deno check`; the
+   `@types/*` package is type-only (erased), so it does not change rule 7's bundling.
+3. **Document every exported symbol** (interfaces, their members, type aliases, and
+   `export const model`) with JSDoc — `fast-check` requires it.
+4. **Self-check before publish:** `deno check` → `deno doc --lint <file>` (ignore the
+   `@types/node` resolution warnings — only `<file>`-pointed errors matter) →
+   `deno test` → `swamp extension fmt --check` → `swamp extension quality` (expect
+   `allPassed: true`).
+
