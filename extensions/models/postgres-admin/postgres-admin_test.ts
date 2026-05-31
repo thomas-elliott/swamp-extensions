@@ -35,7 +35,7 @@ async function rejects(fn: () => Promise<unknown>, re: RegExp): Promise<void> {
 }
 
 const GLOBALS = {
-  host: "100.98.199.114",
+  host: "10.0.0.5",
   port: 5433,
   adminUser: "postgres",
   adminPassword: "admin-pw",

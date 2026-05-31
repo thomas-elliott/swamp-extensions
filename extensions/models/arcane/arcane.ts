@@ -85,7 +85,7 @@ const SyncSpec = z.object({
 
 const GlobalArgs = z.object({
   baseUrl: z.string().describe(
-    "Arcane base URL including port, e.g. https://arcane-tylo.smol.cloud:8443",
+    "Arcane base URL including port, e.g. https://arcane-example.com:8443",
   ),
   apiKey: z.string().meta({ sensitive: true }).describe(
     "Arcane API key (X-API-Key). Supply via vault: ${{ vault.get(name, key) }}",
