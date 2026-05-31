@@ -1002,7 +1002,7 @@ Deno.test("swarmTaskResource surfaces state + error", () => {
     id: "t1",
     serviceName: "unifi_unifi",
     slot: 1,
-    nodeName: "laythe",
+    nodeName: "host-a",
     desiredState: "ready",
     currentState: "rejected",
     error: "bind source path does not exist: /docker/unifi",

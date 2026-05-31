@@ -43,7 +43,7 @@ import pg from "npm:pg@8.21.0";
  * this extension's control; it does not try to mutate it to hide the password.
  *
  * Secrets: `adminPassword` (and per-call role passwords) are supplied via vault
- * expressions, e.g. `${{ vault.get(op-homelab, postgres-test/password) }}`.
+ * expressions, e.g. `${{ vault.get(<vault>, postgres/admin_password) }}`.
  */
 
 // ─────────────────────────── global arguments ───────────────────────────
@@ -65,14 +65,14 @@ const SslConfig = z.object({
 
 const GlobalArgs = z.object({
   host: z.string().describe(
-    "Postgres host (tailnet IP/name), e.g. 100.98.199.114 or tylo.ghost-eagle.ts.net",
+    "Postgres host or IP, e.g. postgres-host or 10.0.0.5",
   ),
   port: z.coerce.number().int().default(5432).describe("Postgres TCP port"),
   adminUser: z.string().default("postgres").describe(
     "Admin/superuser login role used for every connection",
   ),
   adminPassword: z.string().meta({ sensitive: true }).describe(
-    "Admin password. Supply via vault: ${{ vault.get(op-homelab, postgres-test/password) }}",
+    "Admin password. Supply via vault: ${{ vault.get(<vault>, postgres/admin_password) }}",
   ),
   maintenanceDb: z.string().default("postgres").describe(
     "DB to connect to for cluster-wide ops (CREATE DATABASE, role/db catalog reads)",

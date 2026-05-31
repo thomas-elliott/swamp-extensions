@@ -1,8 +1,8 @@
 # @thomas/postgres-admin
 
 Non-destructive **PostgreSQL administration** for swamp, over a direct TCP
-connection (node-postgres). Built for the common homelab task of standing up a
-new application's database, login role, and permissions — plus auditing what's
+connection (node-postgres). Built for the common task of standing up a new
+application's database, login role, and permissions — plus auditing what's
 already there — without ever touching table data.
 
 ## Scope guarantee (read this first)
@@ -30,17 +30,17 @@ swamp extension pull @thomas/postgres-admin
 Create a model instance and supply the admin password from a vault (never inline):
 
 ```bash
-swamp model create @thomas/postgres-admin pg-test \
-  --global-arg host=100.98.199.114 \
-  --global-arg port=5433 \
+swamp model create @thomas/postgres-admin pg \
+  --global-arg host=postgres-host \
+  --global-arg port=5432 \
   --global-arg adminUser=postgres \
   --global-arg maintenanceDb=postgres \
-  --global-arg 'adminPassword=${{ vault.get(op-homelab, postgres-test/password) }}'
+  --global-arg 'adminPassword=${{ vault.get(<vault>, postgres/admin_password) }}'
 ```
 
 | Global arg          | Default                         | Notes                                                            |
 | ------------------- | ------------------------------- | ---------------------------------------------------------------- |
-| `host`              | —                               | Postgres host (tailnet IP/name).                                 |
+| `host`              | —                               | Postgres host or IP.                                             |
 | `port`              | `5432`                          | TCP port.                                                        |
 | `adminUser`         | `postgres`                      | Admin/superuser login used for every connection.                 |
 | `adminPassword`     | — (sensitive)                   | Supply via `${{ vault.get(...) }}`. Never logged or echoed.      |
@@ -76,10 +76,10 @@ swamp model create @thomas/postgres-admin pg-test \
 ### Example — provision a new app
 
 ```bash
-swamp model method run pg-test app_provision \
+swamp model method run pg app_provision \
   --input database=myapp \
   --input role=myapp \
-  --input 'password=${{ vault.get(op-homelab, myapp/db_password) }}'
+  --input 'password=${{ vault.get(<vault>, myapp/db_password) }}'
 ```
 
 Creates the `myapp` database owned by a new `myapp` login role, grants `CONNECT`,
