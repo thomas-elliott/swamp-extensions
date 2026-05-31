@@ -597,7 +597,7 @@ const AppProvisionArgs = z.object({
  */
 export const model = {
   type: "@thomas/postgres-admin",
-  version: "2026.05.30.1",
+  version: "2026.06.01.1",
   globalArguments: GlobalArgs,
   checks: {
     "reachable": {
