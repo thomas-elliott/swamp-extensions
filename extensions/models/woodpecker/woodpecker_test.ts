@@ -446,7 +446,314 @@ Deno.test("model: no value field on the secret schema; deletes are reversible-on
   const deletish = names.filter((n) => /delete|disable/i.test(n));
   assertEquals(
     deletish.sort(),
-    ["org_secret_delete", "repo_disable", "repo_secret_delete"],
+    ["cron_delete", "org_secret_delete", "repo_disable", "repo_secret_delete"],
     "only the reversible disable/secret-delete methods exist",
   );
+});
+
+// ─────────────────────────── observability ───────────────────────────
+
+// A pipeline with one workflow + two steps (one passed, one failed).
+function pipelineWithSteps(
+  over: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return {
+    number: 5,
+    status: "failure",
+    workflows: [{
+      name: "woodpecker",
+      children: [
+        { id: 10, name: "go", state: "success", exit_code: 0 },
+        { id: 11, name: "build", state: "failure", exit_code: 1, error: "" },
+      ],
+    }],
+    ...over,
+  };
+}
+
+Deno.test("pipeline_steps: number omitted -> resolves latest, then flattens steps", async () => {
+  const { caller, calls } = makeFakeApi((c) => {
+    if (c.path === "/api/repos/1/pipelines/latest") return { number: 5 };
+    if (c.path === "/api/repos/1/pipelines/5") return pipelineWithSteps();
+    return undefined;
+  });
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("pipeline_steps").execute({ repo: "1" }, context);
+    assert(
+      calls.some((c) => c.path === "/api/repos/1/pipelines/latest"),
+      "resolves latest when number omitted",
+    );
+    assertEquals(written.length, 2, "one resource per step");
+    assertEquals(written[0].data.name, "go");
+    assertEquals(written[0].data.state, "success");
+    assertEquals(written[1].data.state, "failure");
+    assert(
+      !written[1].name.includes("/"),
+      "step instance name is slash-safe",
+    );
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("pipeline_logs: decodes base64 lines, finds step by name, tails", async () => {
+  const { caller } = makeFakeApi((c) => {
+    if (c.path === "/api/repos/1/pipelines/5") return pipelineWithSteps();
+    if (c.path === "/api/repos/1/logs/5/10") {
+      return {
+        status: 200,
+        body: ([
+          { data: btoa("hello") },
+          { data: btoa("world") },
+        ] as unknown) as Record<string, unknown>,
+      };
+    }
+    return undefined;
+  });
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("pipeline_logs").execute(
+      { repo: "1", number: 5, step: "go" },
+      context,
+    );
+    assertEquals(written[0].data.stepId, 10, "resolved step id by name");
+    assertEquals(written[0].data.text, "hello\nworld", "decoded + joined");
+    assertEquals(written[0].data.truncated, false);
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("pipeline_logs: unknown step rejects", async () => {
+  const { caller } = makeFakeApi((c) => {
+    if (c.path === "/api/repos/1/pipelines/5") return pipelineWithSteps();
+    return undefined;
+  });
+  __setCaller(caller);
+  try {
+    const { context } = makeContext();
+    await rejects(
+      () =>
+        method("pipeline_logs").execute(
+          { repo: "1", number: 5, step: "nope" },
+          context,
+        ),
+      /step "nope" not found/,
+    );
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("pipeline_wait: terminal on first poll -> no wait, writes pipeline + steps", async () => {
+  const { caller, calls } = makeFakeApi((c) => {
+    if (c.path === "/api/repos/1/pipelines/5") {
+      return pipelineWithSteps({ status: "success" });
+    }
+    return undefined;
+  });
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("pipeline_wait").execute(
+      { repo: "1", number: 5, pollIntervalSec: 0 },
+      context,
+    );
+    // exactly one status fetch (already terminal — no re-poll)
+    assertEquals(
+      calls.filter((c) => c.path === "/api/repos/1/pipelines/5").length,
+      1,
+    );
+    assertEquals(written[0].specName, "pipeline");
+    assertEquals(written[0].data.status, "success");
+    // failed step is surfaced
+    assert(
+      written.some((w) =>
+        w.specName === "pipeline-step" && w.data.state === "failure"
+      ),
+      "failed step written",
+    );
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("status_all: per-repo latest; 404 latest -> status 'none'", async () => {
+  const { caller } = makeFakeApi((c) => {
+    if (c.path === "/api/repos") {
+      return {
+        status: 200,
+        body: ([
+          { id: 1, full_name: "o/a" },
+          { id: 2, full_name: "o/b" },
+        ] as unknown) as Record<string, unknown>,
+      };
+    }
+    if (c.path === "/api/repos/1/pipelines/latest") {
+      return { status: "success", number: 3, event: "push", branch: "main" };
+    }
+    if (c.path === "/api/repos/2/pipelines/latest") return undefined; // 404
+    return undefined;
+  });
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("status_all").execute({}, context);
+    assertEquals(written.length, 2);
+    assertEquals(written[0].data.status, "success");
+    assertEquals(written[1].data.status, "none", "no pipelines -> none");
+  } finally {
+    __setCaller(null);
+  }
+});
+
+// ─────────────────────────── run control ───────────────────────────
+
+Deno.test("pipeline_cancel: already-finished is a no-op (no cancel POST)", async () => {
+  const { caller, calls } = makeFakeApi((c) => {
+    if (c.path === "/api/repos/1/pipelines/5") {
+      return pipelineWithSteps({ status: "success" });
+    }
+    return undefined;
+  });
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("pipeline_cancel").execute({ repo: "1", number: 5 }, context);
+    assert(
+      !calls.some((c) => c.path.endsWith("/cancel")),
+      "no cancel POST on a finished pipeline",
+    );
+    assertEquals(written[0].data.action, "unchanged");
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("pipeline_restart: POSTs to the pipeline; action 'restarted'", async () => {
+  const { caller, calls } = makeFakeApi((c) => {
+    if (c.method === "POST" && c.path === "/api/repos/1/pipelines/5") {
+      return { number: 6, status: "pending" };
+    }
+    return undefined;
+  });
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("pipeline_restart").execute({ repo: "1", number: 5 }, context);
+    assert(
+      calls.some((c) =>
+        c.method === "POST" && c.path === "/api/repos/1/pipelines/5"
+      ),
+      "issued restart POST",
+    );
+    assertEquals(written[0].data.action, "restarted");
+    assertEquals(written[0].data.number, 6, "new run number");
+  } finally {
+    __setCaller(null);
+  }
+});
+
+// ─────────────────────────── cron ───────────────────────────
+
+Deno.test("cron_set: no existing -> POST create; identical -> unchanged (no write)", async () => {
+  // create
+  let { caller, calls } = makeFakeApi((c) => {
+    if (c.method === "GET" && c.path === "/api/repos/1/cron") {
+      return { status: 200, body: ([] as unknown) as Record<string, unknown> };
+    }
+    if (c.method === "POST" && c.path === "/api/repos/1/cron") {
+      return { id: 7, name: "nightly", schedule: "@daily" };
+    }
+    return undefined;
+  });
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("cron_set").execute(
+      { repo: "1", name: "nightly", schedule: "@daily" },
+      context,
+    );
+    assert(
+      calls.some((c) => c.method === "POST" && c.path === "/api/repos/1/cron"),
+      "creates via POST",
+    );
+    assertEquals(written[0].data.action, "created");
+  } finally {
+    __setCaller(null);
+  }
+  // unchanged
+  ({ caller, calls } = makeFakeApi((c) => {
+    if (c.method === "GET" && c.path === "/api/repos/1/cron") {
+      return {
+        status: 200,
+        body: ([{
+          id: 7,
+          name: "nightly",
+          schedule: "@daily",
+          branch: "",
+        }] as unknown) as Record<string, unknown>,
+      };
+    }
+    return undefined;
+  }));
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("cron_set").execute(
+      { repo: "1", name: "nightly", schedule: "@daily" },
+      context,
+    );
+    assert(
+      !calls.some((c) => c.method === "POST" || c.method === "PATCH"),
+      "no write when schedule/branch already match",
+    );
+    assertEquals(written[0].data.action, "unchanged");
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("cron_delete: already-absent is an idempotent no-op (no DELETE)", async () => {
+  const { caller, calls } = makeFakeApi((c) => {
+    if (c.method === "GET" && c.path === "/api/repos/1/cron") {
+      return { status: 200, body: ([] as unknown) as Record<string, unknown> };
+    }
+    return undefined;
+  });
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("cron_delete").execute(
+      { repo: "1", name: "gone" },
+      context,
+    );
+    assert(
+      !calls.some((c) => c.method === "DELETE"),
+      "no DELETE when the cron is already absent",
+    );
+    assertEquals(written[0].data.action, "unchanged");
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("server_info: healthz 503 -> healthy:false, version surfaced", async () => {
+  const { caller } = makeFakeApi((c) => {
+    if (c.path === "/version") return { version: "3.15.0", source: "x" };
+    if (c.path === "/healthz") return { status: 503, body: {} };
+    return undefined;
+  });
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("server_info").execute({}, context);
+    assertEquals(written[0].data.version, "3.15.0");
+    assertEquals(written[0].data.healthy, false);
+  } finally {
+    __setCaller(null);
+  }
 });

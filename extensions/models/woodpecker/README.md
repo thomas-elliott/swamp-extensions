@@ -52,6 +52,62 @@ Optional global arg: `httpTimeoutMs` (default 30000).
 `repo_available` (forge repos + whether each is enabled), `org_get`,
 `org_secret_list`, `repo_secret_list`, `pipeline_list`, `pipeline_last`.
 
+**Observability (the day-to-day surface):**
+
+```bash
+# Fleet dashboard — last pipeline status for every enabled repo, in one call.
+swamp model method run woodpecker status_all --input '{}'
+
+# Watch a run to completion (defaults to the repo's latest); writes the final
+# status plus every step, so the failed step is right there.
+swamp model method run woodpecker pipeline_wait \
+  --input '{"repo":"thomas-elliott/taskmanager"}'
+
+# Per-step states for a pipeline (defaults to latest).
+swamp model method run woodpecker pipeline_steps \
+  --input '{"repo":"thomas-elliott/taskmanager"}'
+
+# Decoded logs for one step (by name or id), last N lines — no curl + base64.
+swamp model method run woodpecker pipeline_logs \
+  --input '{"repo":"thomas-elliott/taskmanager","step":"dotnet","tailLines":50}'
+```
+
+- `status_all` — one `repo-status` per enabled repo (`status`, last
+  number/event/ branch; `none` if it never ran). Optional `match` substring
+  filter.
+- `pipeline_steps` — `{workflow, name, state, exitCode, error}` per step.
+- `pipeline_logs` — fetches and **decodes** a step's logs (base64 handled
+  server-side), returning the last `tailLines` (default 200; `0` = all).
+- `pipeline_wait` — polls until terminal (success/failure/error/killed/declined/
+  blocked); `timeoutSec` (default 600) and `pollIntervalSec` (default 5).
+
+**Run control:**
+
+- `pipeline_restart` — re-run a pipeline (creates a new run), e.g. after fixing
+  infra instead of an empty commit.
+- `pipeline_cancel` — stop a running pipeline (no-op if already finished).
+- `pipeline_approve` / `pipeline_decline` — release a pipeline blocked by
+  `require_approval`.
+
+All four default to the repo's latest pipeline; pass `number` to target a
+specific run.
+
+**Infra / health (admin reads):**
+
+- `agent_list` — build agents + health (`online` = contacted in the last 2 min,
+  `version`, `capacity`, `lastContact`).
+- `queue_info` — server build-queue stats (pending/running/worker counts;
+  paused).
+- `server_info` — server version + health.
+
+**Scheduled pipelines (cron):**
+
+- `cron_list` — a repo's cron jobs.
+- `cron_set` — create-or-update a cron by name (idempotent). `schedule` is a
+  cron expression or an `@daily`/`@hourly`/… macro; optional `branch`.
+- `cron_delete` — delete a cron by name (reversible: re-create with `cron_set`;
+  already-absent is a no-op).
+
 **Onboard a repo (the one-liner):**
 
 ```bash
@@ -91,7 +147,7 @@ swamp model method run woodpecker org_secret_set \
 **Action:** `pipeline_trigger` (run a pipeline on a branch).
 
 Every method writes one resource carrying the entity plus an `action`
-(`created|unchanged|updated|enabled|disabled|repaired|deleted|triggered|observed`)
+(`created|unchanged|updated|enabled|disabled|repaired|deleted|triggered|restarted|cancelled|approved|declined|observed`)
 and a `timestamp`.
 
 ## Notes

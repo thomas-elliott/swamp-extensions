@@ -31,11 +31,16 @@ import type {
  * Method sections (by prefix):
  *   - read/audit: `repo_list`, `repo_get`, `repo_available`, `org_get`,
  *     `org_secret_list`, `repo_secret_list`, `pipeline_list`, `pipeline_last`.
+ *   - observability: `pipeline_steps`, `pipeline_logs`, `pipeline_wait`,
+ *     `status_all` (fleet dashboard).
  *   - provision: `repo_enable`, `repo_update`, `repo_repair`,
  *     `org_secret_set`, `repo_secret_set`.
  *   - reversible lifecycle: `repo_disable`, `org_secret_delete`,
- *     `repo_secret_delete`.
- *   - action: `pipeline_trigger`.
+ *     `repo_secret_delete`, `cron_delete`.
+ *   - run control: `pipeline_trigger`, `pipeline_restart`, `pipeline_cancel`,
+ *     `pipeline_approve`, `pipeline_decline`.
+ *   - infra/health: `agent_list`, `queue_info`, `server_info`.
+ *   - scheduled pipelines: `cron_list`, `cron_set`, `cron_delete`.
  *
  * Idempotency: `repo_enable` finds-or-activates by `owner/name` and converges
  * the supplied settings in place; the `*_secret_set` methods create-or-update by
@@ -74,6 +79,10 @@ const Action = z.enum([
   "repaired",
   "deleted",
   "triggered",
+  "restarted",
+  "cancelled",
+  "approved",
+  "declined",
   "observed",
 ]);
 
@@ -142,6 +151,93 @@ const PipelineInfo = z.object({
   branch: z.string().optional(),
   commit: z.string().optional(),
   message: z.string().optional(),
+  createdAt: z.string().optional(),
+  action: Action,
+  timestamp: z.string(),
+});
+
+const PipelineStepInfo = z.object({
+  repo: z.string(),
+  pipelineNumber: z.number(),
+  workflow: z.string().describe("Parent workflow name."),
+  name: z.string().describe("Step name."),
+  state: z.string().describe(
+    "pending | running | success | failure | skipped | killed | …",
+  ),
+  exitCode: z.number().optional(),
+  error: z.string().optional(),
+  action: Action,
+  timestamp: z.string(),
+});
+
+const PipelineLogInfo = z.object({
+  repo: z.string(),
+  pipelineNumber: z.number(),
+  step: z.string().describe("Step name."),
+  stepId: z.number(),
+  lineCount: z.number().describe("Number of log lines returned."),
+  truncated: z.boolean().describe(
+    "True if older lines were dropped (tailLines).",
+  ),
+  text: z.string().describe("Decoded log text (the last `tailLines` lines)."),
+  action: Action,
+  timestamp: z.string(),
+});
+
+const RepoStatusInfo = z.object({
+  repo: z.string(),
+  repoId: z.number(),
+  status: z.string().describe(
+    "The repo's latest pipeline status, or 'none' if it never ran.",
+  ),
+  number: z.number().optional(),
+  event: z.string().optional(),
+  branch: z.string().optional(),
+  finishedAt: z.string().optional(),
+  action: Action,
+  timestamp: z.string(),
+});
+
+const AgentInfo = z.object({
+  id: z.number(),
+  name: z.string().optional(),
+  online: z.boolean().optional().describe(
+    "Derived: contacted within the last 2 minutes.",
+  ),
+  lastContact: z.string().optional(),
+  version: z.string().optional(),
+  capacity: z.number().optional(),
+  noSchedule: z.boolean().optional(),
+  action: Action,
+  timestamp: z.string(),
+});
+
+const QueueStats = z.object({
+  paused: z.boolean().optional(),
+  pending: z.number(),
+  waitingOnDeps: z.number(),
+  running: z.number(),
+  completed: z.number(),
+  workerCount: z.number(),
+  action: Action,
+  timestamp: z.string(),
+});
+
+const ServerStatus = z.object({
+  version: z.string(),
+  source: z.string().optional(),
+  healthy: z.boolean(),
+  action: Action,
+  timestamp: z.string(),
+});
+
+const CronInfo = z.object({
+  repo: z.string(),
+  id: z.number().optional(),
+  name: z.string(),
+  schedule: z.string().describe("Cron expression or @hourly/@daily/… macro."),
+  branch: z.string().optional(),
+  nextExec: z.string().optional(),
   createdAt: z.string().optional(),
   action: Action,
   timestamp: z.string(),
@@ -543,6 +639,158 @@ function toPipelineInfo(
   };
 }
 
+/** Decode a base64 log payload to UTF-8 text (non-fatal: bad bytes → U+FFFD). */
+function b64decode(s: string): string {
+  try {
+    const bin = atob(s);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return new TextDecoder().decode(bytes);
+  } catch {
+    return "";
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Terminal pipeline statuses — a wait loop stops on any of these. */
+const TERMINAL = new Set([
+  "success",
+  "failure",
+  "error",
+  "killed",
+  "declined",
+  "blocked",
+  "skipped",
+]);
+function isTerminal(status: string): boolean {
+  return TERMINAL.has(status);
+}
+
+/** Convert a unix-seconds timestamp to ISO, or undefined if absent/zero. */
+function unixToIso(v: unknown): string | undefined {
+  if (v == null) return undefined;
+  const n = Number(v);
+  return Number.isFinite(n) && n > 0
+    ? new Date(n * 1000).toISOString()
+    : undefined;
+}
+
+/** Resolve a pipeline number: the given one, or look up the repo's latest. */
+async function resolveNumber(
+  g: GlobalArgsT,
+  repoId: number,
+  number?: number,
+): Promise<number> {
+  if (number !== undefined) return number;
+  const r = await call(g, {
+    method: "GET",
+    path: `/api/repos/${repoId}/pipelines/latest`,
+  });
+  return Number(r.body.number ?? 0);
+}
+
+/** Fetch one pipeline (with its workflows/steps) by number. */
+async function getPipeline(
+  g: GlobalArgsT,
+  repoId: number,
+  number: number,
+): Promise<Json> {
+  const r = await call(g, {
+    method: "GET",
+    path: `/api/repos/${repoId}/pipelines/${number}`,
+  });
+  return r.body;
+}
+
+/** Flatten a pipeline's workflows[].children[] into step records. */
+function toSteps(
+  repo: string,
+  pipelineNumber: number,
+  pipeline: Json,
+  action: z.infer<typeof Action>,
+): Array<z.infer<typeof PipelineStepInfo>> {
+  const out: Array<z.infer<typeof PipelineStepInfo>> = [];
+  const ts = nowIso();
+  for (const wf of asArray(pipeline.workflows)) {
+    const wfName = String(wf.name ?? "");
+    for (const child of asArray(wf.children)) {
+      out.push({
+        repo,
+        pipelineNumber,
+        workflow: wfName,
+        name: String(child.name ?? ""),
+        state: String(child.state ?? "unknown"),
+        exitCode: child.exit_code != null ? Number(child.exit_code) : undefined,
+        error: typeof child.error === "string" && child.error
+          ? child.error
+          : undefined,
+        action,
+        timestamp: ts,
+      });
+    }
+  }
+  return out;
+}
+
+/** Find a step (by name or numeric id) within a pipeline's workflows. */
+function findStep(
+  pipeline: Json,
+  step: string,
+): { id: number; name: string } | null {
+  const want = step.trim();
+  for (const wf of asArray(pipeline.workflows)) {
+    for (const child of asArray(wf.children)) {
+      if (
+        String(child.name ?? "") === want || String(child.id ?? "") === want
+      ) {
+        return { id: Number(child.id ?? 0), name: String(child.name ?? "") };
+      }
+    }
+  }
+  return null;
+}
+
+/** Normalise a raw agent object into {@link AgentInfo}, deriving `online`. */
+function toAgent(a: Json): z.infer<typeof AgentInfo> {
+  const lc = a.last_contact != null ? Number(a.last_contact) : 0;
+  const online = Number.isFinite(lc) && lc > 0
+    ? (Date.now() / 1000 - lc) < 120
+    : undefined;
+  return {
+    id: Number(a.id ?? 0),
+    name: typeof a.name === "string" ? a.name : undefined,
+    online,
+    lastContact: unixToIso(a.last_contact),
+    version: typeof a.version === "string" ? a.version : undefined,
+    capacity: a.capacity != null ? Number(a.capacity) : undefined,
+    noSchedule: typeof a.no_schedule === "boolean" ? a.no_schedule : undefined,
+    action: "observed",
+    timestamp: nowIso(),
+  };
+}
+
+/** Normalise a raw cron object into {@link CronInfo}. */
+function toCron(
+  repo: string,
+  c: Json,
+  action: z.infer<typeof Action>,
+): z.infer<typeof CronInfo> {
+  return {
+    repo,
+    id: c.id != null ? Number(c.id) : undefined,
+    name: String(c.name ?? ""),
+    schedule: String(c.schedule ?? ""),
+    branch: typeof c.branch === "string" && c.branch ? c.branch : undefined,
+    nextExec: unixToIso(c.next_exec),
+    createdAt: unixToIso(c.created),
+    action,
+    timestamp: nowIso(),
+  };
+}
+
 // ─────────────────────────── argument schemas ───────────────────────────
 
 const Empty = z.object({});
@@ -659,6 +907,52 @@ const PipelineTriggerArgs = z.object({
   ),
 });
 
+/** A pipeline reference: repo + an optional number (defaults to latest). */
+const PipelineRef = z.object({
+  repo: z.string().describe('Repo reference: numeric id or "owner/name".'),
+  number: z.coerce.number().int().optional().describe(
+    "Pipeline number (defaults to the repo's latest pipeline).",
+  ),
+});
+
+const PipelineLogsArgs = PipelineRef.extend({
+  step: z.string().describe("Step name (e.g. 'dotnet') or numeric step id."),
+  tailLines: z.coerce.number().int().default(200).describe(
+    "Return only the last N decoded log lines (0 = all).",
+  ),
+});
+
+const PipelineWaitArgs = PipelineRef.extend({
+  timeoutSec: z.coerce.number().int().default(600).describe(
+    "Give up waiting after this many seconds (returns the non-terminal state).",
+  ),
+  pollIntervalSec: z.coerce.number().int().default(5).describe(
+    "Seconds between status polls.",
+  ),
+});
+
+const StatusAllArgs = z.object({
+  match: z.string().optional().describe(
+    "Case-insensitive substring filter on the repo full name.",
+  ),
+});
+
+const CronSetArgs = z.object({
+  repo: z.string().describe('Repo reference: numeric id or "owner/name".'),
+  name: z.string().describe("Cron job name (unique within the repo)."),
+  schedule: z.string().describe(
+    "Schedule: a cron expression or an @hourly/@daily/@weekly/… macro.",
+  ),
+  branch: z.string().optional().describe(
+    "Branch to run (defaults to the repo's default branch).",
+  ),
+});
+
+const CronDeleteArgs = z.object({
+  repo: z.string().describe('Repo reference: numeric id or "owner/name".'),
+  name: z.string().describe("Cron job name to delete (reversible: re-create)."),
+});
+
 // ─────────────────────────── model ───────────────────────────
 
 /**
@@ -668,7 +962,7 @@ const PipelineTriggerArgs = z.object({
  */
 export const model = {
   type: "@thomas/woodpecker",
-  version: "2026.06.04.1",
+  version: "2026.06.04.2",
   globalArguments: GlobalArgs,
   checks: {
     "reachable": {
@@ -732,6 +1026,48 @@ export const model = {
       schema: PipelineInfo,
       lifetime: "infinite",
       garbageCollection: 10,
+    },
+    "pipeline-step": {
+      description: "One step of a pipeline run and its state.",
+      schema: PipelineStepInfo,
+      lifetime: "infinite",
+      garbageCollection: 50,
+    },
+    "pipeline-log": {
+      description: "Decoded logs for one pipeline step.",
+      schema: PipelineLogInfo,
+      lifetime: "infinite",
+      garbageCollection: 10,
+    },
+    "repo-status": {
+      description: "A repo's latest pipeline status (the fleet dashboard).",
+      schema: RepoStatusInfo,
+      lifetime: "infinite",
+      garbageCollection: 20,
+    },
+    "agent": {
+      description: "A Woodpecker build agent and its health.",
+      schema: AgentInfo,
+      lifetime: "infinite",
+      garbageCollection: 10,
+    },
+    "queue": {
+      description: "Server build-queue statistics.",
+      schema: QueueStats,
+      lifetime: "infinite",
+      garbageCollection: 10,
+    },
+    "server": {
+      description: "Server version and health.",
+      schema: ServerStatus,
+      lifetime: "infinite",
+      garbageCollection: 10,
+    },
+    "cron": {
+      description: "A repo's scheduled-pipeline (cron) job.",
+      schema: CronInfo,
+      lifetime: "infinite",
+      garbageCollection: 20,
     },
   },
   methods: {
@@ -937,6 +1273,187 @@ export const model = {
           toPipelineInfo(a.repo, r.body, "observed"),
         );
         return { dataHandles: [handle] };
+      },
+    },
+
+    // ───────────── observability ─────────────
+    pipeline_steps: {
+      description:
+        "List a pipeline's steps and their states (factory; defaults to the " +
+        "repo's latest pipeline). Read-only.",
+      arguments: PipelineRef,
+      execute: async (
+        rawArgs,
+        context,
+      ): Promise<{ dataHandles: DataHandle[] }> => {
+        const a = PipelineRef.parse(rawArgs);
+        const g = context.globalArgs;
+        const id = await resolveRepoId(g, a.repo);
+        const number = await resolveNumber(g, id, a.number);
+        const pipe = await getPipeline(g, id, number);
+        const handles: DataHandle[] = [];
+        for (const step of toSteps(a.repo, number, pipe, "observed")) {
+          handles.push(
+            await context.writeResource(
+              "pipeline-step",
+              safeName(`${id}:${number}:${step.workflow}:${step.name}`),
+              step,
+            ),
+          );
+        }
+        return { dataHandles: handles };
+      },
+    },
+    pipeline_logs: {
+      description:
+        "Fetch and decode the logs for one pipeline step (by step name or id; " +
+        "defaults to the repo's latest pipeline), returning the last `tailLines` " +
+        "lines. Read-only.",
+      arguments: PipelineLogsArgs,
+      execute: async (
+        rawArgs,
+        context,
+      ): Promise<{ dataHandles: DataHandle[] }> => {
+        const a = PipelineLogsArgs.parse(rawArgs);
+        const g = context.globalArgs;
+        const id = await resolveRepoId(g, a.repo);
+        const number = await resolveNumber(g, id, a.number);
+        const pipe = await getPipeline(g, id, number);
+        const step = findStep(pipe, a.step);
+        if (!step) {
+          throw new Error(
+            `step ${JSON.stringify(a.step)} not found in ${a.repo} ` +
+              `pipeline #${number}`,
+          );
+        }
+        const r = await call(g, {
+          method: "GET",
+          path: `/api/repos/${id}/logs/${number}/${step.id}`,
+        });
+        const lines = asArray(r.body)
+          .map((e) => b64decode(String((e as Json).data ?? "")))
+          .join("\n")
+          .split("\n");
+        const kept = a.tailLines > 0 ? lines.slice(-a.tailLines) : lines;
+        const handle = await context.writeResource(
+          "pipeline-log",
+          safeName(`${id}:${number}:${step.name}`),
+          {
+            repo: a.repo,
+            pipelineNumber: number,
+            step: step.name,
+            stepId: step.id,
+            lineCount: kept.length,
+            truncated: kept.length < lines.length,
+            text: kept.join("\n"),
+            action: "observed",
+            timestamp: nowIso(),
+          },
+        );
+        return { dataHandles: [handle] };
+      },
+    },
+    pipeline_wait: {
+      description:
+        "Poll a pipeline until it reaches a terminal state (success/failure/…), " +
+        "then write its final status plus every step (so the failed step is " +
+        "visible). Defaults to the repo's latest pipeline; bounded by `timeoutSec`.",
+      arguments: PipelineWaitArgs,
+      execute: async (
+        rawArgs,
+        context,
+      ): Promise<{ dataHandles: DataHandle[] }> => {
+        const a = PipelineWaitArgs.parse(rawArgs);
+        const g = context.globalArgs;
+        const id = await resolveRepoId(g, a.repo);
+        const number = await resolveNumber(g, id, a.number);
+        const deadline = Date.now() + a.timeoutSec * 1000;
+        let pipe: Json = {};
+        let status = "pending";
+        for (;;) {
+          pipe = await getPipeline(g, id, number);
+          status = String(pipe.status ?? "pending");
+          if (isTerminal(status)) break;
+          if (Date.now() >= deadline) {
+            logInfo(context, "Pipeline wait timed out", {
+              repo: a.repo,
+              number,
+              status,
+            });
+            break;
+          }
+          logInfo(context, "Waiting for pipeline", {
+            repo: a.repo,
+            number,
+            status,
+          });
+          await sleep(a.pollIntervalSec * 1000);
+        }
+        const handles: DataHandle[] = [
+          await context.writeResource(
+            "pipeline",
+            `${id}:${number}`,
+            toPipelineInfo(a.repo, pipe, "observed"),
+          ),
+        ];
+        for (const step of toSteps(a.repo, number, pipe, "observed")) {
+          handles.push(
+            await context.writeResource(
+              "pipeline-step",
+              safeName(`${id}:${number}:${step.workflow}:${step.name}`),
+              step,
+            ),
+          );
+        }
+        return { dataHandles: handles };
+      },
+    },
+    status_all: {
+      description:
+        "Fleet dashboard: the latest pipeline status for every enabled repo " +
+        "(factory) — one call to see what's red. Read-only.",
+      arguments: StatusAllArgs,
+      execute: async (
+        rawArgs,
+        context,
+      ): Promise<{ dataHandles: DataHandle[] }> => {
+        const a = StatusAllArgs.parse(rawArgs);
+        const g = context.globalArgs;
+        logInfo(context, "Collecting fleet pipeline status");
+        const r = await call(g, { method: "GET", path: "/api/repos" });
+        const match = a.match?.toLowerCase();
+        const ts = nowIso();
+        const handles: DataHandle[] = [];
+        for (const repo of asArray(r.body)) {
+          const full = String(repo.full_name ?? "");
+          if (match && !full.toLowerCase().includes(match)) continue;
+          const repoId = Number(repo.id ?? 0);
+          const latest = await callTolerant(g, {
+            method: "GET",
+            path: `/api/repos/${repoId}/pipelines/latest`,
+          }, [404]);
+          const p = latest.status === 404 ? {} : latest.body;
+          handles.push(
+            await context.writeResource(
+              "repo-status",
+              safeName(full || String(repoId)),
+              {
+                repo: full,
+                repoId,
+                status: latest.status === 404
+                  ? "none"
+                  : String(p.status ?? "unknown"),
+                number: p.number != null ? Number(p.number) : undefined,
+                event: typeof p.event === "string" ? p.event : undefined,
+                branch: typeof p.branch === "string" ? p.branch : undefined,
+                finishedAt: unixToIso(p.finished),
+                action: "observed",
+                timestamp: ts,
+              },
+            ),
+          );
+        }
+        return { dataHandles: handles };
       },
     },
 
@@ -1260,6 +1777,340 @@ export const model = {
           "pipeline",
           `${id}:${r.body.number}`,
           toPipelineInfo(a.repo, r.body, "triggered"),
+        );
+        return { dataHandles: [handle] };
+      },
+    },
+    pipeline_restart: {
+      description:
+        "Restart (re-run) a pipeline — e.g. after fixing infra, instead of an " +
+        "empty commit. Defaults to the repo's latest. Creates a NEW run.",
+      arguments: PipelineRef,
+      execute: async (
+        rawArgs,
+        context,
+      ): Promise<{ dataHandles: DataHandle[] }> => {
+        const a = PipelineRef.parse(rawArgs);
+        const g = context.globalArgs;
+        const id = await resolveRepoId(g, a.repo);
+        const number = await resolveNumber(g, id, a.number);
+        logInfo(context, "Restarting pipeline", { repo: a.repo, number });
+        const r = await call(g, {
+          method: "POST",
+          path: `/api/repos/${id}/pipelines/${number}`,
+        });
+        const newNum = Number(r.body.number ?? number);
+        const handle = await context.writeResource(
+          "pipeline",
+          `${id}:${newNum}`,
+          toPipelineInfo(a.repo, r.body, "restarted"),
+        );
+        return { dataHandles: [handle] };
+      },
+    },
+    pipeline_cancel: {
+      description:
+        "Cancel a running pipeline (defaults to the repo's latest). Verifies it " +
+        "first; cancelling an already-finished run is a no-op.",
+      arguments: PipelineRef,
+      execute: async (
+        rawArgs,
+        context,
+      ): Promise<{ dataHandles: DataHandle[] }> => {
+        const a = PipelineRef.parse(rawArgs);
+        const g = context.globalArgs;
+        const id = await resolveRepoId(g, a.repo);
+        const number = await resolveNumber(g, id, a.number);
+        const before = await getPipeline(g, id, number);
+        const status = String(before.status ?? "");
+        if (isTerminal(status)) {
+          logInfo(context, "Pipeline already finished; nothing to cancel", {
+            repo: a.repo,
+            number,
+            status,
+          });
+          const handle = await context.writeResource(
+            "pipeline",
+            `${id}:${number}`,
+            toPipelineInfo(a.repo, before, "unchanged"),
+          );
+          return { dataHandles: [handle] };
+        }
+        logInfo(context, "Cancelling pipeline", { repo: a.repo, number });
+        await call(g, {
+          method: "POST",
+          path: `/api/repos/${id}/pipelines/${number}/cancel`,
+        });
+        const after = await getPipeline(g, id, number);
+        const handle = await context.writeResource(
+          "pipeline",
+          `${id}:${number}`,
+          toPipelineInfo(a.repo, after, "cancelled"),
+        );
+        return { dataHandles: [handle] };
+      },
+    },
+    pipeline_approve: {
+      description:
+        "Approve a pipeline blocked pending approval (require_approval). " +
+        "Defaults to the repo's latest.",
+      arguments: PipelineRef,
+      execute: async (
+        rawArgs,
+        context,
+      ): Promise<{ dataHandles: DataHandle[] }> => {
+        const a = PipelineRef.parse(rawArgs);
+        const g = context.globalArgs;
+        const id = await resolveRepoId(g, a.repo);
+        const number = await resolveNumber(g, id, a.number);
+        logInfo(context, "Approving pipeline", { repo: a.repo, number });
+        const r = await call(g, {
+          method: "POST",
+          path: `/api/repos/${id}/pipelines/${number}/approve`,
+        });
+        const handle = await context.writeResource(
+          "pipeline",
+          `${id}:${number}`,
+          toPipelineInfo(a.repo, r.body, "approved"),
+        );
+        return { dataHandles: [handle] };
+      },
+    },
+    pipeline_decline: {
+      description:
+        "Decline a pipeline blocked pending approval (defaults to the repo's " +
+        "latest). To undo, restart it.",
+      arguments: PipelineRef,
+      execute: async (
+        rawArgs,
+        context,
+      ): Promise<{ dataHandles: DataHandle[] }> => {
+        const a = PipelineRef.parse(rawArgs);
+        const g = context.globalArgs;
+        const id = await resolveRepoId(g, a.repo);
+        const number = await resolveNumber(g, id, a.number);
+        logInfo(context, "Declining pipeline", { repo: a.repo, number });
+        const r = await call(g, {
+          method: "POST",
+          path: `/api/repos/${id}/pipelines/${number}/decline`,
+        });
+        const handle = await context.writeResource(
+          "pipeline",
+          `${id}:${number}`,
+          toPipelineInfo(a.repo, r.body, "declined"),
+        );
+        return { dataHandles: [handle] };
+      },
+    },
+
+    // ───────────── infra / health ─────────────
+    agent_list: {
+      description:
+        "List the server's build agents and their health (last contact, version, " +
+        "capacity; factory). Admin read.",
+      arguments: Empty,
+      execute: async (
+        _rawArgs,
+        context,
+      ): Promise<{ dataHandles: DataHandle[] }> => {
+        const g = context.globalArgs;
+        logInfo(context, "Listing agents");
+        const r = await call(g, { method: "GET", path: "/api/agents" });
+        const handles: DataHandle[] = [];
+        for (const ag of asArray(r.body)) {
+          handles.push(
+            await context.writeResource(
+              "agent",
+              String(ag.id ?? ""),
+              toAgent(ag),
+            ),
+          );
+        }
+        return { dataHandles: handles };
+      },
+    },
+    queue_info: {
+      description:
+        "Server build-queue statistics (pending/running/worker counts; paused). " +
+        "Admin read.",
+      arguments: Empty,
+      execute: async (
+        _rawArgs,
+        context,
+      ): Promise<{ dataHandles: DataHandle[] }> => {
+        const g = context.globalArgs;
+        const r = await call(g, { method: "GET", path: "/api/queue/info" });
+        const b = r.body;
+        const stats = (b.stats ?? {}) as Json;
+        const handle = await context.writeResource("queue", "queue", {
+          paused: typeof b.paused === "boolean" ? b.paused : undefined,
+          pending: Number(stats.pending_count ?? asArray(b.pending).length),
+          waitingOnDeps: Number(
+            stats.waiting_on_deps_count ?? asArray(b.waiting_on_deps).length,
+          ),
+          running: Number(stats.running_count ?? asArray(b.running).length),
+          completed: Number(stats.completed_count ?? 0),
+          workerCount: Number(stats.worker_count ?? 0),
+          action: "observed",
+          timestamp: nowIso(),
+        });
+        return { dataHandles: [handle] };
+      },
+    },
+    server_info: {
+      description:
+        "Server version and health (GET /version + /healthz). Read-only.",
+      arguments: Empty,
+      execute: async (
+        _rawArgs,
+        context,
+      ): Promise<{ dataHandles: DataHandle[] }> => {
+        const g = context.globalArgs;
+        // /version and /healthz live OUTSIDE the /api prefix — the /api/* forms
+        // are swallowed by the SPA catch-all and return HTML, not JSON.
+        const ver = await call(g, { method: "GET", path: "/version" });
+        const health = await callTolerant(g, {
+          method: "GET",
+          path: "/healthz",
+        }, [500, 503]);
+        const handle = await context.writeResource("server", "server", {
+          version: String(ver.body.version ?? "unknown"),
+          source: typeof ver.body.source === "string"
+            ? ver.body.source
+            : undefined,
+          healthy: health.status < 400,
+          action: "observed",
+          timestamp: nowIso(),
+        });
+        return { dataHandles: [handle] };
+      },
+    },
+
+    // ───────────── scheduled pipelines (cron) ─────────────
+    cron_list: {
+      description:
+        "List a repo's scheduled-pipeline (cron) jobs (factory). Read-only.",
+      arguments: RepoRef,
+      execute: async (
+        rawArgs,
+        context,
+      ): Promise<{ dataHandles: DataHandle[] }> => {
+        const a = RepoRef.parse(rawArgs);
+        const g = context.globalArgs;
+        const id = await resolveRepoId(g, a.repo);
+        const r = await call(g, {
+          method: "GET",
+          path: `/api/repos/${id}/cron`,
+        });
+        const handles: DataHandle[] = [];
+        for (const c of asArray(r.body)) {
+          handles.push(
+            await context.writeResource(
+              "cron",
+              safeName(`${id}:${c.name}`),
+              toCron(a.repo, c, "observed"),
+            ),
+          );
+        }
+        return { dataHandles: handles };
+      },
+    },
+    cron_set: {
+      description:
+        "Create-or-update a scheduled-pipeline (cron) job by name (idempotent: " +
+        "reports unchanged when the schedule/branch already match).",
+      arguments: CronSetArgs,
+      execute: async (
+        rawArgs,
+        context,
+      ): Promise<{ dataHandles: DataHandle[] }> => {
+        const a = CronSetArgs.parse(rawArgs);
+        const g = context.globalArgs;
+        const id = await resolveRepoId(g, a.repo);
+        const list = await call(g, {
+          method: "GET",
+          path: `/api/repos/${id}/cron`,
+        });
+        const existing = asArray(list.body).find((c) =>
+          String(c.name ?? "") === a.name
+        );
+        const payload: Json = { name: a.name, schedule: a.schedule };
+        if (a.branch) payload.branch = a.branch;
+        let raw: Json;
+        let action: "created" | "updated" | "unchanged";
+        if (!existing) {
+          logInfo(context, "Creating cron", { repo: a.repo, name: a.name });
+          const r = await call(g, {
+            method: "POST",
+            path: `/api/repos/${id}/cron`,
+            body: payload,
+          });
+          raw = r.body;
+          action = "created";
+        } else if (
+          String(existing.schedule ?? "") === a.schedule &&
+          String(existing.branch ?? "") === (a.branch ?? "")
+        ) {
+          raw = existing;
+          action = "unchanged";
+        } else {
+          logInfo(context, "Updating cron", { repo: a.repo, name: a.name });
+          const r = await call(g, {
+            method: "PATCH",
+            path: `/api/repos/${id}/cron/${existing.id}`,
+            body: { id: existing.id, ...payload },
+          });
+          raw = r.body;
+          action = "updated";
+        }
+        const handle = await context.writeResource(
+          "cron",
+          safeName(`${id}:${a.name}`),
+          toCron(a.repo, { ...raw, name: a.name }, action),
+        );
+        return { dataHandles: [handle] };
+      },
+    },
+    cron_delete: {
+      description:
+        "Delete a scheduled-pipeline (cron) job by name. REVERSIBLE — re-create " +
+        "with cron_set. Idempotent: already-absent is a no-op.",
+      arguments: CronDeleteArgs,
+      execute: async (
+        rawArgs,
+        context,
+      ): Promise<{ dataHandles: DataHandle[] }> => {
+        const a = CronDeleteArgs.parse(rawArgs);
+        const g = context.globalArgs;
+        const id = await resolveRepoId(g, a.repo);
+        const list = await call(g, {
+          method: "GET",
+          path: `/api/repos/${id}/cron`,
+        });
+        const existing = asArray(list.body).find((c) =>
+          String(c.name ?? "") === a.name
+        );
+        if (!existing) {
+          logInfo(context, "Cron already absent", {
+            repo: a.repo,
+            name: a.name,
+          });
+          const handle = await context.writeResource(
+            "cron",
+            safeName(`${id}:${a.name}`),
+            toCron(a.repo, { name: a.name, schedule: "" }, "unchanged"),
+          );
+          return { dataHandles: [handle] };
+        }
+        logInfo(context, "Deleting cron", { repo: a.repo, name: a.name });
+        await call(g, {
+          method: "DELETE",
+          path: `/api/repos/${id}/cron/${existing.id}`,
+        });
+        const handle = await context.writeResource(
+          "cron",
+          safeName(`${id}:${a.name}`),
+          toCron(a.repo, { ...existing, name: a.name }, "deleted"),
         );
         return { dataHandles: [handle] };
       },
