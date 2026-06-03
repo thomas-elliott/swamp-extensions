@@ -1,0 +1,34 @@
+manifestVersion: 1
+name: "@thomas/woodpecker"
+version: 2026.06.04.1
+description: >-
+  Careful administration of a Woodpecker CI server over its REST API,
+  authenticated with a personal access token. Onboard and configure
+  repositories (enable, mark trusted, set timeout/visibility/approval),
+  promote shared CI credentials to org- or repo-scoped secrets idempotently,
+  inspect recent pipelines, and trigger runs. Mutations are additive or
+  reversible (disable/secret-delete undo by re-running enable/set); secret
+  values are write-only — supplied via a vault reference, sent once, and never
+  read back or emitted.
+repository: https://github.com/thomas-elliott/swamp-extensions
+paths:
+  base: manifest
+models:
+  - woodpecker.ts
+workflows: []
+vaults: []
+drivers: []
+datastores: []
+reports: []
+skills: []
+additionalFiles:
+  - README.md
+  - LICENSE.txt
+labels:
+  - woodpecker
+  - ci
+  - cicd
+  - pipelines
+  - devops
+  - admin
+dependencies: []
