@@ -1,6 +1,6 @@
 manifestVersion: 1
 name: "@thomas/woodpecker"
-version: 2026.06.04.2
+version: 2026.06.04.3
 description: >-
   Careful administration of a Woodpecker CI server over its REST API,
   authenticated with a personal access token. Onboard and configure

@@ -678,18 +678,33 @@ function unixToIso(v: unknown): string | undefined {
     : undefined;
 }
 
-/** Resolve a pipeline number: the given one, or look up the repo's latest. */
+/**
+ * The most recent pipeline for a repo, of ANY event (returns null if the repo
+ * has never run). NB: the dedicated `/pipelines/latest` endpoint only considers
+ * the DEFAULT BRANCH and silently excludes tag pipelines, so a just-cut release
+ * would be invisible — list-most-recent instead.
+ */
+async function latestPipeline(
+  g: GlobalArgsT,
+  repoId: number,
+): Promise<Json | null> {
+  const r = await call(g, {
+    method: "GET",
+    path: `/api/repos/${repoId}/pipelines?perPage=1`,
+  });
+  return asArray(r.body)[0] ?? null;
+}
+
+/** Resolve a pipeline number: the given one, or the repo's most recent run. */
 async function resolveNumber(
   g: GlobalArgsT,
   repoId: number,
   number?: number,
 ): Promise<number> {
   if (number !== undefined) return number;
-  const r = await call(g, {
-    method: "GET",
-    path: `/api/repos/${repoId}/pipelines/latest`,
-  });
-  return Number(r.body.number ?? 0);
+  const p = await latestPipeline(g, repoId);
+  if (!p) throw new Error(`repo ${repoId} has no pipelines yet`);
+  return Number(p.number ?? 0);
 }
 
 /** Fetch one pipeline (with its workflows/steps) by number. */
@@ -962,7 +977,7 @@ const CronDeleteArgs = z.object({
  */
 export const model = {
   type: "@thomas/woodpecker",
-  version: "2026.06.04.2",
+  version: "2026.06.04.3",
   globalArguments: GlobalArgs,
   checks: {
     "reachable": {
@@ -1254,7 +1269,9 @@ export const model = {
       },
     },
     pipeline_last: {
-      description: "Get the latest pipeline for a repo. Read-only.",
+      description:
+        "Get the most recent pipeline for a repo, of any event (incl. tags). " +
+        "Read-only.",
       arguments: RepoRef,
       execute: async (
         rawArgs,
@@ -1263,14 +1280,12 @@ export const model = {
         const a = RepoRef.parse(rawArgs);
         const g = context.globalArgs;
         const id = await resolveRepoId(g, a.repo);
-        const r = await call(g, {
-          method: "GET",
-          path: `/api/repos/${id}/pipelines/latest`,
-        });
+        const p = await latestPipeline(g, id);
+        if (!p) throw new Error(`repo ${a.repo} has no pipelines yet`);
         const handle = await context.writeResource(
           "pipeline",
-          `${id}:${r.body.number}`,
-          toPipelineInfo(a.repo, r.body, "observed"),
+          `${id}:${p.number}`,
+          toPipelineInfo(a.repo, p, "observed"),
         );
         return { dataHandles: [handle] };
       },
@@ -1428,11 +1443,8 @@ export const model = {
           const full = String(repo.full_name ?? "");
           if (match && !full.toLowerCase().includes(match)) continue;
           const repoId = Number(repo.id ?? 0);
-          const latest = await callTolerant(g, {
-            method: "GET",
-            path: `/api/repos/${repoId}/pipelines/latest`,
-          }, [404]);
-          const p = latest.status === 404 ? {} : latest.body;
+          const p = (await latestPipeline(g, repoId)) ?? {};
+          const ran = p.number != null;
           handles.push(
             await context.writeResource(
               "repo-status",
@@ -1440,9 +1452,7 @@ export const model = {
               {
                 repo: full,
                 repoId,
-                status: latest.status === 404
-                  ? "none"
-                  : String(p.status ?? "unknown"),
+                status: ran ? String(p.status ?? "unknown") : "none",
                 number: p.number != null ? Number(p.number) : undefined,
                 event: typeof p.event === "string" ? p.event : undefined,
                 branch: typeof p.branch === "string" ? p.branch : undefined,

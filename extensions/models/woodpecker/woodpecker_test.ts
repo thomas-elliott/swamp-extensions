@@ -473,7 +473,14 @@ function pipelineWithSteps(
 
 Deno.test("pipeline_steps: number omitted -> resolves latest, then flattens steps", async () => {
   const { caller, calls } = makeFakeApi((c) => {
-    if (c.path === "/api/repos/1/pipelines/latest") return { number: 5 };
+    // "latest" must list the most-recent of ANY event (perPage=1), NOT the
+    // /pipelines/latest endpoint (which silently excludes tag pipelines).
+    if (c.path === "/api/repos/1/pipelines?perPage=1") {
+      return {
+        status: 200,
+        body: ([{ number: 5 }] as unknown) as Record<string, unknown>,
+      };
+    }
     if (c.path === "/api/repos/1/pipelines/5") return pipelineWithSteps();
     return undefined;
   });
@@ -482,8 +489,12 @@ Deno.test("pipeline_steps: number omitted -> resolves latest, then flattens step
     const { context, written } = makeContext();
     await method("pipeline_steps").execute({ repo: "1" }, context);
     assert(
-      calls.some((c) => c.path === "/api/repos/1/pipelines/latest"),
-      "resolves latest when number omitted",
+      calls.some((c) => c.path === "/api/repos/1/pipelines?perPage=1"),
+      "resolves latest via list (includes tag pipelines)",
+    );
+    assert(
+      !calls.some((c) => c.path === "/api/repos/1/pipelines/latest"),
+      "must NOT use /pipelines/latest (excludes tags)",
     );
     assertEquals(written.length, 2, "one resource per step");
     assertEquals(written[0].data.name, "go");
@@ -592,10 +603,21 @@ Deno.test("status_all: per-repo latest; 404 latest -> status 'none'", async () =
         ] as unknown) as Record<string, unknown>,
       };
     }
-    if (c.path === "/api/repos/1/pipelines/latest") {
-      return { status: "success", number: 3, event: "push", branch: "main" };
+    if (c.path === "/api/repos/1/pipelines?perPage=1") {
+      return {
+        status: 200,
+        body: ([{
+          status: "success",
+          number: 3,
+          event: "push",
+          branch: "main",
+        }] as unknown) as Record<string, unknown>,
+      };
     }
-    if (c.path === "/api/repos/2/pipelines/latest") return undefined; // 404
+    if (c.path === "/api/repos/2/pipelines?perPage=1") {
+      // empty list -> repo has never run
+      return { status: 200, body: ([] as unknown) as Record<string, unknown> };
+    }
     return undefined;
   });
   __setCaller(caller);
