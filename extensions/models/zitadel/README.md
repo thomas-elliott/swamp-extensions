@@ -115,8 +115,9 @@ and a `timestamp`.
 
 ## Notes
 
-- Zero npm dependencies — JWT signing uses the runtime's `node:crypto` (Zitadel
-  issues PKCS#1 RSA keys, signed natively).
+- Zero dependencies and no `node:` imports — JWT signing uses the Web Crypto API
+  (`crypto.subtle`). Zitadel issues PKCS#1 RSA keys, which are wrapped to PKCS#8
+  (a fixed DER envelope) before importing, since Web Crypto imports only PKCS#8.
 - Targets the stable Management v1 API. For very large user bases the v2 User
   API is Zitadel's recommended surface; a future version may switch user methods
   over.
