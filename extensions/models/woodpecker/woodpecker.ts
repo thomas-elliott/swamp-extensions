@@ -977,7 +977,7 @@ const CronDeleteArgs = z.object({
  */
 export const model = {
   type: "@thomas/woodpecker",
-  version: "2026.06.04.3",
+  version: "2026.06.04.1",
   globalArguments: GlobalArgs,
   checks: {
     "reachable": {
