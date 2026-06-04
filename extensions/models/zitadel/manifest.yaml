@@ -1,0 +1,35 @@
+manifestVersion: 1
+name: "@thomas/zitadel"
+version: 2026.06.04.1
+description: >-
+  Careful, non-destructive administration of a Zitadel instance over its
+  Management API (v1 REST), authenticated with a JWT private-key service account.
+  Read/audit of orgs, projects, applications, users and managers; idempotent
+  provisioning of OIDC/API applications and machine (service) users; project-role
+  and user-grant authorization (roles, grants, and the role-assertion flag that
+  surfaces roles in tokens); rotation of client secrets, PATs, machine keys and
+  secrets; and reversible deactivate/reactivate. Machine identities only. The only
+  hard delete is a single, verify-first project-role removal (roles have no
+  deactivate state); secrets are emitted once and marked sensitive.
+repository: https://github.com/thomas-elliott/swamp-extensions
+paths:
+  base: manifest
+models:
+  - zitadel.ts
+workflows: []
+vaults: []
+drivers: []
+datastores: []
+reports: []
+skills: []
+additionalFiles:
+  - README.md
+  - LICENSE.txt
+labels:
+  - zitadel
+  - oidc
+  - iam
+  - auth
+  - identity
+  - admin
+dependencies: []
