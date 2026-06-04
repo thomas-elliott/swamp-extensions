@@ -68,9 +68,9 @@ authorization flags), `app_list`, `app_get`, `user_list`, `manager_audit`,
 ```bash
 # Find-or-create the project, create/update the OIDC client, get clientId (+ secret once)
 swamp model method run zitadel oidc_app_ensure \
-  --arg project=homelab --arg name=grafana \
-  --arg 'redirectUris=["https://grafana.example.com/login/generic_oauth"]' \
-  --arg appType=web --arg authMethod=basic
+  --input project=homelab --input name=grafana \
+  --input 'redirectUris=["https://grafana.example.com/login/generic_oauth"]' \
+  --input appType=web --input authMethod=basic
 ```
 
 - `project_ensure` — find-or-create a project by name.
@@ -87,11 +87,11 @@ swamp model method run zitadel oidc_app_ensure \
 ```bash
 # Define a role, grant it to a user, and make roles appear in that project's tokens
 swamp model method run zitadel role_ensure \
-  --arg project=homelab --arg key=admin --arg displayName=Admin
+  --input project=homelab --input key=admin --input displayName=Admin
 swamp model method run zitadel grant_ensure \
-  --arg user=thomas@smol.cloud --arg project=homelab --arg 'roleKeys=["admin"]'
+  --input user=thomas@smol.cloud --input project=homelab --input 'roleKeys=["admin"]'
 swamp model method run zitadel project_authz_set \
-  --arg project=homelab --arg roleAssertion=true
+  --input project=homelab --input roleAssertion=true
 ```
 
 - `role_ensure` — find-or-create a project role by `key`; converge
