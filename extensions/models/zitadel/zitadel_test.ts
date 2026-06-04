@@ -11,6 +11,7 @@ import {
   type ApiCall,
   type ApiResult,
   type CallerFn,
+  importSigningKey,
   jwtAssertionClaims,
   model,
 } from "./zitadel.ts";
@@ -110,6 +111,69 @@ Deno.test("jwtAssertionClaims: iss==sub==userId, aud trimmed, 1h life", () => {
   );
   assertEquals(c.iat, 1000);
   assertEquals(c.exp, 4600, "exp = iat + 3600");
+});
+
+// Web Crypto signing: prove importSigningKey works for BOTH a PKCS#8 key and a
+// PKCS#1 key (the format Zitadel issues, exercised via the pkcs1ToPkcs8 wrapper),
+// by signing with the imported key and verifying against the matching public key.
+function derToPem(der: Uint8Array, label: string): string {
+  let s = "";
+  for (const b of der) s += String.fromCharCode(b);
+  return `-----BEGIN ${label}-----\n${btoa(s)}\n-----END ${label}-----`;
+}
+// Unwrap a PKCS#8 PrivateKeyInfo to its inner PKCS#1 RSAPrivateKey (the final
+// OCTET STRING). Web Crypto can only export PKCS#8, so this derives a genuine
+// PKCS#1 key to feed back through importSigningKey's wrapper path.
+function pkcs8ToPkcs1(pkcs8: Uint8Array): Uint8Array {
+  let p = 0;
+  const readLen = () => {
+    let l = pkcs8[p++];
+    if (l & 0x80) {
+      const n = l & 0x7f;
+      l = 0;
+      for (let i = 0; i < n; i++) l = l * 256 + pkcs8[p++];
+    }
+    return l;
+  };
+  if (pkcs8[p++] !== 0x30) throw new Error("not a SEQUENCE");
+  readLen();
+  while (p < pkcs8.length) {
+    const tag = pkcs8[p++];
+    const len = readLen();
+    if (tag === 0x04) return pkcs8.slice(p, p + len);
+    p += len;
+  }
+  throw new Error("no OCTET STRING (PKCS#1) found");
+}
+
+Deno.test("importSigningKey: signs verifiably for PKCS#8 and PKCS#1 (wrapper) keys", async () => {
+  const kp = await crypto.subtle.generateKey(
+    {
+      name: "RSASSA-PKCS1-v1_5",
+      modulusLength: 2048,
+      publicExponent: new Uint8Array([1, 0, 1]),
+      hash: "SHA-256",
+    },
+    true,
+    ["sign", "verify"],
+  ) as CryptoKeyPair;
+  const pkcs8 = new Uint8Array(
+    await crypto.subtle.exportKey("pkcs8", kp.privateKey),
+  );
+  const msg = new TextEncoder().encode("header.payload");
+  const signsAndVerifies = async (pem: string): Promise<boolean> => {
+    const key = await importSigningKey(pem);
+    const sig = await crypto.subtle.sign("RSASSA-PKCS1-v1_5", key, msg);
+    return crypto.subtle.verify("RSASSA-PKCS1-v1_5", kp.publicKey, sig, msg);
+  };
+  assert(
+    await signsAndVerifies(derToPem(pkcs8, "PRIVATE KEY")),
+    "PKCS#8 branch produces a verifiable RS256 signature",
+  );
+  assert(
+    await signsAndVerifies(derToPem(pkcs8ToPkcs1(pkcs8), "RSA PRIVATE KEY")),
+    "PKCS#1 wrapper (pkcs1ToPkcs8) produces a verifiable RS256 signature",
+  );
 });
 
 Deno.test("jwtAssertionClaims: falls back to clientId when no userId", () => {

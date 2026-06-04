@@ -1,6 +1,6 @@
 manifestVersion: 1
 name: "@thomas/zitadel"
-version: 2026.06.04.1
+version: 2026.06.04.2
 description: >-
   Careful, non-destructive administration of a Zitadel instance over its
   Management API (v1 REST), authenticated with a JWT private-key service account.

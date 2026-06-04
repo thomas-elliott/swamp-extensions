@@ -7,9 +7,12 @@ import type {
   MethodContext,
   ModelDefinition,
 } from "jsr:@systeminit/swamp-testing@0.20260521.16";
-// node:crypto is provided by the runtime (Deno's node-compat); it signs the
-// PKCS#1 RSA key Zitadel issues natively, so this extension needs ZERO npm deps.
-import { createPrivateKey, createSign } from "node:crypto";
+// Signing uses the Web Crypto API (the `crypto.subtle` global) — NO node: import,
+// so the extension has zero dependencies AND resolves no `@types/node` at doc-lint
+// time (a `node:` import makes some `deno doc` sandboxes fetch the floating
+// @types/node → undici-types, which can break scoring). Zitadel issues PKCS#1
+// ("RSA PRIVATE KEY") keys and Web Crypto imports only PKCS#8, so `signAssertion`
+// wraps PKCS#1 → PKCS#8 (a fixed DER envelope) before importing the key.
 
 /**
  * `@thomas/zitadel` — careful, non-destructive administration of a Zitadel
@@ -371,7 +374,83 @@ export function jwtAssertionClaims(
   };
 }
 
-function signAssertion(k: KeyJson, apiUrl: string, nowSec: number): string {
+/** Decode a PEM block's base64 body to DER bytes; flags whether it's PKCS#8. */
+function pemToDer(pem: string): { der: Uint8Array; isPkcs8: boolean } {
+  const isPkcs8 = /BEGIN PRIVATE KEY/.test(pem);
+  const b64 = pem
+    .replace(/-----BEGIN [^-]+-----/g, "")
+    .replace(/-----END [^-]+-----/g, "")
+    .replace(/\s+/g, "");
+  const bin = atob(b64);
+  const der = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) der[i] = bin.charCodeAt(i);
+  return { der, isPkcs8 };
+}
+
+/** DER length octets for a content length (short form < 128, else long form). */
+function derLen(n: number): number[] {
+  if (n < 0x80) return [n];
+  const out: number[] = [];
+  for (let v = n; v > 0; v = Math.floor(v / 256)) out.unshift(v & 0xff);
+  return [0x80 | out.length, ...out];
+}
+
+/**
+ * Wrap a PKCS#1 `RSAPrivateKey` DER in the PKCS#8 `PrivateKeyInfo` envelope
+ * (`SEQUENCE { version 0, AlgorithmIdentifier rsaEncryption, OCTET STRING pkcs1 }`),
+ * so Web Crypto's `importKey("pkcs8", …)` accepts a Zitadel-issued PKCS#1 key.
+ * Pure byte-surgery, deterministic, no dependencies.
+ */
+function pkcs1ToPkcs8(pkcs1: Uint8Array): Uint8Array {
+  // AlgorithmIdentifier: SEQUENCE { OID 1.2.840.113549.1.1.1 (rsaEncryption), NULL }
+  const algId = [
+    0x30,
+    0x0d,
+    0x06,
+    0x09,
+    0x2a,
+    0x86,
+    0x48,
+    0x86,
+    0xf7,
+    0x0d,
+    0x01,
+    0x01,
+    0x01,
+    0x05,
+    0x00,
+  ];
+  const version = [0x02, 0x01, 0x00];
+  const octet = [0x04, ...derLen(pkcs1.length), ...pkcs1];
+  const body = [...version, ...algId, ...octet];
+  return new Uint8Array([0x30, ...derLen(body.length), ...body]);
+}
+
+/**
+ * Import a PEM RSA private key (PKCS#1 or PKCS#8) as an RS256 signing key via
+ * Web Crypto. Exported for tests. Zitadel keys are PKCS#1 → wrapped to PKCS#8.
+ */
+export async function importSigningKey(pemKey: string): Promise<CryptoKey> {
+  const { der, isPkcs8 } = pemToDer(pemKey);
+  const pkcs8 = isPkcs8 ? der : pkcs1ToPkcs8(der);
+  // Back the key bytes with a plain ArrayBuffer — a Uint8Array<ArrayBufferLike>
+  // is not accepted as BufferSource (it could be SharedArrayBuffer-backed).
+  const buf = new ArrayBuffer(pkcs8.byteLength);
+  new Uint8Array(buf).set(pkcs8);
+  return await crypto.subtle.importKey(
+    "pkcs8",
+    buf,
+    { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+}
+
+async function signAssertion(
+  k: KeyJson,
+  apiUrl: string,
+  nowSec: number,
+): Promise<string> {
   const header = b64url(
     JSON.stringify({ alg: "RS256", kid: k.keyId, typ: "JWT" }),
   );
@@ -379,8 +458,12 @@ function signAssertion(k: KeyJson, apiUrl: string, nowSec: number): string {
     JSON.stringify(jwtAssertionClaims({ ...k }, apiUrl, nowSec)),
   );
   const input = `${header}.${payload}`;
-  const pk = createPrivateKey({ key: k.key, format: "pem" });
-  const sig = createSign("RSA-SHA256").update(input).end().sign(pk);
+  const key = await importSigningKey(k.key);
+  const sig = await crypto.subtle.sign(
+    "RSASSA-PKCS1-v1_5",
+    key,
+    new TextEncoder().encode(input),
+  );
   return `${input}.${b64url(new Uint8Array(sig))}`;
 }
 
@@ -409,7 +492,7 @@ async function getToken(g: GlobalArgsT): Promise<string> {
   const nowSec = Math.floor(Date.now() / 1000);
   const cached = _tokenCache.get(k.keyId);
   if (cached && cached.expSec - 60 > nowSec) return cached.token;
-  const assertion = signAssertion(k, g.apiUrl, nowSec);
+  const assertion = await signAssertion(k, g.apiUrl, nowSec);
   const form = new URLSearchParams({
     grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
     scope: g.tokenScope,
@@ -922,7 +1005,7 @@ const ProjectAuthzSetArgs = z.object({
  */
 export const model = {
   type: "@thomas/zitadel",
-  version: "2026.06.04.1",
+  version: "2026.06.04.2",
   globalArguments: GlobalArgs,
   checks: {
     "reachable": {
