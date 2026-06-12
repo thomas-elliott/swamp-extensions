@@ -456,6 +456,108 @@ Deno.test("app_secret_rotate: verify-first GET then regenerate, secret once", as
   }
 });
 
+Deno.test("app_get: normalizes proto3-omitted OIDC defaults (web/bearer/false)", async () => {
+  // Zitadel omits zero-value fields: a default web app comes back with appType,
+  // accessTokenType and devMode ABSENT. The read shape must show effective values.
+  const { caller } = makeFakeApi((c) => {
+    if (c.method === "GET") {
+      return {
+        app: {
+          id: "a1",
+          name: "web-app",
+          state: "APP_STATE_ACTIVE",
+          oidcConfig: { clientId: "cid", redirectUris: ["https://x/cb"] },
+        },
+      };
+    }
+  });
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("app_get").execute({ projectId: "p1", appId: "a1" }, context);
+    assertEquals(written[0].data.kind, "oidc");
+    assertEquals(written[0].data.appType, "web", "default appType surfaced");
+    assertEquals(
+      written[0].data.accessTokenType,
+      "bearer",
+      "default accessTokenType surfaced",
+    );
+    assertEquals(written[0].data.devMode, false, "default devMode surfaced");
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("app_get: round-trips non-default OIDC enums (spa/jwt) from the wire", async () => {
+  const { caller } = makeFakeApi((c) => {
+    if (c.method === "GET") {
+      return {
+        app: {
+          id: "a2",
+          name: "spa-app",
+          state: "APP_STATE_ACTIVE",
+          oidcConfig: {
+            clientId: "cid2",
+            appType: "OIDC_APP_TYPE_USER_AGENT",
+            accessTokenType: "OIDC_TOKEN_TYPE_JWT",
+            devMode: true,
+            responseTypes: ["OIDC_RESPONSE_TYPE_CODE", "OIDC_RESPONSE_TYPE_ID_TOKEN"],
+            grantTypes: [
+              "OIDC_GRANT_TYPE_AUTHORIZATION_CODE",
+              "OIDC_GRANT_TYPE_REFRESH_TOKEN",
+            ],
+          },
+        },
+      };
+    }
+  });
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("app_get").execute({ projectId: "p1", appId: "a2" }, context);
+    // USER_AGENT must read back as "spa" (the write-path friendly value), NOT
+    // friendlyState's "agent" — so a read-then-converge sees no spurious drift.
+    assertEquals(written[0].data.appType, "spa");
+    assertEquals(written[0].data.accessTokenType, "jwt");
+    assertEquals(written[0].data.devMode, true);
+    // ID_TOKEN / AUTHORIZATION_CODE / REFRESH_TOKEN would all collapse to the
+    // wrong friendlyState value ("token"/"code") — the reverse map fixes them.
+    assertEquals(written[0].data.responseTypes, ["code", "id_token"]);
+    assertEquals(written[0].data.grantTypes, [
+      "authorization_code",
+      "refresh_token",
+    ]);
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("app_get: leaves OIDC-only fields undefined for an API app", async () => {
+  const { caller } = makeFakeApi((c) => {
+    if (c.method === "GET") {
+      return {
+        app: {
+          id: "a3",
+          name: "api-app",
+          state: "APP_STATE_ACTIVE",
+          apiConfig: { clientId: "cid3" },
+        },
+      };
+    }
+  });
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("app_get").execute({ projectId: "p1", appId: "a3" }, context);
+    assertEquals(written[0].data.kind, "api");
+    assertEquals(written[0].data.appType, undefined);
+    assertEquals(written[0].data.accessTokenType, undefined);
+    assertEquals(written[0].data.devMode, undefined);
+  } finally {
+    __setCaller(null);
+  }
+});
+
 Deno.test("pat_revoke: refuses when tokenId not owned by user", async () => {
   const { caller, calls } = makeFakeApi((c) => {
     if (c.path.endsWith("/pats/_search")) return { result: [{ id: "OTHER" }] };

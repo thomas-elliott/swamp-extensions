@@ -1,0 +1,34 @@
+manifestVersion: 1
+name: "@thomas/stalwart"
+version: 2026.06.09.1
+description: >-
+  Careful, non-destructive administration of a Stalwart mail server (v0.16+)
+  over its JMAP-over-HTTP management API, authenticated with a scoped admin API
+  key. Read/audit of domains, accounts, aliases, groups, DMARC/TLS reports, the
+  outbound queue and server health; idempotent provisioning of accounts and
+  aliases, groups, mailing lists and roles; spam-filter configuration; certificate
+  install + reload and config reload; and reversible deactivate/reactivate. No
+  hard deletes — the only "off switch" is the reversible set-state pair. Secrets
+  (account passwords, certificate keys) are sent once and never read back.
+repository: https://github.com/thomas-elliott/swamp-extensions
+paths:
+  base: manifest
+models:
+  - stalwart.ts
+workflows: []
+vaults: []
+drivers: []
+datastores: []
+reports: []
+skills: []
+additionalFiles:
+  - README.md
+  - LICENSE.txt
+labels:
+  - stalwart
+  - mail
+  - smtp
+  - jmap
+  - email
+  - admin
+dependencies: []
