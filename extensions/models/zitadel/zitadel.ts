@@ -132,6 +132,27 @@ const ACCESS_TOKEN_TYPE: Record<string, string> = {
   jwt: "OIDC_TOKEN_TYPE_JWT",
 };
 
+/** Invert a friendly→Zitadel enum map for read-shaping (Zitadel enum → friendly). */
+function invertEnum(m: Record<string, string>): Record<string, string> {
+  return Object.fromEntries(Object.entries(m).map(([k, v]) => [v, k]));
+}
+/** Reverse maps: round-trip-safe read-shaping for fields the write path maps. */
+const APP_TYPE_REV = invertEnum(APP_TYPE);
+const ACCESS_TOKEN_TYPE_REV = invertEnum(ACCESS_TOKEN_TYPE);
+const RESPONSE_TYPE_REV = invertEnum(RESPONSE_TYPE);
+const GRANT_TYPE_REV = invertEnum(GRANT_TYPE);
+
+/** Reverse-map a wire enum array to friendly values (friendlyState fallback). */
+function friendlyEnumArr(
+  v: unknown,
+  rev: Record<string, string>,
+): string[] | undefined {
+  if (!Array.isArray(v)) return undefined;
+  return v.map((e) =>
+    typeof e === "string" ? (rev[e] ?? friendlyState(e)) : String(e)
+  );
+}
+
 function mapEnum(
   m: Record<string, string>,
   v: string,
@@ -217,6 +238,9 @@ const AppInfo = z.object({
   kind: z.string().describe("oidc | api | saml | unknown"),
   clientId: z.string().optional(),
   appType: z.string().optional(),
+  accessTokenType: z.string().optional().describe(
+    "OIDC access-token type: bearer | jwt (effective value, defaults normalized)",
+  ),
   authMethod: z.string().optional(),
   redirectUris: z.array(z.string()).optional(),
   postLogoutUris: z.array(z.string()).optional(),
@@ -772,7 +796,22 @@ function shapeApp(
     state: friendlyState(a.state),
     kind,
     clientId,
-    appType: oidc.appType ? friendlyState(oidc.appType) : undefined,
+    // OIDC config fields use proto3 zero-value omission: appType=web,
+    // accessTokenType=bearer and devMode=false come back ABSENT. Normalize to
+    // the effective default for OIDC apps so reads show the complete config and
+    // a read-then-converge changes only what's intended. Left undefined for
+    // non-OIDC (api/saml) apps, where these fields don't apply.
+    appType: a.oidcConfig
+      ? (typeof oidc.appType === "string"
+        ? (APP_TYPE_REV[oidc.appType] ?? friendlyState(oidc.appType))
+        : "web")
+      : undefined,
+    accessTokenType: a.oidcConfig
+      ? (typeof oidc.accessTokenType === "string"
+        ? (ACCESS_TOKEN_TYPE_REV[oidc.accessTokenType] ??
+          friendlyState(oidc.accessTokenType))
+        : "bearer")
+      : undefined,
     authMethod: (oidc.authMethodType ?? api.authMethodType)
       ? friendlyState(oidc.authMethodType ?? api.authMethodType)
       : undefined,
@@ -782,13 +821,11 @@ function shapeApp(
     postLogoutUris: Array.isArray(oidc.postLogoutRedirectUris)
       ? (oidc.postLogoutRedirectUris as string[])
       : undefined,
-    responseTypes: Array.isArray(oidc.responseTypes)
-      ? (oidc.responseTypes as string[])
+    responseTypes: friendlyEnumArr(oidc.responseTypes, RESPONSE_TYPE_REV),
+    grantTypes: friendlyEnumArr(oidc.grantTypes, GRANT_TYPE_REV),
+    devMode: a.oidcConfig
+      ? (typeof oidc.devMode === "boolean" ? oidc.devMode : false)
       : undefined,
-    grantTypes: Array.isArray(oidc.grantTypes)
-      ? (oidc.grantTypes as string[])
-      : undefined,
-    devMode: typeof oidc.devMode === "boolean" ? oidc.devMode : undefined,
     action,
     timestamp: ts,
   };
