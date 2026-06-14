@@ -1230,3 +1230,121 @@ Deno.test("image_prune sends dangling flag + records result", async () => {
     __setArcaneTransport(null);
   }
 });
+
+Deno.test("version reads the flat /version body (no envelope) into arcane-version", async () => {
+  __setArcaneTransport(
+    (_g: unknown, m: string, p: string): Promise<unknown> => {
+      if (m === "GET" && p === "/version") {
+        // /version returns the body directly — no {success,data} envelope (v1 and v2)
+        return Promise.resolve({
+          currentVersion: "v1.19.4",
+          newestVersion: "v2.0.3",
+          updateAvailable: true,
+          releaseUrl: "https://github.com/getarcaneapp/arcane/releases/tag/v2.0.3",
+        });
+      }
+      return Promise.reject(new Error(`unexpected ${m} ${p}`));
+    },
+  );
+  try {
+    const { context, written } = makeContext(TEST_GLOBALS);
+    await method("version").execute({}, context);
+    const r = written.find((w) => w.specName === "arcane-version");
+    assert(r, "arcane-version resource written");
+    assertEquals(r!.name, "arcane");
+    assertEquals(r!.data.currentVersion, "v1.19.4");
+    assertEquals(r!.data.newestVersion, "v2.0.3");
+    assertEquals(r!.data.updateAvailable, true);
+  } finally {
+    __setArcaneTransport(null);
+  }
+});
+
+Deno.test("gitops_sync_status fans out over all syncs and surfaces the failing one", async () => {
+  __setArcaneTransport(
+    (_g: unknown, m: string, p: string): Promise<unknown> => {
+      if (m === "GET" && p === "/environments/0/gitops-syncs") {
+        return Promise.resolve({
+          success: true,
+          data: [{ id: "s1", name: "web" }, { id: "s2", name: "db" }],
+        });
+      }
+      if (m === "GET" && p === "/environments/0/gitops-syncs/s1/status") {
+        return Promise.resolve({
+          success: true,
+          data: {
+            id: "s1",
+            autoSync: true,
+            lastSyncAt: "2026-06-12T10:00:00Z",
+            lastSyncStatus: "success",
+            lastSyncCommit: "abc1234",
+            nextSyncAt: "2026-06-12T10:05:00Z",
+          },
+        });
+      }
+      if (m === "GET" && p === "/environments/0/gitops-syncs/s2/status") {
+        return Promise.resolve({
+          success: true,
+          data: {
+            id: "s2",
+            autoSync: true,
+            lastSyncAt: "2026-06-12T10:01:00Z",
+            lastSyncStatus: "failed",
+            lastSyncError: "invalid compose file: env file not found",
+          },
+        });
+      }
+      return Promise.reject(new Error(`unexpected ${m} ${p}`));
+    },
+  );
+  try {
+    const { context, written } = makeContext(TEST_GLOBALS);
+    await method("gitops_sync_status").execute({ names: [] }, context);
+    const statuses = written.filter((w) => w.specName === "sync-status");
+    assertEquals(statuses.length, 2);
+    const web = statuses.find((w) => w.name === "web");
+    assertEquals(web!.data.lastSyncStatus, "success");
+    assertEquals(web!.data.lastSyncCommit, "abc1234");
+    assertEquals(web!.data.lastSyncError, undefined);
+    const db = statuses.find((w) => w.name === "db");
+    assertEquals(db!.data.lastSyncStatus, "failed");
+    assertEquals(
+      db!.data.lastSyncError,
+      "invalid compose file: env file not found",
+    );
+  } finally {
+    __setArcaneTransport(null);
+  }
+});
+
+Deno.test("gitops_sync_status names a missing sync instead of silently skipping it", async () => {
+  __setArcaneTransport(
+    (_g: unknown, m: string, p: string): Promise<unknown> => {
+      if (m === "GET" && p === "/environments/0/gitops-syncs") {
+        return Promise.resolve({
+          success: true,
+          data: [{ id: "s1", name: "web" }],
+        });
+      }
+      return Promise.reject(new Error(`unexpected ${m} ${p}`));
+    },
+  );
+  try {
+    const { context } = makeContext(TEST_GLOBALS);
+    let message = "";
+    try {
+      await method("gitops_sync_status").execute(
+        { names: ["web", "ghost"] },
+        context,
+      );
+    } catch (e) {
+      message = e instanceof Error ? e.message : String(e);
+    }
+    assert(
+      message.includes("ghost"),
+      "error names the missing sync",
+    );
+  } finally {
+    __setArcaneTransport(null);
+  }
+});

@@ -263,6 +263,16 @@ const AppCredential = z.object({
   timestamp: z.string(),
 });
 
+const OidcRedirectResult = z.object({
+  projectId: z.string(),
+  appId: z.string(),
+  name: z.string().optional(),
+  previousRedirectUris: z.array(z.string()),
+  redirectUris: z.array(z.string()),
+  action: Action,
+  timestamp: z.string(),
+});
+
 const UserInfo = z.object({
   userId: z.string(),
   username: z.string().optional(),
@@ -872,6 +882,20 @@ const AppGetArgs = z.object({
   appId: z.string(),
 });
 
+const OidcAppRedirectSetArgs = z.object({
+  projectId: z.string().describe("Project id (from app_list / project_list)"),
+  appId: z.string().describe("Application id (from app_list)"),
+  add: jsonArray(z.string()).default([]).describe(
+    "Redirect URIs to ENSURE PRESENT (idempotent append)",
+  ),
+  remove: jsonArray(z.string()).default([]).describe(
+    "Redirect URIs to ENSURE ABSENT (for cleanup)",
+  ),
+}).refine(
+  (a) => a.add.length > 0 || a.remove.length > 0,
+  { message: "provide add and/or remove" },
+);
+
 const UserListArgs = z.object({
   type: z.enum(["machine", "human", "any"]).default("any").describe(
     "Filter by user type",
@@ -1042,7 +1066,7 @@ const ProjectAuthzSetArgs = z.object({
  */
 export const model = {
   type: "@thomas/zitadel",
-  version: "2026.06.04.2",
+  version: "2026.06.13.1",
   globalArguments: GlobalArgs,
   checks: {
     "reachable": {
@@ -1087,6 +1111,12 @@ export const model = {
     "app": {
       description: "An application record (config only; never a secret)",
       schema: AppInfo,
+      lifetime: "infinite",
+      garbageCollection: 10,
+    },
+    "oidc-redirect-result": {
+      description: "Result of an oidc_app_redirect_set change",
+      schema: OidcRedirectResult,
       lifetime: "infinite",
       garbageCollection: 10,
     },
@@ -1253,6 +1283,127 @@ export const model = {
           "app",
           a.appId,
           shapeApp(a.projectId, app, "observed", nowIso()),
+        );
+        return { dataHandles: [handle] };
+      },
+    },
+    oidc_app_redirect_set: {
+      description:
+        "Add and/or remove redirect URIs on an OIDC app's allowlist via READ-MODIFY-" +
+        "WRITE: fetches the live oidc_config and re-PUTs it with ONLY redirectUris " +
+        "changed, preserving every other field (PKCE/auth method/response types/…). " +
+        "Safe on shared clients where a full converge would risk clobbering. Idempotent.",
+      arguments: OidcAppRedirectSetArgs,
+      execute: async (
+        rawArgs,
+        context,
+      ): Promise<{ dataHandles: DataHandle[] }> => {
+        const a = OidcAppRedirectSetArgs.parse(rawArgs);
+        const g = context.globalArgs;
+        const ts = nowIso();
+
+        const got = await call(g, {
+          method: "GET",
+          path: mgmt(
+            `/projects/${encodeURIComponent(a.projectId)}/apps/${
+              encodeURIComponent(a.appId)
+            }`,
+          ),
+        });
+        const app = (got.body.app ?? {}) as Json;
+        const oidc = app.oidcConfig as Json | undefined;
+        if (!oidc) {
+          throw new Error(
+            `app ${a.appId} has no oidcConfig (not an OIDC app)`,
+          );
+        }
+
+        const prev = asArray(oidc.redirectUris).map(String);
+        const removeSet = new Set(a.remove);
+        const next = prev.filter((u) => !removeSet.has(u));
+        for (const u of a.add) if (!next.includes(u)) next.push(u);
+
+        const name = typeof app.name === "string" ? app.name : undefined;
+        if (
+          next.length === prev.length && next.every((u, i) => u === prev[i])
+        ) {
+          const handle = await context.writeResource(
+            "oidc-redirect-result",
+            a.appId,
+            {
+              projectId: a.projectId,
+              appId: a.appId,
+              name,
+              previousRedirectUris: prev,
+              redirectUris: prev,
+              action: "unchanged",
+              timestamp: ts,
+            },
+          );
+          return { dataHandles: [handle] };
+        }
+
+        // Carry over EVERY writable oidc_config field verbatim (raw API enum values
+        // round-trip on PUT); only redirectUris changes. Read-only fields (clientId,
+        // complianceProblems, …) are intentionally omitted.
+        const WRITABLE = [
+          "responseTypes",
+          "grantTypes",
+          "appType",
+          "authMethodType",
+          "postLogoutRedirectUris",
+          "devMode",
+          "accessTokenType",
+          "idTokenRoleAssertion",
+          "idTokenUserinfoAssertion",
+          "clockSkew",
+          "additionalOrigins",
+          "skipNativeAppSuccessPage",
+          "backChannelLogoutUri",
+        ];
+        const body: Json = { redirectUris: next };
+        for (const k of WRITABLE) {
+          if (oidc[k] !== undefined) body[k] = oidc[k];
+        }
+
+        logInfo(context, "Setting OIDC redirect URIs", {
+          appId: a.appId,
+          added: a.add,
+          removed: a.remove,
+        });
+        await call(g, {
+          method: "PUT",
+          path: mgmt(
+            `/projects/${encodeURIComponent(a.projectId)}/apps/${
+              encodeURIComponent(a.appId)
+            }/oidc_config`,
+          ),
+          body,
+        });
+
+        const after = await call(g, {
+          method: "GET",
+          path: mgmt(
+            `/projects/${encodeURIComponent(a.projectId)}/apps/${
+              encodeURIComponent(a.appId)
+            }`,
+          ),
+        });
+        const afterOidc = ((after.body.app ?? {}) as Json).oidcConfig as
+          | Json
+          | undefined;
+        const handle = await context.writeResource(
+          "oidc-redirect-result",
+          a.appId,
+          {
+            projectId: a.projectId,
+            appId: a.appId,
+            name,
+            previousRedirectUris: prev,
+            redirectUris: asArray(afterOidc?.redirectUris).map(String),
+            action: "updated",
+            timestamp: ts,
+          },
         );
         return { dataHandles: [handle] };
       },

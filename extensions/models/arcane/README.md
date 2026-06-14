@@ -53,8 +53,13 @@ swamp model method run arcane-prod swarm_stack_remove --input '{"name":"unifi"}'
 
 ## Method sections
 
+- **`version`** — read Arcane's version (current + newest available; the endpoint is
+  identical on v1.19.x and v2.0.x) — upgrade preflight/post-check.
 - **`gitops_*`** — drive Arcane Git Sync: `gitops_repo_list` / `gitops_repo_ensure`,
-  `gitops_sync_list` / `gitops_sync_ensure`, `gitops_sync_trigger`.
+  `gitops_sync_list` / `gitops_sync_ensure`, `gitops_sync_trigger`, and
+  `gitops_sync_status` (fan-out health view: per-sync `lastSyncStatus` /
+  `lastSyncError` / `lastSyncCommit` / `nextSyncAt` — how you find a sync that has
+  been failing silently on the scheduler).
 - **`project_*`** — compose projects. Lifecycle: `project_list`, `project_get`,
   `project_up` / `project_down` / `project_redeploy` / `project_pull` / `project_destroy`.
   Direct (API) authoring: `project_validate`, `project_create`, `project_update`.

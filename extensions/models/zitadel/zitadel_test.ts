@@ -349,6 +349,84 @@ Deno.test("oidc_app_ensure: existing app updates config, no secret echoed", asyn
   }
 });
 
+Deno.test("oidc_app_redirect_set: read-modify-write adds/removes, preserves other config", async () => {
+  let putBody: Record<string, unknown> | null = null;
+  let gets = 0;
+  const oidcConfig = {
+    clientId: "cid",
+    redirectUris: ["https://a/cb", "https://b/cb"],
+    responseTypes: ["OIDC_RESPONSE_TYPE_CODE"],
+    authMethodType: "OIDC_AUTH_METHOD_TYPE_NONE",
+    appType: "OIDC_APP_TYPE_WEB",
+    devMode: false,
+  };
+  const { caller } = makeFakeApi((c) => {
+    if (c.method === "GET" && c.path.includes("/apps/")) {
+      gets++;
+      const uris = gets >= 2
+        ? ["https://b/cb", "https://c/cb"]
+        : oidcConfig.redirectUris;
+      return { app: { name: "shared", oidcConfig: { ...oidcConfig, redirectUris: uris } } };
+    }
+    if (c.method === "PUT" && c.path.endsWith("/oidc_config")) {
+      putBody = c.body as Record<string, unknown>;
+      return {};
+    }
+  });
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("oidc_app_redirect_set").execute({
+      projectId: "p1",
+      appId: "a1",
+      add: ["https://c/cb"],
+      remove: ["https://a/cb"],
+    }, context);
+    const body = putBody as unknown as Record<string, unknown>;
+    assertEquals(body.redirectUris, ["https://b/cb", "https://c/cb"]);
+    assertEquals(
+      body.authMethodType,
+      "OIDC_AUTH_METHOD_TYPE_NONE",
+      "must preserve PKCE/auth method",
+    );
+    assertEquals(body.responseTypes, ["OIDC_RESPONSE_TYPE_CODE"]);
+    assertEquals(body.clientId, undefined, "must NOT echo read-only clientId");
+    const r = written[0].data;
+    assertEquals(r.action, "updated");
+    assertEquals(r.previousRedirectUris, ["https://a/cb", "https://b/cb"]);
+    assertEquals(r.redirectUris, ["https://b/cb", "https://c/cb"]);
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("oidc_app_redirect_set: no-op when add present & remove absent", async () => {
+  let putCalled = false;
+  const { caller } = makeFakeApi((c) => {
+    if (c.method === "GET" && c.path.includes("/apps/")) {
+      return { app: { name: "x", oidcConfig: { redirectUris: ["https://a/cb"] } } };
+    }
+    if (c.method === "PUT") {
+      putCalled = true;
+      return {};
+    }
+  });
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("oidc_app_redirect_set").execute({
+      projectId: "p1",
+      appId: "a1",
+      add: ["https://a/cb"],
+      remove: ["https://z/cb"],
+    }, context);
+    assertEquals(putCalled, false, "no PUT when the set is unchanged");
+    assertEquals(written[0].data.action, "unchanged");
+  } finally {
+    __setCaller(null);
+  }
+});
+
 Deno.test("oidc_app_ensure: treats Zitadel 'No changes' 400 as unchanged", async () => {
   const caller: CallerFn = (_g, c) => {
     if (c.path.endsWith("/projects/_search")) {

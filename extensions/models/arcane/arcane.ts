@@ -138,6 +138,34 @@ const SyncResource = z.object({
   observedAt: z.string(),
 });
 
+const SyncStatusResource = z.object({
+  id: z.string(),
+  name: z.string(),
+  autoSync: z.boolean().optional(),
+  nextSyncAt: z.string().optional().describe(
+    "Estimated time of the next automatic sync (autoSync only)",
+  ),
+  lastSyncAt: z.string().optional(),
+  lastSyncStatus: z.string().optional().describe(
+    "Outcome of the last sync attempt (e.g. success/failed)",
+  ),
+  lastSyncError: z.string().optional().describe(
+    "Error from the last sync if it failed — empty on success",
+  ),
+  lastSyncCommit: z.string().optional().describe(
+    "Commit hash of the last successful sync",
+  ),
+  observedAt: z.string(),
+});
+
+const VersionResource = z.object({
+  currentVersion: z.string(),
+  newestVersion: z.string().optional(),
+  updateAvailable: z.boolean().optional(),
+  releaseUrl: z.string().optional(),
+  observedAt: z.string(),
+});
+
 const ProjectResource = z.object({
   id: z.string(),
   name: z.string(),
@@ -1136,6 +1164,12 @@ const GitopsSyncTriggerArgs = z.object({
   ),
 });
 
+const GitopsSyncStatusArgs = z.object({
+  names: z.array(z.string()).default([]).describe(
+    "Sync names to check; empty means all",
+  ),
+});
+
 const ProjectValidateArgs = z.object({
   target: z.string().optional().describe(
     "Label for the result (defaults to composePath or 'inline')",
@@ -1255,7 +1289,7 @@ const LifecycleArgs = z.object({
 /** The `@thomas/arcane` swamp model: schema, methods, and lifecycle for managing Docker via Arcane. */
 export const model = {
   type: "@thomas/arcane",
-  version: "2026.05.24.1",
+  version: "2026.06.12.1",
   globalArguments: GlobalArgs,
   upgrades: [
     {
@@ -1290,6 +1324,14 @@ export const model = {
         old: Record<string, unknown>,
       ): Record<string, unknown> => old,
     },
+    {
+      toVersion: "2026.06.12.1",
+      description:
+        "Add the `version` and `gitops_sync_status` read-only methods (both endpoints exist on Arcane v1.19.x and v2.0.x). globalArguments schema is unchanged, so this is a no-op data migration.",
+      upgradeAttributes: (
+        old: Record<string, unknown>,
+      ): Record<string, unknown> => old,
+    },
   ],
   resources: {
     "repository": {
@@ -1301,6 +1343,20 @@ export const model = {
     "sync": {
       description: "An Arcane GitOps sync entry (one project pulled from git)",
       schema: SyncResource,
+      lifetime: "infinite",
+      garbageCollection: 10,
+    },
+    "sync-status": {
+      description:
+        "A GitOps sync's last/next run state (lastSyncStatus/lastSyncError/lastSyncCommit) — the gitops health view",
+      schema: SyncStatusResource,
+      lifetime: "infinite",
+      garbageCollection: 10,
+    },
+    "arcane-version": {
+      description:
+        "Arcane's reported version (current + newest available) — upgrade preflight/post-check",
+      schema: VersionResource,
       lifetime: "infinite",
       garbageCollection: 10,
     },
@@ -1383,6 +1439,33 @@ export const model = {
     },
   },
   methods: {
+    version: {
+      description:
+        "Read Arcane's version (GET /version, works on v1 and v2) — preflight/verify for manager upgrades",
+      arguments: z.object({}),
+      execute: async (
+        _args,
+        context,
+      ): Promise<{ dataHandles: DataHandle[] }> => {
+        const g: GlobalArgsT = context.globalArgs;
+        logInfo(context, "Reading Arcane version");
+        const v = unwrap(await arcane(g, "GET", "/version"));
+        const currentVersion =
+          asString(pick(v, "currentVersion", "current_version")) ?? "unknown";
+        const handle = await context.writeResource("arcane-version", "arcane", {
+          currentVersion,
+          newestVersion: asString(pick(v, "newestVersion", "newest_version")),
+          updateAvailable: pick(v, "updateAvailable", "update_available") as
+            | boolean
+            | undefined,
+          releaseUrl: asString(pick(v, "releaseUrl", "release_url")),
+          observedAt: new Date().toISOString(),
+        });
+        logInfo(context, "Read Arcane version", { currentVersion });
+        return { dataHandles: [handle] };
+      },
+    },
+
     gitops_repo_list: {
       description:
         "List Arcane git repository connections (factory: one `repository` per entry, keyed by name)",
@@ -1697,6 +1780,67 @@ export const model = {
           );
         }
         logInfo(context, "Triggered Arcane syncs", { count: handles.length });
+        return { dataHandles: handles };
+      },
+    },
+
+    gitops_sync_status: {
+      description:
+        "Read last/next run state for the named syncs (fan-out: one `sync-status` per sync, keyed by name). Empty `names` checks all syncs — surfaces lastSyncStatus/lastSyncError/lastSyncCommit, the missing gitops health view.",
+      arguments: GitopsSyncStatusArgs,
+      execute: async (
+        args: z.infer<typeof GitopsSyncStatusArgs>,
+        context,
+      ): Promise<{ dataHandles: DataHandle[] }> => {
+        const g: GlobalArgsT = context.globalArgs;
+        logInfo(context, "Reading Arcane sync status", {
+          names: args.names ?? [],
+        });
+        const existing = coerceList(
+          await arcane(g, "GET", `${ENV(g)}/gitops-syncs`),
+        );
+        const wanted: string[] = args.names ?? [];
+        const targets = wanted.length === 0
+          ? existing
+          : existing.filter((s) =>
+            wanted.includes(asString(pick(s, "name")) ?? "")
+          );
+        if (wanted.length > 0 && targets.length !== wanted.length) {
+          const found = new Set(targets.map((s) => asString(pick(s, "name"))));
+          const missing = wanted.filter((n) => !found.has(n));
+          throw new Error(`sync(s) not found in Arcane: ${missing.join(", ")}`);
+        }
+        const observedAt = new Date().toISOString();
+        const handles: DataHandle[] = [];
+        for (const s of targets) {
+          const name = asString(pick(s, "name")) ?? "unnamed";
+          const id = asString(pick(s, "id")) ?? "";
+          const st = unwrap(
+            await arcane(g, "GET", `${ENV(g)}/gitops-syncs/${id}/status`),
+          );
+          handles.push(
+            await context.writeResource("sync-status", name, {
+              id: asString(pick(st, "id")) ?? id,
+              name,
+              autoSync: pick(st, "autoSync", "auto_sync") as
+                | boolean
+                | undefined,
+              nextSyncAt: asString(pick(st, "nextSyncAt", "next_sync_at")),
+              lastSyncAt: asString(pick(st, "lastSyncAt", "last_sync_at")),
+              lastSyncStatus: asString(
+                pick(st, "lastSyncStatus", "last_sync_status"),
+              ),
+              lastSyncError: asString(
+                pick(st, "lastSyncError", "last_sync_error"),
+              ),
+              lastSyncCommit: asString(
+                pick(st, "lastSyncCommit", "last_sync_commit"),
+              ),
+              observedAt,
+            }),
+          );
+        }
+        logInfo(context, "Read Arcane sync status", { count: handles.length });
         return { dataHandles: handles };
       },
     },

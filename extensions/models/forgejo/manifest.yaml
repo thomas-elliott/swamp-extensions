@@ -1,0 +1,35 @@
+manifestVersion: 1
+name: "@thomas/forgejo"
+version: 2026.06.13.1
+description: >-
+  Careful administration of a Forgejo (or Gitea) server over its /api/v1 REST
+  API, authenticated with a scoped access token. Find-or-create organizations
+  and repositories and converge their settings, run GitHub pull-mirrors
+  (create via /repos/migrate, reconcile interval/visibility, queue immediate
+  syncs), and audit every mirror's sync health. Mutations are find-or-create
+  or reversible (archive/unarchive); there are no delete methods — a failed
+  migration's empty shell repo is detected and reported, never auto-deleted.
+  Mirror source credentials are write-only: supplied via a vault reference,
+  sent once, never read back or emitted.
+repository: https://github.com/thomas-elliott/swamp-extensions
+paths:
+  base: manifest
+models:
+  - forgejo.ts
+workflows: []
+vaults: []
+drivers: []
+datastores: []
+reports: []
+skills: []
+additionalFiles:
+  - README.md
+  - LICENSE.txt
+labels:
+  - forgejo
+  - gitea
+  - git
+  - mirrors
+  - provisioning
+  - admin
+dependencies: []
