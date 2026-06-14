@@ -1,0 +1,34 @@
+manifestVersion: 1
+name: "@thomas/truenas"
+version: 2026.06.13.1
+description: >-
+  Administration of a TrueNAS SCALE host (25.04+) via its JSON-RPC 2.0 WebSocket
+  API (wss://, API-key auth). Read/audit of apps + their port bindings, NFS/SMB
+  shares + their host allowlists, services, network interfaces, and a service-
+  exposure roll-up; plus a narrow, reversible mutating surface — flip an app
+  port between published/exposed, and set NFS networks/hosts and SMB
+  hostsallow/hostsdeny. Refuses any non-TLS endpoint by construction (TrueNAS
+  revokes an API key sent over cleartext). Verify-first; no pool/dataset/user or
+  service start/stop.
+repository: https://github.com/thomas-elliott/swamp-extensions
+paths:
+  base: manifest
+models:
+  - truenas.ts
+workflows: []
+vaults: []
+drivers: []
+datastores: []
+reports: []
+skills: []
+additionalFiles:
+  - README.md
+  - LICENSE.txt
+labels:
+  - truenas
+  - scale
+  - nas
+  - admin
+  - exposure
+  - homelab
+dependencies: []
