@@ -337,6 +337,86 @@ Deno.test("blocking_temporary_disable records the till timestamp", async () => {
   }
 });
 
+Deno.test("web_service_set_tls maps args to webService* params and emits settings", async () => {
+  const calls: Call[] = [];
+  scriptTransport(calls, () => ({
+    webServiceEnableTls: true,
+    webServiceTlsPort: 53443,
+    webServiceUseSelfSignedTlsCertificate: false,
+    webServiceTlsCertificatePath: "wildcard.example.com.pfx",
+    webServiceHttpToTlsRedirect: false,
+  }));
+  try {
+    const { context, written } = makeContext();
+    await method("web_service_set_tls").execute({
+      certificatePath: "wildcard.example.com.pfx",
+      certificatePassword: "s3cret",
+      useSelfSignedCertificate: false,
+    }, context);
+    assertEquals(calls[0].method, "POST");
+    assertEquals(calls[0].path, "/settings/set");
+    assertEquals(calls[0].params, {
+      webServiceTlsCertificatePath: "wildcard.example.com.pfx",
+      webServiceTlsCertificatePassword: "s3cret",
+      webServiceUseSelfSignedTlsCertificate: false,
+    });
+    assertEquals(written[0].specName, "settings");
+    assertEquals(written[0].data.webServiceUseSelfSignedTlsCertificate, false);
+    assertEquals(written[0].data.webServiceTlsCertificatePath, "wildcard.example.com.pfx");
+  } finally {
+    __setTechnitiumTransport(null);
+  }
+});
+
+Deno.test("web_service_set_tls sends only the fields provided (redirect-only)", async () => {
+  const calls: Call[] = [];
+  scriptTransport(calls, () => ({ webServiceHttpToTlsRedirect: true }));
+  try {
+    const { context } = makeContext();
+    await method("web_service_set_tls").execute(
+      { httpToTlsRedirect: true },
+      context,
+    );
+    assertEquals(calls[0].params, { webServiceHttpToTlsRedirect: true });
+  } finally {
+    __setTechnitiumTransport(null);
+  }
+});
+
+Deno.test("web_service_set_tls throws when no fields are provided", async () => {
+  const calls: Call[] = [];
+  scriptTransport(calls, () => ({}));
+  try {
+    const { context } = makeContext();
+    let threw = false;
+    try {
+      await method("web_service_set_tls").execute({}, context);
+    } catch (_e) {
+      threw = true;
+    }
+    assert(threw, "expected an error when no TLS fields provided");
+    assertEquals(calls.length, 0, "no API call should be made");
+  } finally {
+    __setTechnitiumTransport(null);
+  }
+});
+
+Deno.test("dnssec_validation_set posts only dnssecValidation and emits settings", async () => {
+  const calls: Call[] = [];
+  scriptTransport(calls, () => ({ dnssecValidation: true }));
+  try {
+    const { context, written } = makeContext();
+    await method("dnssec_validation_set").execute({ enable: true }, context);
+    assertEquals(calls[0].method, "POST");
+    assertEquals(calls[0].path, "/settings/set");
+    assertEquals(calls[0].params, { dnssecValidation: true });
+    assertEquals(written[0].specName, "settings");
+    assertEquals(written[0].data.dnssecValidation, true);
+  } finally {
+    __setTechnitiumTransport(null);
+  }
+});
+
 Deno.test("zone_create posts zone+type and writes a created zone", async () => {
   const calls: Call[] = [];
   scriptTransport(calls, () => ({}));
