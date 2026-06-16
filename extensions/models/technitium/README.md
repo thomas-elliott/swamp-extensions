@@ -59,7 +59,7 @@ swamp model method run dns-home blocking_set_lists \
 # Create a zone and add an A record
 swamp model method run dns-home zone_create --input '{"zone":"lab.example.com","type":"Primary"}'
 swamp model method run dns-home record_add \
-  --input '{"zone":"lab.example.com","domain":"nas.lab.example.com","type":"A","ttl":300,"rData":{"ipAddress":"10.0.0.5"}}'
+  --input '{"zone":"lab.example.com","domain":"nas.lab.example.com","type":"A","ttl":300,"rData":{"ipAddress":"192.0.2.5"}}'
 
 # Debug a resolution and flush the cache
 swamp model method run dns-home client_resolve --input '{"domain":"example.com","type":"A"}'

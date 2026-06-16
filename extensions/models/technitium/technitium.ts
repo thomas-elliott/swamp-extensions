@@ -92,6 +92,27 @@ const SettingsResource = z.object({
   blockListUrls: z.array(z.string()).optional(),
   allowListUrls: z.array(z.string()).optional(),
   blockListUrlUpdateIntervalHours: z.number().optional(),
+  // Web-service TLS + resolver-security posture (read-only projection; the
+  // cert password is never surfaced here).
+  webServiceEnableTls: z.boolean().optional().describe(
+    "Whether the admin web service serves HTTPS (on webServiceTlsPort)",
+  ),
+  webServiceTlsPort: z.number().optional(),
+  webServiceUseSelfSignedTlsCertificate: z.boolean().optional().describe(
+    "true = self-signed cert (browsers reject); false = uses webServiceTlsCertificatePath",
+  ),
+  webServiceTlsCertificatePath: z.string().optional().describe(
+    "PKCS#12 cert path on the server (relative paths resolve against the config dir)",
+  ),
+  webServiceHttpToTlsRedirect: z.boolean().optional().describe(
+    "Whether plaintext HTTP requests are redirected to HTTPS",
+  ),
+  dnssecValidation: z.boolean().optional().describe(
+    "Whether the resolver validates DNSSEC signatures on upstream answers",
+  ),
+  enableDnsOverTls: z.boolean().optional().describe(
+    "Whether DNS-over-TLS is enabled (dnsOverTlsPort, default 853)",
+  ),
   observedAt: z.string(),
 });
 
@@ -706,6 +727,21 @@ function extractSettings(
     blockListUrlUpdateIntervalHours: asNumber(
       pick(r, "blockListUrlUpdateIntervalHours"),
     ),
+    webServiceEnableTls: pick(r, "webServiceEnableTls") as boolean | undefined,
+    webServiceTlsPort: asNumber(pick(r, "webServiceTlsPort")),
+    webServiceUseSelfSignedTlsCertificate: pick(
+      r,
+      "webServiceUseSelfSignedTlsCertificate",
+    ) as boolean | undefined,
+    webServiceTlsCertificatePath: asString(
+      pick(r, "webServiceTlsCertificatePath"),
+    ),
+    webServiceHttpToTlsRedirect: pick(
+      r,
+      "webServiceHttpToTlsRedirect",
+    ) as boolean | undefined,
+    dnssecValidation: pick(r, "dnssecValidation") as boolean | undefined,
+    enableDnsOverTls: pick(r, "enableDnsOverTls") as boolean | undefined,
     observedAt,
   };
 }
@@ -781,6 +817,34 @@ const BlockingTempDisableArgs = z.object({
 const BlockingSetListsArgs = z.object({
   blockListUrls: z.array(z.string()).optional(),
   allowListUrls: z.array(z.string()).optional(),
+});
+
+const WebServiceSetTlsArgs = z.object({
+  certificatePath: z.string().optional().describe(
+    "PKCS#12 (.pfx/.p12) cert path on the server. Relative paths resolve " +
+      "against Technitium's config dir (e.g. `wildcard.example.com.pfx` → /etc/dns).",
+  ),
+  certificatePassword: z.string().meta({ sensitive: true }).optional().describe(
+    "Export password for the PKCS#12 file. Supply via vault expression.",
+  ),
+  useSelfSignedCertificate: z.boolean().optional().describe(
+    "Set false when installing a real cert via certificatePath.",
+  ),
+  enableTls: z.boolean().optional().describe(
+    "Enable/disable the HTTPS listener (webServiceTlsPort).",
+  ),
+  tlsPort: z.number().int().positive().optional().describe(
+    "HTTPS listener port (Technitium default 53443).",
+  ),
+  httpToTlsRedirect: z.boolean().optional().describe(
+    "Redirect plaintext HTTP to HTTPS. Enable only AFTER verifying the cert.",
+  ),
+});
+
+const DnssecValidationSetArgs = z.object({
+  enable: z.boolean().describe(
+    "Whether the resolver validates DNSSEC on upstream answers.",
+  ),
 });
 
 const ZoneCreateArgs = z.object({
@@ -887,7 +951,7 @@ const SettingsRestoreArgs = z.object({
 /** The `@thomas/technitium` swamp model: schema, methods, and lifecycle for managing a Technitium DNS server. */
 export const model = {
   type: "@thomas/technitium",
-  version: "2026.05.24.1",
+  version: "2026.06.16.1",
   globalArguments: GlobalArgs,
   resources: {
     "zone": {
@@ -1104,6 +1168,86 @@ export const model = {
           "operationResult",
           "blocking-force-update-lists",
           opResult("blocking_force_update_lists", true),
+        );
+        return { dataHandles: [handle] };
+      },
+    },
+
+    // ----- security settings ---------------------------------------------
+    web_service_set_tls: {
+      description:
+        "Configure the admin web service TLS (HTTPS) listener: install a " +
+        "PKCS#12 certificate, toggle the self-signed fallback, the HTTPS " +
+        "listener, its port, and HTTP→HTTPS redirect. Only the fields you " +
+        "provide are changed. Enable httpToTlsRedirect ONLY after verifying " +
+        "the cert serves correctly, or you can lock yourself out of the UI.",
+      arguments: WebServiceSetTlsArgs,
+      execute: async (
+        args: z.infer<typeof WebServiceSetTlsArgs>,
+        context,
+      ): Promise<{ dataHandles: DataHandle[] }> => {
+        const g: GlobalArgsT = context.globalArgs;
+        const params: Params = {};
+        if (args.certificatePath !== undefined) {
+          params.webServiceTlsCertificatePath = args.certificatePath;
+        }
+        if (args.certificatePassword !== undefined) {
+          params.webServiceTlsCertificatePassword = args.certificatePassword;
+        }
+        if (args.useSelfSignedCertificate !== undefined) {
+          params.webServiceUseSelfSignedTlsCertificate =
+            args.useSelfSignedCertificate;
+        }
+        if (args.enableTls !== undefined) {
+          params.webServiceEnableTls = args.enableTls;
+        }
+        if (args.tlsPort !== undefined) {
+          params.webServiceTlsPort = args.tlsPort;
+        }
+        if (args.httpToTlsRedirect !== undefined) {
+          params.webServiceHttpToTlsRedirect = args.httpToTlsRedirect;
+        }
+        if (Object.keys(params).length === 0) {
+          throw new Error(
+            "Provide at least one web-service TLS field to change",
+          );
+        }
+        // Log the change WITHOUT the password.
+        logInfo(context, "Setting web-service TLS", {
+          certificatePath: args.certificatePath,
+          useSelfSignedCertificate: args.useSelfSignedCertificate,
+          enableTls: args.enableTls,
+          tlsPort: args.tlsPort,
+          httpToTlsRedirect: args.httpToTlsRedirect,
+          certificatePasswordProvided: args.certificatePassword !== undefined,
+        });
+        const r = await apiCall(g, "POST", "/settings/set", params);
+        const handle = await context.writeResource(
+          "settings",
+          "current",
+          extractSettings(r, new Date().toISOString()),
+        );
+        return { dataHandles: [handle] };
+      },
+    },
+
+    dnssec_validation_set: {
+      description: "Enable or disable DNSSEC validation of upstream answers " +
+        "(writes only `dnssecValidation`).",
+      arguments: DnssecValidationSetArgs,
+      execute: async (
+        args: z.infer<typeof DnssecValidationSetArgs>,
+        context,
+      ): Promise<{ dataHandles: DataHandle[] }> => {
+        const g: GlobalArgsT = context.globalArgs;
+        logInfo(context, "Setting DNSSEC validation", { enable: args.enable });
+        const r = await apiCall(g, "POST", "/settings/set", {
+          dnssecValidation: args.enable,
+        });
+        const handle = await context.writeResource(
+          "settings",
+          "current",
+          extractSettings(r, new Date().toISOString()),
         );
         return { dataHandles: [handle] };
       },
