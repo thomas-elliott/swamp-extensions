@@ -41,8 +41,11 @@ import type {
  * over a non-TLS transport** (plain `ws://`/`http://`). This model therefore refuses
  * any non-`wss` endpoint *by construction* — {@link websocketUrl} throws before a
  * socket is opened, and never downgrades `https→ws`. The NAS ships a self-signed
- * cert (`CN=localhost`), so `insecureSkipTlsVerify` skips cert *validation* — but the
- * transport stays TLS-encrypted, which is what keeps the key alive.
+ * cert (`CN=localhost`); `insecureSkipTlsVerify` is a best-effort request to skip cert
+ * *validation*, but in swamp's managed Deno runtime it is effectively inert in-process
+ * (skip-verify is only honoured process-wide via --unsafely-ignore-certificate-errors)
+ * — so the supported path is a trusted cert on the host. Either way the transport stays
+ * TLS-encrypted, which is what keeps the key alive.
  *
  * Secrets: `apiKey` is supplied via a vault expression, e.g.
  * `${{ vault.get(<vault>, truenas/credential) }}`. It is marked sensitive and
@@ -63,10 +66,12 @@ const GlobalArgs = z.object({
       "${{ vault.get(<vault>, truenas/credential) }}",
   ),
   insecureSkipTlsVerify: z.coerce.boolean().default(false).describe(
-    "Skip TLS certificate VALIDATION (the NAS uses a self-signed CN=localhost " +
-      "cert). Transport stays TLS-encrypted — safe for the API key. Note: Deno's " +
-      "WebSocket honours this only when the process is run with " +
-      "--unsafely-ignore-certificate-errors; otherwise trust the cert on the host.",
+    "Best-effort request to skip TLS certificate VALIDATION (the NAS uses a " +
+      "self-signed CN=localhost cert). In swamp's managed Deno runtime this flag is " +
+      "effectively inert in-process: skip-verify is only honoured process-wide, when " +
+      "the runtime is started with --unsafely-ignore-certificate-errors. The supported " +
+      "path is a trusted cert on the host; the transport always stays TLS-encrypted, " +
+      "which is what keeps the API key alive.",
   ),
   timeoutMs: z.coerce.number().int().default(30000).describe(
     "Per-call timeout in milliseconds (also the job-wait budget)",
@@ -84,6 +89,8 @@ const Action = z.enum([
   "updated",
   "unchanged",
   "deleted",
+  // delete verbs are idempotent: a target that's already gone records "absent".
+  "absent",
 ]);
 
 // ─────────────────────────── resource schemas ───────────────────────────
@@ -853,6 +860,53 @@ async function resolveSmb(
   if (rows.length === 0) {
     throw new Error(`SMB share ${JSON.stringify(a.id ?? a.name)} not found`);
   }
+  if (rows.length > 1) {
+    throw new Error(
+      `SMB selector ${
+        JSON.stringify(a.id ?? a.name)
+      } is ambiguous (${rows.length} matches) — use id`,
+    );
+  }
+  return asObj(rows[0]);
+}
+
+/**
+ * Like {@link resolveNfs} but returns `null` when no share matches (idempotent
+ * delete path) — still throws on an AMBIGUOUS selector, since deleting one of
+ * several matches blindly is unsafe.
+ */
+async function resolveNfsOrNull(
+  session: RpcSession,
+  a: { id?: number; path?: string },
+): Promise<Record<string, unknown> | null> {
+  const filter = a.id !== undefined
+    ? [["id", "=", a.id]]
+    : [["path", "=", a.path]];
+  const rows = asArr(await session.call("sharing.nfs.query", [filter]));
+  if (rows.length === 0) return null;
+  if (rows.length > 1) {
+    throw new Error(
+      `NFS selector ${
+        JSON.stringify(a.id ?? a.path)
+      } is ambiguous (${rows.length} matches) — use id`,
+    );
+  }
+  return asObj(rows[0]);
+}
+
+/**
+ * Like {@link resolveSmb} but returns `null` when no share matches (idempotent
+ * delete path) — still throws on an AMBIGUOUS selector.
+ */
+async function resolveSmbOrNull(
+  session: RpcSession,
+  a: { id?: number; name?: string },
+): Promise<Record<string, unknown> | null> {
+  const filter = a.id !== undefined
+    ? [["id", "=", a.id]]
+    : [["name", "=", a.name]];
+  const rows = asArr(await session.call("sharing.smb.query", [filter]));
+  if (rows.length === 0) return null;
   if (rows.length > 1) {
     throw new Error(
       `SMB selector ${
@@ -1674,8 +1728,9 @@ export const model = {
       description:
         "DELETE an NFS export rule (e.g. a now-unused share). Verifies the share " +
         "first and records its removed config (path/networks/hosts) so it can be " +
-        "re-created. Removes ONLY the export rule — the underlying dataset/data is " +
-        "untouched. Pass confirmPath to guard against deleting the wrong share.",
+        "re-created. Idempotent: a share that's already gone records action=absent " +
+        "instead of failing. Removes ONLY the export rule — the underlying " +
+        "dataset/data is untouched. Pass confirmPath to guard against deleting the wrong share.",
       arguments: NfsShareDeleteArgs,
       execute: async (
         rawArgs,
@@ -1685,7 +1740,28 @@ export const model = {
         const a = NfsShareDeleteArgs.parse(rawArgs);
         const session = await openSession(g);
         try {
-          const share = await resolveNfs(session, a);
+          const share = await resolveNfsOrNull(session, a);
+          if (share === null) {
+            // Already gone — idempotent success. The confirmPath guard only
+            // protects against deleting the WRONG existing share, so it doesn't
+            // apply when there's nothing to delete.
+            const ats = new Date().toISOString();
+            const handle = await context.writeResource(
+              "nfs-share-result",
+              String(a.id ?? a.path),
+              {
+                id: a.id ?? 0,
+                path: a.path ?? "",
+                previousNetworks: [],
+                previousHosts: [],
+                networks: [],
+                hosts: [],
+                action: "absent",
+                timestamp: ats,
+              },
+            );
+            return { dataHandles: [handle] };
+          }
           const id = asNum(share.id) ?? 0;
           const path = String(share.path ?? "");
           const ts = new Date().toISOString();
@@ -1824,7 +1900,8 @@ export const model = {
       description:
         "DELETE an SMB share (e.g. a now-unused share). Verifies the share first " +
         "and records its removed config (name/path/hostsallow/hostsdeny/purpose) so it " +
-        "can be re-created. Removes ONLY the share definition — the underlying " +
+        "can be re-created. Idempotent: a share that's already gone records action=absent " +
+        "instead of failing. Removes ONLY the share definition — the underlying " +
         "dataset/data is untouched. Pass confirmName to guard against deleting the wrong share.",
       arguments: SmbShareDeleteArgs,
       execute: async (
@@ -1835,7 +1912,30 @@ export const model = {
         const a = SmbShareDeleteArgs.parse(rawArgs);
         const session = await openSession(g);
         try {
-          const share = await resolveSmb(session, a);
+          const share = await resolveSmbOrNull(session, a);
+          if (share === null) {
+            // Already gone — idempotent success. The confirmName guard only
+            // protects against deleting the WRONG existing share, so it doesn't
+            // apply when there's nothing to delete.
+            const ats = new Date().toISOString();
+            const handle = await context.writeResource(
+              "smb-share-result",
+              String(a.id ?? a.name),
+              {
+                id: a.id ?? 0,
+                name: a.name ?? "",
+                previousHostsallow: [],
+                previousHostsdeny: [],
+                hostsallow: [],
+                hostsdeny: [],
+                previousPurpose: "",
+                purpose: "",
+                action: "absent",
+                timestamp: ats,
+              },
+            );
+            return { dataHandles: [handle] };
+          }
           const id = asNum(share.id) ?? 0;
           const name = String(share.name ?? "");
           const ts = new Date().toISOString();

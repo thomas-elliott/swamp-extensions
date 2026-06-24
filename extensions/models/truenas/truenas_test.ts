@@ -682,6 +682,29 @@ Deno.test("nfs_share_delete: refuses when confirmPath mismatches", async () => {
   }
 });
 
+Deno.test("nfs_share_delete: already-absent share succeeds with action=absent (idempotent)", async () => {
+  let deleteCalled = false;
+  const fake = makeFakeSession((m) => {
+    if (m === "sharing.nfs.query") return []; // nothing matches — already gone
+    if (m === "sharing.nfs.delete") {
+      deleteCalled = true;
+      return true;
+    }
+    return undefined;
+  });
+  __setTruenasSession(fake.factory);
+  try {
+    const { context, written } = makeContext();
+    await method("nfs_share_delete").execute({ id: 9 }, context);
+    assertEquals(deleteCalled, false, "must NOT call delete when nothing matches");
+    const r = written[0].data;
+    assertEquals(r.action, "absent");
+    assertEquals(r.id, 9);
+  } finally {
+    __setTruenasSession(null);
+  }
+});
+
 // ─────────────────────────── smb_share_delete ───────────────────────────
 
 Deno.test("smb_share_delete: removes the share and records its prior config", async () => {
@@ -740,6 +763,29 @@ Deno.test("smb_share_delete: refuses when confirmName mismatches", async () => {
       /does not match/,
     );
     assertEquals(deleteCalled, false, "must NOT delete on a confirmName mismatch");
+  } finally {
+    __setTruenasSession(null);
+  }
+});
+
+Deno.test("smb_share_delete: already-absent share succeeds with action=absent (idempotent)", async () => {
+  let deleteCalled = false;
+  const fake = makeFakeSession((m) => {
+    if (m === "sharing.smb.query") return []; // nothing matches — already gone
+    if (m === "sharing.smb.delete") {
+      deleteCalled = true;
+      return true;
+    }
+    return undefined;
+  });
+  __setTruenasSession(fake.factory);
+  try {
+    const { context, written } = makeContext();
+    await method("smb_share_delete").execute({ name: "Music" }, context);
+    assertEquals(deleteCalled, false, "must NOT call delete when nothing matches");
+    const r = written[0].data;
+    assertEquals(r.action, "absent");
+    assertEquals(r.name, "Music");
   } finally {
     __setTruenasSession(null);
   }

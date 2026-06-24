@@ -1294,6 +1294,35 @@ export const model = {
   type: "@thomas/arcane",
   version: "2026.06.24.1",
   globalArguments: GlobalArgs,
+  checks: {
+    "reachable": {
+      description:
+        "Verify the Arcane API authenticates (GET /version with the X-API-Key)",
+      labels: ["live"],
+      execute: async (
+        context: Pick<MethodContext<GlobalArgsT>, "globalArgs">,
+      ) => {
+        const g = context.globalArgs;
+        // `swamp model validate` does NOT resolve vault expressions before checks, so
+        // the key is still a literal `${{ … }}` and a probe can't auth. Skip then —
+        // real reachability is exercised at method-run time.
+        if (/\$\{\{/.test(String(g.apiKey))) return { pass: true };
+        try {
+          // Cheap, read-only, auth-exercising probe — the same endpoint the
+          // `version` method reads. Goes through the model's HTTP transport.
+          await arcane(g, "GET", "/version");
+          return { pass: true };
+        } catch (e) {
+          return {
+            pass: false,
+            errors: [
+              `Cannot reach Arcane at ${g.baseUrl}: ${(e as Error).message}`,
+            ],
+          };
+        }
+      },
+    },
+  },
   upgrades: [
     {
       toVersion: "2026.05.21.1",

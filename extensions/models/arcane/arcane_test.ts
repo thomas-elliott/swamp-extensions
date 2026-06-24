@@ -1348,3 +1348,97 @@ Deno.test("gitops_sync_status names a missing sync instead of silently skipping 
     __setArcaneTransport(null);
   }
 });
+
+// ─────────────────────────── reachable check ───────────────────────────
+
+Deno.test("reachable check: skips (pass) when the apiKey is still a vault expression", async () => {
+  let called = false;
+  __setArcaneTransport(() => {
+    called = true;
+    throw new Error("should not be called");
+  });
+  try {
+    const checks = (model as unknown as {
+      checks: Record<
+        string,
+        { execute: (c: unknown) => Promise<{ pass: boolean }> }
+      >;
+    }).checks;
+    const res = await checks.reachable.execute({
+      globalArgs: {
+        baseUrl: "https://arcane.example:8443",
+        apiKey: "${{ vault.get(myvault, arcane/api_key) }}",
+        environmentId: "0",
+        skipTlsVerify: false,
+        syncs: [],
+      },
+    });
+    assertEquals(res.pass, true);
+    assert(!called, "must not probe when the apiKey is unresolved");
+  } finally {
+    __setArcaneTransport(null);
+  }
+});
+
+Deno.test("reachable check: fails with errors when the probe throws", async () => {
+  __setArcaneTransport(() => {
+    throw new Error("connection refused");
+  });
+  try {
+    const checks = (model as unknown as {
+      checks: Record<
+        string,
+        {
+          execute: (
+            c: unknown,
+          ) => Promise<{ pass: boolean; errors?: string[] }>;
+        }
+      >;
+    }).checks;
+    const res = await checks.reachable.execute({
+      globalArgs: {
+        baseUrl: "https://arcane.example:8443",
+        apiKey: "real-key",
+        environmentId: "0",
+        skipTlsVerify: false,
+        syncs: [],
+      },
+    });
+    assertEquals(res.pass, false);
+    assert(
+      (res.errors ?? []).some((e) => /connection refused/.test(e)),
+      "should surface the cause",
+    );
+  } finally {
+    __setArcaneTransport(null);
+  }
+});
+
+Deno.test("reachable check: passes when the /version probe succeeds", async () => {
+  const paths: string[] = [];
+  __setArcaneTransport((_g, _method, path) => {
+    paths.push(path);
+    return Promise.resolve({ currentVersion: "2.0.3" });
+  });
+  try {
+    const checks = (model as unknown as {
+      checks: Record<
+        string,
+        { execute: (c: unknown) => Promise<{ pass: boolean }> }
+      >;
+    }).checks;
+    const res = await checks.reachable.execute({
+      globalArgs: {
+        baseUrl: "https://arcane.example:8443",
+        apiKey: "real-key",
+        environmentId: "0",
+        skipTlsVerify: false,
+        syncs: [],
+      },
+    });
+    assertEquals(res.pass, true);
+    assertEquals(paths, ["/version"], "probes the cheap /version endpoint");
+  } finally {
+    __setArcaneTransport(null);
+  }
+});
