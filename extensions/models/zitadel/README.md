@@ -78,6 +78,9 @@ swamp model method run zitadel oidc_app_ensure \
   `web|spa|native`, authMethod `basic|post|none|jwt`, grant/response types,
   devMode). Re-running converges config (`action: unchanged|updated`).
 - `api_app_ensure` — ensure an API app (M2M resource server).
+- `oidc_app_redirect_set` — add/remove redirect URIs on an existing OIDC app
+  (set-based, idempotent), preserving every other field of its OIDC config
+  (auth method, response/grant types, PKCE, devMode).
 
 **Rotate:** `app_secret_rotate`, `machine_user_ensure`, `pat_create`,
 `pat_revoke`, `machine_key_create`, `machine_secret_generate`.
@@ -89,7 +92,7 @@ swamp model method run zitadel oidc_app_ensure \
 swamp model method run zitadel role_ensure \
   --input project=homelab --input key=admin --input displayName=Admin
 swamp model method run zitadel grant_ensure \
-  --input user=thomas@smol.cloud --input project=homelab --input 'roleKeys=["admin"]'
+  --input user=alice@example.com --input project=homelab --input 'roleKeys=["admin"]'
 swamp model method run zitadel project_authz_set \
   --input project=homelab --input roleAssertion=true
 ```

@@ -953,6 +953,35 @@ export const model = {
   type: "@thomas/technitium",
   version: "2026.06.16.1",
   globalArguments: GlobalArgs,
+  checks: {
+    "reachable": {
+      description:
+        "Verify the Technitium API authenticates (GET /api/settings/get)",
+      labels: ["live"],
+      execute: async (
+        context: Pick<MethodContext<GlobalArgsT>, "globalArgs">,
+      ) => {
+        const g = context.globalArgs;
+        // `swamp model validate` does NOT resolve vault expressions before checks, so
+        // the token may still be a literal `${{ … }}` and a probe can't auth. Skip then —
+        // real reachability is exercised at method-run time.
+        if (/\$\{\{/.test(String(g.apiToken))) return { pass: true };
+        try {
+          await apiCall(g, "GET", "/settings/get");
+          return { pass: true };
+        } catch (e) {
+          return {
+            pass: false,
+            errors: [
+              `Cannot reach Technitium at ${g.baseUrl}: ${
+                (e as Error).message
+              }`,
+            ],
+          };
+        }
+      },
+    },
+  },
   resources: {
     "zone": {
       description: "An authoritative DNS zone",

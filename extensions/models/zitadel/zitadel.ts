@@ -54,7 +54,7 @@ import type {
 
 const GlobalArgs = z.object({
   apiUrl: z.string().describe(
-    "Zitadel base URL / issuer, e.g. https://zitadel.test.smol.cloud",
+    "Zitadel base URL / issuer, e.g. https://zitadel.example.com",
   ),
   keyJson: z.string().meta({ sensitive: true }).describe(
     "Service-user machine key JSON (the whole blob downloaded from Zitadel; " +
