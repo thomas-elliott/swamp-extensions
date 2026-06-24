@@ -34,7 +34,7 @@ bare host / `https://`, both of which resolve to `wss://<host>/api/current`).
 ```yaml
 type: "@thomas/truenas"
 globalArguments:
-  endpoint: wss://nas.smol.cloud/api/current   # bare host or https:// also accepted
+  endpoint: wss://nas.example.com/api/current   # bare host or https:// also accepted
   apiKey: ${{ vault.get(<vault>, truenas/credential) }}
   insecureSkipTlsVerify: false                  # see TLS note
   timeoutMs: 30000
@@ -47,14 +47,14 @@ need `APP_WRITE` / `SHARING_NFS_WRITE` / `SHARING_SMB_WRITE`).
 ### TLS note (important)
 
 TrueNAS ships a **self-signed certificate** (`CN=localhost`), which fails both chain
-*and* hostname validation for `nas.smol.cloud`. Deno's `WebSocket` honours a
+*and* hostname validation for `nas.example.com`. Deno's `WebSocket` honours a
 skip-verify only when the **process** runs with `--unsafely-ignore-certificate-errors`
 — there is no per-connection switch — so `insecureSkipTlsVerify` cannot take effect
 inside swamp's managed runtime. The supported fix is to **install a certificate valid
 for the host's name** on the TrueNAS UI (the WebSocket API rides the same `:443`
 listener):
 
-1. Issue/obtain a cert for the host name (e.g. the existing `*.smol.cloud` wildcard).
+1. Issue/obtain a cert for the host name (e.g. the existing `*.example.com` wildcard).
 2. **System Settings → Certificates** → import the cert+key.
 3. **System Settings → GUI → GUI SSL Certificate** → select it; the UI reloads.
 
@@ -94,7 +94,7 @@ swamp model method run nas app_set_port_bind --input app=lldap --input portKey=l
 
 # Restrict an NFS export to specific hosts
 swamp model method run nas nfs_share_set_access \
-  --input id=6 --input networks='["192.168.10.161/32","192.168.10.162/32"]'
+  --input id=6 --input networks='["192.0.2.161/32","192.0.2.162/32"]'
 
 # Revert (re-run with the previous values captured on the result resource)
 ```

@@ -45,7 +45,7 @@ import type {
 
 const GlobalArgs = z.object({
   apiUrl: z.string().describe(
-    "Stalwart base URL, e.g. https://mail.smol.cloud (no trailing /jmap)",
+    "Stalwart base URL, e.g. https://mail.example.com (no trailing /jmap)",
   ),
   apiKey: z.string().meta({ sensitive: true }).describe(
     "Scoped admin API key, sent as a Bearer token. Supply via vault: " +
@@ -82,9 +82,6 @@ const DomainInfo = z.object({
   id: z.string(),
   name: z.string(),
   state: z.string().describe("active | inactive | unknown"),
-  dkim: z.boolean().optional().describe(
-    "Whether a DKIM signature is configured",
-  ),
   action: Action,
   timestamp: z.string(),
 });
@@ -129,10 +126,11 @@ const AliasInfo = z.object({
   timestamp: z.string(),
 });
 
+// Membership is tracked on each member's account, not on the group, so there is
+// no `members` field here.
 const GroupInfo = z.object({
   id: z.string(),
   name: z.string(),
-  members: z.array(z.string()),
   description: z.string().optional(),
   action: Action,
   timestamp: z.string(),
@@ -192,14 +190,8 @@ const CertificateInfo = z.object({
   timestamp: z.string(),
 });
 
-const SpamConfigInfo = z.object({
-  id: z.string(),
-  kind: z.string().describe("classifier | rule"),
-  name: z.string(),
-  settings: z.record(z.string(), z.unknown()),
-  action: Action,
-  timestamp: z.string(),
-});
+// Spam classifier/rule configuration is future work (no writer yet), so no
+// dedicated resource spec is published for it.
 
 const SettingsInfo = z.object({
   kind: z.string().describe("Which settings singleton (http, system, …)"),
@@ -813,7 +805,7 @@ const SettingsSetArgs = z.object({
 });
 
 const MailingListEnsureArgs = z.object({
-  address: z.string().describe("Full list address, e.g. team@smol.cloud"),
+  address: z.string().describe("Full list address, e.g. team@example.com"),
   recipients: jsonArray.optional().describe(
     "Member recipient addresses (converged to exactly this set when provided)",
   ),
@@ -821,7 +813,7 @@ const MailingListEnsureArgs = z.object({
 });
 
 const GroupEnsureArgs = z.object({
-  address: z.string().describe("Full group address, e.g. staff@smol.cloud"),
+  address: z.string().describe("Full group address, e.g. staff@example.com"),
   description: z.string().optional(),
 });
 
@@ -941,7 +933,7 @@ const RoleAssignArgs = z.object({
 });
 
 const AccountEnsureArgs = z.object({
-  email: z.string().describe("Full primary address, e.g. alice@smol.cloud"),
+  email: z.string().describe("Full primary address, e.g. alice@example.com"),
   aliases: jsonArray.optional().describe(
     "Full alias addresses to attach (converged to exactly this set)",
   ),
@@ -969,7 +961,7 @@ const CertificateInstallArgs = z.object({
 
 const StateArg = z.enum(["active", "inactive"]);
 const DomainSetStateArgs = z.object({
-  domain: z.string().describe("Domain name, e.g. smol.cloud"),
+  domain: z.string().describe("Domain name, e.g. example.com"),
   state: StateArg.describe("active (enabled) or inactive (disabled)"),
 });
 const AccountSetStateArgs = z.object({
@@ -1047,7 +1039,8 @@ export const model = {
       garbageCollection: 50,
     },
     "group": {
-      description: "A group principal and its members",
+      description:
+        "A group principal (membership is tracked on member accounts)",
       schema: GroupInfo,
       lifetime: "infinite",
       garbageCollection: 20,
@@ -1082,12 +1075,6 @@ export const model = {
       schema: CertificateInfo,
       lifetime: "infinite",
       garbageCollection: 10,
-    },
-    "spam-config": {
-      description: "A spam classifier/rule configuration result",
-      schema: SpamConfigInfo,
-      lifetime: "infinite",
-      garbageCollection: 20,
     },
     "role": {
       description: "A role and the permissions it grants",
@@ -1324,7 +1311,6 @@ export const model = {
               {
                 id: String(grp.id ?? ""),
                 name: String(grp.name ?? ""),
-                members: [],
                 description: typeof grp.description === "string"
                   ? grp.description
                   : undefined,
@@ -1918,7 +1904,6 @@ export const model = {
         const handle = await context.writeResource("group", local, {
           id,
           name: local,
-          members: [],
           description: a.description,
           action,
           timestamp: nowIso(),

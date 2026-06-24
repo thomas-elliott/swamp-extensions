@@ -124,29 +124,29 @@ const find = (calls: Call[], m: string): Call | undefined =>
 
 Deno.test("websocketUrl: bare host becomes wss://host/api/current", () => {
   assertEquals(
-    websocketUrl("nas.smol.cloud"),
-    "wss://nas.smol.cloud/api/current",
+    websocketUrl("nas.example.com"),
+    "wss://nas.example.com/api/current",
   );
 });
 
 Deno.test("websocketUrl: https is upgraded to wss", () => {
   assertEquals(
-    websocketUrl("https://nas.smol.cloud"),
-    "wss://nas.smol.cloud/api/current",
+    websocketUrl("https://nas.example.com"),
+    "wss://nas.example.com/api/current",
   );
 });
 
 Deno.test("websocketUrl: keeps an explicit wss path", () => {
   assertEquals(
-    websocketUrl("wss://nas.smol.cloud/api/current"),
-    "wss://nas.smol.cloud/api/current",
+    websocketUrl("wss://nas.example.com/api/current"),
+    "wss://nas.example.com/api/current",
   );
 });
 
 Deno.test("websocketUrl: REJECTS ws:// (cleartext revokes the key)", () => {
   let threw = false;
   try {
-    websocketUrl("ws://nas.smol.cloud/api/current");
+    websocketUrl("ws://nas.example.com/api/current");
   } catch (e) {
     threw = true;
     assert(/non-TLS|cleartext/i.test((e as Error).message));
@@ -157,7 +157,7 @@ Deno.test("websocketUrl: REJECTS ws:// (cleartext revokes the key)", () => {
 Deno.test("websocketUrl: REJECTS http://", () => {
   let threw = false;
   try {
-    websocketUrl("http://nas.smol.cloud");
+    websocketUrl("http://nas.example.com");
   } catch {
     threw = true;
   }
@@ -234,7 +234,7 @@ Deno.test("exposure_audit: flags plaintext LDAP + 0.0.0.0 ports + unrestricted s
           {
             id: 1,
             path: "/mnt/a",
-            networks: ["192.168.10.0/24"],
+            networks: ["192.0.2.0/24"],
             hosts: [],
             enabled: true,
             ro: false,
@@ -259,7 +259,7 @@ Deno.test("exposure_audit: flags plaintext LDAP + 0.0.0.0 ports + unrestricted s
           ro: false,
         }];
       case "interface.ip_in_use":
-        return [{ address: "192.168.10.252", netmask: 24 }];
+        return [{ address: "192.0.2.252", netmask: 24 }];
       default:
         return undefined;
     }
@@ -273,7 +273,7 @@ Deno.test("exposure_audit: flags plaintext LDAP + 0.0.0.0 ports + unrestricted s
     const flags = a.flags as Record<string, unknown>;
     assertEquals(flags.plaintextLdapPublished, true);
     assertEquals(flags.portsOnAllInterfaces, [389, 636, 30325]);
-    assertEquals(flags.nonWildcardBindableIps, ["192.168.10.252"]);
+    assertEquals(flags.nonWildcardBindableIps, ["192.0.2.252"]);
     assertEquals(a.unrestrictedNfsShares, ["/mnt/open"]);
     assertEquals(a.unrestrictedSmbShares, ["Open"]);
     assertEquals((a.publishedPorts as unknown[]).length, 3);
@@ -477,14 +477,14 @@ Deno.test("nfs_share_set_access: sets networks, re-reads, records previous", asy
   const before = {
     id: 1,
     path: "/mnt/a",
-    networks: ["192.168.10.0/24"],
+    networks: ["192.0.2.0/24"],
     hosts: [],
     enabled: true,
     ro: false,
   };
   const after = {
     ...before,
-    networks: ["192.168.10.161/32", "192.168.10.162/32"],
+    networks: ["192.0.2.161/32", "192.0.2.162/32"],
   };
   let done = false;
   const fake = makeFakeSession((m, params) => {
@@ -492,7 +492,7 @@ Deno.test("nfs_share_set_access: sets networks, re-reads, records previous", asy
     if (m === "sharing.nfs.update") {
       done = true;
       const body = params[1] as Record<string, unknown>;
-      assertEquals(body.networks, ["192.168.10.161/32", "192.168.10.162/32"]);
+      assertEquals(body.networks, ["192.0.2.161/32", "192.0.2.162/32"]);
       return after;
     }
     return undefined;
@@ -501,13 +501,13 @@ Deno.test("nfs_share_set_access: sets networks, re-reads, records previous", asy
   try {
     const { context, written } = makeContext();
     await method("nfs_share_set_access").execute(
-      { id: 1, networks: ["192.168.10.161/32", "192.168.10.162/32"] },
+      { id: 1, networks: ["192.0.2.161/32", "192.0.2.162/32"] },
       context,
     );
     const r = written[0].data;
     assertEquals(r.action, "updated");
-    assertEquals(r.previousNetworks, ["192.168.10.0/24"]);
-    assertEquals(r.networks, ["192.168.10.161/32", "192.168.10.162/32"]);
+    assertEquals(r.previousNetworks, ["192.0.2.0/24"]);
+    assertEquals(r.networks, ["192.0.2.161/32", "192.0.2.162/32"]);
   } finally {
     __setTruenasSession(null);
   }
@@ -624,7 +624,7 @@ Deno.test("nfs_share_delete: removes the export and records its prior config", a
   const share = {
     id: 9,
     path: "/mnt/Primary/apps/git",
-    networks: ["192.168.10.161/32", "192.168.10.162/32"],
+    networks: ["192.0.2.161/32", "192.0.2.162/32"],
     hosts: [],
     enabled: true,
   };
@@ -646,8 +646,8 @@ Deno.test("nfs_share_delete: removes the export and records its prior config", a
     assertEquals(r.action, "deleted");
     assertEquals(r.path, "/mnt/Primary/apps/git");
     assertEquals(r.previousNetworks, [
-      "192.168.10.161/32",
-      "192.168.10.162/32",
+      "192.0.2.161/32",
+      "192.0.2.162/32",
     ]);
     assertEquals(r.networks, []);
   } finally {
@@ -757,7 +757,7 @@ Deno.test("smb_share_set_access: echoes name+path and sets hostsallow", async ()
     enabled: true,
     ro: false,
   };
-  const after = { ...before, hostsallow: ["192.168.10.50"] };
+  const after = { ...before, hostsallow: ["192.0.2.50"] };
   let done = false;
   const fake = makeFakeSession((m, params) => {
     if (m === "sharing.smb.query") return [done ? after : before];
@@ -766,7 +766,7 @@ Deno.test("smb_share_set_access: echoes name+path and sets hostsallow", async ()
       const body = params[1] as Record<string, unknown>;
       assertEquals(body.name, "Media", "must echo name (schema-required)");
       assertEquals(body.path, "/mnt/m", "must echo path");
-      assertEquals(body.hostsallow, ["192.168.10.50"]);
+      assertEquals(body.hostsallow, ["192.0.2.50"]);
       return after;
     }
     return undefined;
@@ -776,12 +776,12 @@ Deno.test("smb_share_set_access: echoes name+path and sets hostsallow", async ()
     const { context, written } = makeContext();
     await method("smb_share_set_access").execute({
       id: 3,
-      hostsallow: ["192.168.10.50"],
+      hostsallow: ["192.0.2.50"],
     }, context);
     const r = written[0].data;
     assertEquals(r.action, "updated");
     assertEquals(r.previousHostsallow, []);
-    assertEquals(r.hostsallow, ["192.168.10.50"]);
+    assertEquals(r.hostsallow, ["192.0.2.50"]);
   } finally {
     __setTruenasSession(null);
   }
@@ -803,7 +803,7 @@ Deno.test("smb_share_set_access: releases a host-locking preset to NO_PRESET", a
   const after = {
     ...before,
     purpose: "NO_PRESET",
-    hostsallow: ["192.168.10.101"],
+    hostsallow: ["192.0.2.101"],
   };
   let done = false;
   let sentPurpose: unknown = "UNSET";
@@ -821,13 +821,13 @@ Deno.test("smb_share_set_access: releases a host-locking preset to NO_PRESET", a
     const { context, written } = makeContext();
     await method("smb_share_set_access").execute({
       id: 1,
-      hostsallow: ["192.168.10.101"],
+      hostsallow: ["192.0.2.101"],
     }, context);
     assertEquals(sentPurpose, "NO_PRESET", "must release the preset lock");
     const r = written[0].data;
     assertEquals(r.previousPurpose, "DEFAULT_SHARE");
     assertEquals(r.purpose, "NO_PRESET");
-    assertEquals(r.hostsallow, ["192.168.10.101"]);
+    assertEquals(r.hostsallow, ["192.0.2.101"]);
   } finally {
     __setTruenasSession(null);
   }
@@ -845,7 +845,7 @@ Deno.test("smb_share_set_access: leaves a non-locking preset untouched", async (
     enabled: true,
     ro: false,
   };
-  const after = { ...before, hostsallow: ["192.168.10.101"] };
+  const after = { ...before, hostsallow: ["192.0.2.101"] };
   let done = false;
   let purposeKeyPresent = true;
   const fake = makeFakeSession((m, params) => {
@@ -862,7 +862,7 @@ Deno.test("smb_share_set_access: leaves a non-locking preset untouched", async (
     const { context, written } = makeContext();
     await method("smb_share_set_access").execute({
       id: 9,
-      hostsallow: ["192.168.10.101"],
+      hostsallow: ["192.0.2.101"],
     }, context);
     assertEquals(purposeKeyPresent, false, "must not send purpose for a non-locking preset");
     const r = written[0].data;

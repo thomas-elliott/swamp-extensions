@@ -52,9 +52,9 @@ import type {
 // ─────────────────────────── global arguments ───────────────────────────
 
 const GlobalArgs = z.object({
-  endpoint: z.string().default("wss://nas.smol.cloud/api/current").describe(
-    "TrueNAS host or wss:// base URL, e.g. nas.smol.cloud or " +
-      "wss://nas.smol.cloud/api/current. A bare host becomes " +
+  endpoint: z.string().default("wss://nas.example.com/api/current").describe(
+    "TrueNAS host or wss:// base URL, e.g. nas.example.com or " +
+      "wss://nas.example.com/api/current. A bare host becomes " +
       "wss://<host>/api/current. NON-TLS (ws://, http://) is REJECTED — TrueNAS " +
       "revokes an API key sent over cleartext.",
   ),
@@ -706,7 +706,7 @@ const AppSetPortBindArgs = z.object({
       "host port). Omit to leave the mode unchanged and only edit hostIps.",
   ),
   hostIps: z.array(z.string()).optional().describe(
-    'Host IPs to publish on (e.g. ["192.168.10.252"]); only meaningful when ' +
+    'Host IPs to publish on (e.g. ["192.0.2.252"]); only meaningful when ' +
       "published. Omit to leave unchanged.",
   ),
 }).refine(
@@ -735,7 +735,7 @@ const NfsShareSetAccessArgs = z.object({
     "Alternatively select the share by export path",
   ),
   networks: z.array(z.string()).optional().describe(
-    'Authorized networks in CIDR, e.g. ["192.168.10.161/32"]. Empty array CLEARS ' +
+    'Authorized networks in CIDR, e.g. ["192.0.2.161/32"]. Empty array CLEARS ' +
       "the restriction (all networks). Omit to leave networks unchanged.",
   ),
   hosts: z.array(z.string()).optional().describe(

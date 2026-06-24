@@ -238,6 +238,9 @@ const SwarmStackResource = z.object({
   name: z.string(),
   namespace: z.string().optional(),
   services: z.number().optional().describe("Number of services in the stack"),
+  deletes: z.number().int().optional().describe(
+    "Number of objects removed when the stack was deleted",
+  ),
   createdAt: z.string().optional(),
   updatedAt: z.string().optional(),
   action: Action,
@@ -1289,7 +1292,7 @@ const LifecycleArgs = z.object({
 /** The `@thomas/arcane` swamp model: schema, methods, and lifecycle for managing Docker via Arcane. */
 export const model = {
   type: "@thomas/arcane",
-  version: "2026.06.12.1",
+  version: "2026.06.24.1",
   globalArguments: GlobalArgs,
   upgrades: [
     {
@@ -1328,6 +1331,14 @@ export const model = {
       toVersion: "2026.06.12.1",
       description:
         "Add the `version` and `gitops_sync_status` read-only methods (both endpoints exist on Arcane v1.19.x and v2.0.x). globalArguments schema is unchanged, so this is a no-op data migration.",
+      upgradeAttributes: (
+        old: Record<string, unknown>,
+      ): Record<string, unknown> => old,
+    },
+    {
+      toVersion: "2026.06.24.1",
+      description:
+        "First registry publish of the version/gitops_sync_status work (2026.06.12.1 was prepared but never pushed). No source change since 2026.06.12.1; globalArguments schema is unchanged, so this is a no-op data migration.",
       upgradeAttributes: (
         old: Record<string, unknown>,
       ): Record<string, unknown> => old,
