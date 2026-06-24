@@ -614,7 +614,7 @@ const MirrorSyncArgs = z.object({
  */
 export const model = {
   type: "@thomas/forgejo",
-  version: "2026.06.13.1",
+  version: "2026.06.24.1",
   globalArguments: GlobalArgs,
   checks: {
     "reachable": {
