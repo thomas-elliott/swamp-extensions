@@ -762,7 +762,7 @@ async function getKeyRaw(
  */
 export const model = {
   type: "@thomas/garage",
-  version: "2026.06.01.1",
+  version: "2026.06.24.1",
   globalArguments: GlobalArgs,
   checks: {
     "reachable": {
