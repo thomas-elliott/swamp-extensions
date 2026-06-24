@@ -51,7 +51,7 @@ import type {
 
 const GlobalArgs = z.object({
   apiUrl: z.string().describe(
-    "Forgejo base URL, e.g. https://git.smol.cloud (no trailing /api/v1).",
+    "Forgejo base URL, e.g. https://git.example.com (no trailing /api/v1).",
   ),
   token: z.string().meta({ sensitive: true }).describe(
     "Forgejo access token (Settings → Applications). Supply via vault: " +

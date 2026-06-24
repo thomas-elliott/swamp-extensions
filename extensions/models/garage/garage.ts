@@ -134,9 +134,11 @@ const KeyInfo = z.object({
   expiration: z.string().nullable().optional(),
   expired: z.boolean().optional(),
   canCreateBucket: z.boolean().optional(),
-  buckets: z.array(KeyBucketAccess).optional(),
+  buckets: z.array(KeyBucketAccess).optional().describe(
+    "Buckets this key can reach (populated only by key_get; key_list leaves it empty)",
+  ),
   // Present ONLY on key_create / key_rotate output, or key_get with showSecretKey.
-  secretAccessKey: z.string().nullable().optional(),
+  secretAccessKey: z.string().meta({ sensitive: true }).nullable().optional(),
   action: Action,
   timestamp: z.string(),
 });
@@ -183,7 +185,7 @@ const KeyResult = z.object({
   name: z.string().optional(),
   /** Returned ONCE by Garage on create/rotate — sensitive; persisted here so you can
    * capture it. Move it to 1Password and GC this artifact. */
-  secretAccessKey: z.string().nullable().optional(),
+  secretAccessKey: z.string().meta({ sensitive: true }).nullable().optional(),
   action: Action,
   timestamp: z.string(),
 });
@@ -824,6 +826,7 @@ export const model = {
       description:
         "Result of a key create/import/update/rotate/delete (may carry the one-time secret)",
       schema: KeyResult,
+      sensitiveOutput: true,
       lifetime: "infinite",
       garbageCollection: 10,
     },

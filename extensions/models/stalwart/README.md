@@ -36,13 +36,13 @@ it:
 
 ```bash
 swamp model create @thomas/stalwart stalwart \
-  --global-arg apiUrl=https://mail.smol.cloud \
+  --global-arg apiUrl=https://mail.example.com \
   --global-arg 'apiKey=${{ vault.get(op-homelab, stalwart/api_key) }}'
 ```
 
 | Global arg | Required | Notes |
 | --- | --- | --- |
-| `apiUrl` | yes | Base URL, e.g. `https://mail.smol.cloud` (no trailing `/jmap`). |
+| `apiUrl` | yes | Base URL, e.g. `https://mail.example.com` (no trailing `/jmap`). |
 | `apiKey` | yes | Scoped admin API key (Bearer). Supply via vault. |
 | `accountId` | no | JMAP management accountId; omit to use the session's primary. |
 | `httpTimeoutMs` | no | Per-request timeout (default 30000). |
