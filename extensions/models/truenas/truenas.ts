@@ -927,7 +927,7 @@ async function resolveSmbOrNull(
  */
 export const model = {
   type: "@thomas/truenas",
-  version: "2026.06.16.1",
+  version: "2026.06.24.1",
   globalArguments: GlobalArgs,
   checks: {
     "reachable": {

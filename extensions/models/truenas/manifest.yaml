@@ -1,6 +1,6 @@
 manifestVersion: 1
 name: "@thomas/truenas"
-version: 2026.06.13.1
+version: 2026.06.24.1
 description: >-
   Administration of a TrueNAS SCALE host (25.04+) via its JSON-RPC 2.0 WebSocket
   API (wss://, API-key auth). Read/audit of apps + their port bindings, NFS/SMB
