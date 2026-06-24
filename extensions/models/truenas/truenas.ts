@@ -22,15 +22,20 @@ import type {
  *   - NFS share access (`nfs_share_set_access`) — set the per-share authorized
  *     `networks`/`hosts` allowlist (the one supported per-client gate).
  *   - SMB share access (`smb_share_set_access`) — set per-share `hostsallow`/`hostsdeny`.
+ *   - SMB/NFS share delete (`smb_share_delete`, `nfs_share_delete`) — remove a share
+ *     definition (the dataset/data is left untouched); the removed config is recorded
+ *     so it can be re-created.
  * It does NOT touch pools, datasets, users, snapshots, replication, or service
  * start/stop (a stopped ssh/nfs service is a lockout/outage risk — left an explicit
- * gap). Every mutating verb verifies its target by id/name first (CLAUDE.md rule 5)
- * and is reversible (re-run with the prior values).
+ * gap). Every mutating verb verifies its target by id/name first (CLAUDE.md rule 5);
+ * the set-access verbs are reversible (re-run with the prior values) and the delete
+ * verbs record the removed config so the share can be re-created.
  *
  * Method sections (by prefix):
  *   - read/audit: `system_info`, `app_list`, `nfs_share_list`, `smb_share_list`,
  *     `service_list`, `network_info`, `exposure_audit` (the R28 report data source).
- *   - mutate: `app_set_port_bind`, `nfs_share_set_access`, `smb_share_set_access`.
+ *   - mutate: `app_set_port_bind`, `app_set_networks`, `nfs_share_set_access`,
+ *     `smb_share_set_access`, `nfs_share_delete`, `smb_share_delete`.
  *
  * TRANSPORT SAFETY: TrueNAS **permanently revokes an API key the instant it is sent
  * over a non-TLS transport** (plain `ws://`/`http://`). This model therefore refuses
@@ -304,7 +309,10 @@ const SmbShareResult = z.object({
  * applies no preset overrides) in the same update. Discovered on SCALE 25.04 via
  * `sharing.smb.presets`.
  */
-const HOST_LOCKING_PURPOSES = new Set(["DEFAULT_SHARE", "VEEAM_REPOSITORY_SHARE"]);
+const HOST_LOCKING_PURPOSES = new Set([
+  "DEFAULT_SHARE",
+  "VEEAM_REPOSITORY_SHARE",
+]);
 
 // ─────────────────────────── transport seam ───────────────────────────
 
@@ -778,6 +786,22 @@ const SmbShareSetAccessArgs = z.object({
   { message: "provide hostsallow and/or hostsdeny" },
 );
 
+const SmbShareDeleteArgs = z.object({
+  id: z.coerce.number().int().optional().describe(
+    "SMB share id (from smb_share_list)",
+  ),
+  name: z.string().optional().describe(
+    "Alternatively select the share by name",
+  ),
+  confirmName: z.string().optional().describe(
+    "Safety guard: when set, must exactly equal the resolved share's name " +
+      "or the delete is refused (guards against deleting the wrong share by a mistyped id).",
+  ),
+}).refine(
+  (a) => !!(a.id !== undefined || a.name),
+  { message: "provide id or name" },
+);
+
 // ─────────────────────────── resolve helpers (verify-first) ───────────────────────────
 
 /** Find an app by name; throws if absent. */
@@ -849,7 +873,7 @@ async function resolveSmb(
  */
 export const model = {
   type: "@thomas/truenas",
-  version: "2026.06.13.4",
+  version: "2026.06.16.1",
   globalArguments: GlobalArgs,
   checks: {
     "reachable": {
@@ -1293,17 +1317,22 @@ export const model = {
             );
           if (portsList.length > 0 && !inNetworkMap) {
             const idx = portsList.findIndex(
-              (p) => a.portNumber !== undefined &&
+              (p) =>
+                a.portNumber !== undefined &&
                 asNum(p.port_number) === a.portNumber,
             );
             if (idx < 0) {
               throw new Error(
-                `port ${JSON.stringify(a.portNumber ?? a.portKey)} not found in ` +
+                `port ${
+                  JSON.stringify(a.portNumber ?? a.portKey)
+                } not found in ` +
                   `config.ports of ${a.app} (list-form ports select by portNumber)`,
               );
             }
             const cur = portsList[idx];
-            const pkLabel = String(asNum(cur.port_number) ?? a.portNumber ?? "");
+            const pkLabel = String(
+              asNum(cur.port_number) ?? a.portNumber ?? "",
+            );
             const prevMode = String(cur.bind_mode ?? "published");
             const prevIps = strArr(cur.host_ips);
             const newMode = a.bindMode ?? prevMode;
@@ -1345,10 +1374,14 @@ export const model = {
               Number(g.timeoutMs) || 30000,
             );
 
-            const afterList = asArr(asObj((await resolveApp(session, a.app)).config).ports)
+            const afterList = asArr(
+              asObj((await resolveApp(session, a.app)).config).ports,
+            )
               .map((p) => asObj(p));
             const applied = afterList.find(
-              (p) => asNum(p.port_number) === (asNum(cur.port_number) ?? a.portNumber),
+              (p) =>
+                asNum(p.port_number) ===
+                  (asNum(cur.port_number) ?? a.portNumber),
             ) ?? {};
             const handle = await context.writeResource(
               "app-port-result",
@@ -1542,7 +1575,9 @@ export const model = {
             Number(g.timeoutMs) || 30000,
           );
 
-          const after = asArr(asObj((await resolveApp(session, a.app)).config).networks)
+          const after = asArr(
+            asObj((await resolveApp(session, a.app)).config).networks,
+          )
             .map((n) => String(asObj(n).name));
           const handle = await context.writeResource(
             "app-networks-result",
@@ -1657,8 +1692,12 @@ export const model = {
 
           if (a.confirmPath !== undefined && a.confirmPath !== path) {
             throw new Error(
-              `confirmPath ${JSON.stringify(a.confirmPath)} does not match the ` +
-                `resolved export path ${JSON.stringify(path)} — refusing to delete`,
+              `confirmPath ${
+                JSON.stringify(a.confirmPath)
+              } does not match the ` +
+                `resolved export path ${
+                  JSON.stringify(path)
+                } — refusing to delete`,
             );
           }
 
@@ -1771,6 +1810,64 @@ export const model = {
               previousPurpose: prevPurpose,
               purpose: String(after.purpose ?? newPurpose),
               action: "updated",
+              timestamp: ts,
+            },
+          );
+          return { dataHandles: [handle] };
+        } finally {
+          session.close();
+        }
+      },
+    },
+
+    smb_share_delete: {
+      description:
+        "DELETE an SMB share (e.g. a now-unused share). Verifies the share first " +
+        "and records its removed config (name/path/hostsallow/hostsdeny/purpose) so it " +
+        "can be re-created. Removes ONLY the share definition — the underlying " +
+        "dataset/data is untouched. Pass confirmName to guard against deleting the wrong share.",
+      arguments: SmbShareDeleteArgs,
+      execute: async (
+        rawArgs,
+        context,
+      ): Promise<{ dataHandles: DataHandle[] }> => {
+        const g = context.globalArgs;
+        const a = SmbShareDeleteArgs.parse(rawArgs);
+        const session = await openSession(g);
+        try {
+          const share = await resolveSmb(session, a);
+          const id = asNum(share.id) ?? 0;
+          const name = String(share.name ?? "");
+          const ts = new Date().toISOString();
+
+          if (a.confirmName !== undefined && a.confirmName !== name) {
+            throw new Error(
+              `confirmName ${
+                JSON.stringify(a.confirmName)
+              } does not match the ` +
+                `resolved share name ${
+                  JSON.stringify(name)
+                } — refusing to delete`,
+            );
+          }
+
+          logInfo(context, "Deleting SMB share", { id, name });
+          await session.call("sharing.smb.delete", [id]);
+
+          // The removed config is captured in previous* so the share can be re-created.
+          const handle = await context.writeResource(
+            "smb-share-result",
+            String(id),
+            {
+              id,
+              name,
+              previousHostsallow: strArr(share.hostsallow),
+              previousHostsdeny: strArr(share.hostsdeny),
+              hostsallow: [],
+              hostsdeny: [],
+              previousPurpose: String(share.purpose ?? ""),
+              purpose: String(share.purpose ?? ""),
+              action: "deleted",
               timestamp: ts,
             },
           );

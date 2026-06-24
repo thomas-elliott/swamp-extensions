@@ -682,6 +682,69 @@ Deno.test("nfs_share_delete: refuses when confirmPath mismatches", async () => {
   }
 });
 
+// ─────────────────────────── smb_share_delete ───────────────────────────
+
+Deno.test("smb_share_delete: removes the share and records its prior config", async () => {
+  const share = {
+    id: 6,
+    name: "Music",
+    path: "/mnt/Primary/Music",
+    hostsallow: ["100.64.0.0/10"],
+    hostsdeny: [],
+    purpose: "NO_PRESET",
+    enabled: true,
+  };
+  let deletedId: unknown = null;
+  const fake = makeFakeSession((m, params) => {
+    if (m === "sharing.smb.query") return [share];
+    if (m === "sharing.smb.delete") {
+      deletedId = params[0];
+      return true;
+    }
+    return undefined;
+  });
+  __setTruenasSession(fake.factory);
+  try {
+    const { context, written } = makeContext();
+    await method("smb_share_delete").execute({ id: 6 }, context);
+    assertEquals(deletedId, 6, "must call sharing.smb.delete with the id");
+    const r = written[0].data;
+    assertEquals(r.action, "deleted");
+    assertEquals(r.name, "Music");
+    assertEquals(r.previousHostsallow, ["100.64.0.0/10"]);
+    assertEquals(r.hostsallow, []);
+  } finally {
+    __setTruenasSession(null);
+  }
+});
+
+Deno.test("smb_share_delete: refuses when confirmName mismatches", async () => {
+  let deleteCalled = false;
+  const fake = makeFakeSession((m) => {
+    if (m === "sharing.smb.query") return [{ id: 6, name: "Music", path: "/mnt/Primary/Music" }];
+    if (m === "sharing.smb.delete") {
+      deleteCalled = true;
+      return true;
+    }
+    return undefined;
+  });
+  __setTruenasSession(fake.factory);
+  try {
+    const { context } = makeContext();
+    await rejects(
+      () =>
+        method("smb_share_delete").execute(
+          { id: 6, confirmName: "WRONG" },
+          context,
+        ),
+      /does not match/,
+    );
+    assertEquals(deleteCalled, false, "must NOT delete on a confirmName mismatch");
+  } finally {
+    __setTruenasSession(null);
+  }
+});
+
 // ─────────────────────────── smb_share_set_access ───────────────────────────
 
 Deno.test("smb_share_set_access: echoes name+path and sets hostsallow", async () => {
