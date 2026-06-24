@@ -951,7 +951,7 @@ const SettingsRestoreArgs = z.object({
 /** The `@thomas/technitium` swamp model: schema, methods, and lifecycle for managing a Technitium DNS server. */
 export const model = {
   type: "@thomas/technitium",
-  version: "2026.06.16.1",
+  version: "2026.06.24.1",
   globalArguments: GlobalArgs,
   checks: {
     "reachable": {
