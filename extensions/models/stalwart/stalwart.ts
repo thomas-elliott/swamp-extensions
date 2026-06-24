@@ -991,7 +991,7 @@ function logInfo(
  */
 export const model = {
   type: "@thomas/stalwart",
-  version: "2026.06.09.1",
+  version: "2026.06.24.1",
   globalArguments: GlobalArgs,
   checks: {
     "reachable": {
