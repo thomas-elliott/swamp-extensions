@@ -1,6 +1,6 @@
 manifestVersion: 1
 name: "@thomas/technitium"
-version: 2026.06.16.1
+version: 2026.06.24.1
 description: >-
   Management of a Technitium DNS Server via its HTTP API — built-in ad-blocking
   control (enable/disable, temporary disable, allow/block list URLs), authoritative
