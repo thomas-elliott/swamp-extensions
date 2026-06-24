@@ -1,6 +1,6 @@
 manifestVersion: 1
 name: "@thomas/garage"
-version: 2026.06.01.1
+version: 2026.06.24.1
 description: >-
   Control-plane administration of a Garage (S3-compatible object store) cluster
   via its Admin API v2 (bearer token). Read/audit of cluster health, buckets,
