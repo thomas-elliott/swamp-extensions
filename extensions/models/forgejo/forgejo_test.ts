@@ -790,3 +790,303 @@ Deno.test("API errors surface with method, path, status, and message", async () 
     __setCaller(null);
   }
 });
+
+// ─────────────────────────── pull requests ───────────────────────────
+
+// A realistic PR object as the server returns it.
+function prObj(over: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    number: 4,
+    title: "Add the thing",
+    body: "why",
+    state: "open",
+    draft: false,
+    merged: false,
+    mergeable: true,
+    html_url: "https://git.test.example.com/apps/damson/pulls/4",
+    user: { login: "telliott" },
+    head: { ref: "feat/thing", sha: "abc123def456", repo: repoObj() },
+    base: { ref: "main", sha: "999", repo: repoObj() },
+    comments: 0,
+    created_at: "2026-08-01T00:00:00Z",
+    updated_at: "2026-08-01T00:00:00Z",
+    ...over,
+  };
+}
+
+/**
+ * Fake covering the PR endpoints. `open` is the open-PR listing; `detail` the
+ * single-PR fetch; `ci` the combined-status state ("" ⇒ no statuses).
+ */
+function prApi(opts: {
+  open?: Array<Record<string, unknown>>;
+  detail?: Record<string, unknown>;
+  ci?: string;
+  onMerge?: () => { status: number; body: Record<string, unknown> };
+}) {
+  return makeFakeApi((c) => {
+    if (c.path.includes("/commits/") && c.path.endsWith("/status")) {
+      return opts.ci === undefined ? {} : { state: opts.ci };
+    }
+    if (c.method === "POST" && c.path.endsWith("/merge")) {
+      return opts.onMerge?.() ?? { status: 200, body: {} };
+    }
+    if (c.method === "GET" && c.path.includes("/pulls?state=")) {
+      return opts.open ?? [];
+    }
+    if (c.method === "GET" && /\/pulls\/\d+$/.test(c.path)) {
+      return opts.detail;
+    }
+    if (c.method === "POST" && c.path.endsWith("/pulls")) return prObj();
+    if (c.method === "PATCH") return prObj({ title: "Renamed" });
+    return undefined;
+  });
+}
+
+Deno.test("pr_ensure opens a PR when no matching open one exists", async () => {
+  const { caller, calls } = prApi({ open: [] });
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("pr_ensure").execute(
+      {
+        owner: "apps",
+        name: "damson",
+        head: "feat/thing",
+        base: "main",
+        title: "Add the thing",
+      },
+      context,
+    );
+    const post = calls.find((c) => c.method === "POST");
+    assertEquals(post?.path, "/api/v1/repos/apps/damson/pulls");
+    assertEquals((post?.body as Record<string, unknown>).base, "main");
+    assertEquals(written[0].data.action, "created");
+    assertEquals(written[0].name, "apps:damson#4");
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("pr_ensure is a no-op when an identical open PR exists", async () => {
+  const { caller, calls } = prApi({ open: [prObj()] });
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("pr_ensure").execute(
+      {
+        owner: "apps",
+        name: "damson",
+        head: "feat/thing",
+        base: "main",
+        title: "Add the thing",
+        body: "why",
+      },
+      context,
+    );
+    assert(
+      !calls.some((c) => c.method === "POST" || c.method === "PATCH"),
+      "must not write when nothing differs",
+    );
+    assertEquals(written[0].data.action, "unchanged");
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("pr_ensure converges the title of an existing open PR", async () => {
+  const { caller, calls } = prApi({ open: [prObj()] });
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("pr_ensure").execute(
+      {
+        owner: "apps",
+        name: "damson",
+        head: "feat/thing",
+        base: "main",
+        title: "Renamed",
+      },
+      context,
+    );
+    const patch = calls.find((c) => c.method === "PATCH");
+    assertEquals(patch?.path, "/api/v1/repos/apps/damson/pulls/4");
+    assertEquals((patch?.body as Record<string, unknown>).title, "Renamed");
+    assertEquals(written[0].data.action, "updated");
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("pr_ensure matches a fork head (owner:branch) against the bare ref", async () => {
+  const { caller, calls } = prApi({ open: [prObj()] });
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("pr_ensure").execute(
+      {
+        owner: "apps",
+        name: "damson",
+        head: "someone:feat/thing",
+        base: "main",
+        title: "Add the thing",
+        body: "why",
+      },
+      context,
+    );
+    assert(
+      !calls.some((c) => c.method === "POST"),
+      "a qualified head must still match the existing PR, not duplicate it",
+    );
+    assertEquals(written[0].data.action, "unchanged");
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("pr_get reports ciState none when the head carries no status", async () => {
+  const { caller } = prApi({ detail: prObj(), ci: "" });
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("pr_get").execute(
+      { owner: "apps", name: "damson", index: 4 },
+      context,
+    );
+    assertEquals(written[0].data.ciState, "none");
+    assertEquals(written[0].data.mergeable, true);
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("pr_merge refuses a draft, a closed PR, and an already-merged PR", async () => {
+  for (
+    const [over, re] of [
+      [{ draft: true }, /is a draft/],
+      [{ state: "closed" }, /not open/],
+      [{ merged: true }, /already merged/],
+    ] as Array<[Record<string, unknown>, RegExp]>
+  ) {
+    const { caller, calls } = prApi({ detail: prObj(over), ci: "success" });
+    __setCaller(caller);
+    try {
+      const { context } = makeContext();
+      await rejects(
+        () =>
+          method("pr_merge").execute(
+            { owner: "apps", name: "damson", index: 4 },
+            context,
+          ),
+        re,
+      );
+      assert(
+        !calls.some((c) => c.path.endsWith("/merge")),
+        `must not call merge for ${JSON.stringify(over)}`,
+      );
+    } finally {
+      __setCaller(null);
+    }
+  }
+});
+
+Deno.test("pr_merge refuses a PR the server says is not mergeable", async () => {
+  const { caller, calls } = prApi({
+    detail: prObj({ mergeable: false }),
+    ci: "success",
+  });
+  __setCaller(caller);
+  try {
+    const { context } = makeContext();
+    await rejects(
+      () =>
+        method("pr_merge").execute(
+          { owner: "apps", name: "damson", index: 4, force: true },
+          context,
+        ),
+      /not mergeable/,
+    );
+    assert(
+      !calls.some((c) => c.path.endsWith("/merge")),
+      "force must not override a conflicting PR",
+    );
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("pr_merge refuses a non-green head unless forced", async () => {
+  const { caller, calls } = prApi({ detail: prObj(), ci: "failure" });
+  __setCaller(caller);
+  try {
+    const { context } = makeContext();
+    await rejects(
+      () =>
+        method("pr_merge").execute(
+          { owner: "apps", name: "damson", index: 4 },
+          context,
+        ),
+      /CI state "failure"/,
+    );
+    assert(!calls.some((c) => c.path.endsWith("/merge")), "must not merge");
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("pr_merge with no CI status at all is refused unless forced", async () => {
+  const { caller } = prApi({ detail: prObj(), ci: "" });
+  __setCaller(caller);
+  try {
+    const { context } = makeContext();
+    await rejects(
+      () =>
+        method("pr_merge").execute(
+          { owner: "apps", name: "damson", index: 4 },
+          context,
+        ),
+      /CI state "none"/,
+    );
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("pr_merge sends the strategy as Do and records merged", async () => {
+  // The detail fetch happens twice: the pre-merge guard must see an open PR,
+  // the post-merge re-fetch a merged one.
+  let merged = false;
+  const { caller, calls } = makeFakeApi((c) => {
+    if (c.path.includes("/commits/")) return { state: "success" };
+    if (c.method === "POST" && c.path.endsWith("/merge")) {
+      merged = true;
+      return {};
+    }
+    if (c.method === "GET" && /\/pulls\/\d+$/.test(c.path)) {
+      return prObj(merged ? { merged: true, state: "closed" } : {});
+    }
+    return undefined;
+  });
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("pr_merge").execute(
+      {
+        owner: "apps",
+        name: "damson",
+        index: 4,
+        strategy: "squash",
+        deleteBranch: true,
+      },
+      context,
+    );
+    const merge = calls.find((c) => c.path.endsWith("/merge"));
+    assertEquals(merge?.path, "/api/v1/repos/apps/damson/pulls/4/merge");
+    const body = merge?.body as Record<string, unknown>;
+    assertEquals(body.Do, "squash");
+    assertEquals(body.delete_branch_after_merge, true);
+    assertEquals(written[0].data.action, "merged");
+  } finally {
+    __setCaller(null);
+  }
+});
