@@ -200,9 +200,19 @@ Deno.test("org_ensure is unchanged when already converged", async () => {
 Deno.test("org_ensure patches only the drifted field", async () => {
   const { caller, calls } = makeFakeApi((c) => {
     if (c.method === "PATCH") {
-      return { id: 3, name: "mirrors", visibility: "private", description: "new" };
+      return {
+        id: 3,
+        name: "mirrors",
+        visibility: "private",
+        description: "new",
+      };
     }
-    return { id: 3, name: "mirrors", visibility: "private", description: "old" };
+    return {
+      id: 3,
+      name: "mirrors",
+      visibility: "private",
+      description: "old",
+    };
   });
   __setCaller(caller);
   try {
@@ -638,8 +648,9 @@ Deno.test("repo_list paginates the search endpoint and unwraps {data}", async ()
 Deno.test("repo_list falls back to the user listing for a non-org owner", async () => {
   const { caller, calls } = makeFakeApi((c) => {
     if (c.path === "/api/v1/orgs/thomas") return undefined; // 404 -> a user
-    return [repoObj({ owner: { login: "thomas" }, full_name: "thomas/x" })] as
-      unknown as Record<string, unknown>;
+    return [
+      repoObj({ owner: { login: "thomas" }, full_name: "thomas/x" }),
+    ] as unknown as Record<string, unknown>;
   });
   __setCaller(caller);
   try {
@@ -1086,6 +1097,132 @@ Deno.test("pr_merge sends the strategy as Do and records merged", async () => {
     assertEquals(body.Do, "squash");
     assertEquals(body.delete_branch_after_merge, true);
     assertEquals(written[0].data.action, "merged");
+  } finally {
+    __setCaller(null);
+  }
+});
+
+// ─────────────────────── narrow-token compatibility ───────────────────────
+
+type CheckDef = {
+  execute: (
+    context: { globalArgs: typeof GLOBALS },
+  ) => Promise<{ pass: boolean; errors?: string[] }>;
+};
+const check = (name: string): CheckDef =>
+  (model.checks as unknown as Record<string, CheckDef>)[name];
+
+Deno.test("reachable: a scope-rejection 403 passes — the token authenticated", async () => {
+  const { caller } = makeFakeApi(() => ({
+    status: 403,
+    body: {
+      message:
+        "token does not have at least one of required scope(s): [read:user]",
+    },
+  }));
+  __setCaller(caller);
+  try {
+    const r = await check("reachable").execute({ globalArgs: GLOBALS });
+    assertEquals(r.pass, true);
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("reachable: a 401 still fails — a bad token must not pass", async () => {
+  const { caller } = makeFakeApi(() => ({
+    status: 401,
+    body: { message: "unauthorized" },
+  }));
+  __setCaller(caller);
+  try {
+    const r = await check("reachable").execute({ globalArgs: GLOBALS });
+    assertEquals(r.pass, false);
+    assert(
+      /401/.test((r.errors ?? []).join(" ")),
+      "the failure must name the status",
+    );
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("reachable: a non-scope 403 still fails", async () => {
+  const { caller } = makeFakeApi(() => ({
+    status: 403,
+    body: { message: "user is not allowed to log in" },
+  }));
+  __setCaller(caller);
+  try {
+    const r = await check("reachable").execute({ globalArgs: GLOBALS });
+    assertEquals(r.pass, false);
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("repo_list: a refused org probe falls through to the user path", async () => {
+  const { caller, calls } = makeFakeApi((c) => {
+    if (c.path.startsWith("/api/v1/orgs/telliott")) {
+      return {
+        status: 403,
+        body: {
+          message:
+            "token does not have at least one of required scope(s): [read:organization]",
+        },
+      };
+    }
+    if (c.path.startsWith("/api/v1/users/telliott/repos")) {
+      return [
+        repoObj({ full_name: "telliott/swamp", owner: { login: "telliott" } }),
+      ];
+    }
+    return undefined;
+  });
+  const { context, written } = makeContext();
+  __setCaller(caller);
+  try {
+    await method("repo_list").execute({ owner: "telliott" }, context);
+    assertEquals(written.length, 1);
+    assertEquals(written[0].data.fullName, "telliott/swamp");
+    assert(
+      calls.some((c) => c.path.startsWith("/api/v1/orgs/telliott")),
+      "the org probe must still be attempted first",
+    );
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("repo_list: names the missing scopes when both probes are refused", async () => {
+  const { caller } = makeFakeApi(() => ({
+    status: 403,
+    body: {
+      message:
+        "token does not have at least one of required scope(s): [read:user]",
+    },
+  }));
+  const { context } = makeContext();
+  __setCaller(caller);
+  try {
+    await rejects(
+      () => method("repo_list").execute({ owner: "telliott" }, context),
+      /read:organization nor read:user/,
+    );
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("repo_list: a genuinely absent owner is still a 404, not a scope error", async () => {
+  const { caller } = makeFakeApi(() => undefined);
+  const { context } = makeContext();
+  __setCaller(caller);
+  try {
+    await rejects(
+      () => method("repo_list").execute({ owner: "nobody" }, context),
+      /No user "nobody"/,
+    );
   } finally {
     __setCaller(null);
   }

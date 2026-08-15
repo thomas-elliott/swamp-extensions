@@ -790,12 +790,14 @@ const PrMergeArgs = z.object({
  */
 export const model = {
   type: "@thomas/forgejo",
-  version: "2026.08.15.1",
+  version: "2026.08.15.2",
   globalArguments: GlobalArgs,
   checks: {
     "reachable": {
       description:
-        "Verify the server is reachable and the token authenticates (GET /api/v1/user).",
+        "Verify the server is reachable and the token authenticates " +
+        "(GET /api/v1/user). A scope-rejection 403 passes: the token was " +
+        "accepted, it merely lacks read:user.",
       labels: ["live"],
       execute: async (context: Pick<Ctx, "globalArgs">) => {
         const g = context.globalArgs;
@@ -805,6 +807,9 @@ export const model = {
         if (/\$\{\{/.test(String(g.token))) return { pass: true };
         try {
           const r = await rawCall(g, { method: "GET", path: "/api/v1/user" });
+          if (r.status === 403 && /scope/i.test(errMsg(r))) {
+            return { pass: true };
+          }
           if (r.status >= 400) {
             return {
               pass: false,
@@ -930,10 +935,34 @@ export const model = {
           const org = await callTolerant(g, {
             method: "GET",
             path: `/api/v1/orgs/${enc(a.owner)}`,
-          }, [404]);
-          repos = org.status === 404
-            ? await pageAll(g, `/api/v1/users/${enc(a.owner)}/repos`)
-            : await pageAll(g, `/api/v1/orgs/${enc(a.owner)}/repos`);
+          }, [403, 404]);
+          if (org.status < 400) {
+            repos = await pageAll(g, `/api/v1/orgs/${enc(a.owner)}/repos`);
+          } else {
+            const user = await callTolerant(g, {
+              method: "GET",
+              path: `/api/v1/users/${enc(a.owner)}/repos?limit=1&page=1`,
+            }, [403, 404]);
+            if (user.status === 403) {
+              throw new Error(
+                `Cannot list repositories for owner "${a.owner}": this token ` +
+                  `holds neither read:organization nor read:user, and Forgejo ` +
+                  `requires one of them to resolve an owner. Drop --owner to ` +
+                  `list via /repos/search, which read:repository covers.`,
+              );
+            }
+            if (user.status === 404) {
+              throw new Error(
+                `No user "${a.owner}" on ${g.apiUrl}` +
+                  (org.status === 403
+                    ? `, and the org probe was refused for lack of ` +
+                      `read:organization — an organization of that name could ` +
+                      `not be ruled out.`
+                    : `, and no organization of that name either.`),
+              );
+            }
+            repos = await pageAll(g, `/api/v1/users/${enc(a.owner)}/repos`);
+          }
         }
         const handles: DataHandle[] = [];
         for (const r of repos) {
