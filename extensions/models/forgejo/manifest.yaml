@@ -1,6 +1,6 @@
 manifestVersion: 1
 name: "@thomas/forgejo"
-version: 2026.08.15.1
+version: 2026.08.15.2
 description: >-
   Careful administration of a Forgejo (or Gitea) server over its /api/v1 REST
   API, authenticated with a scoped access token. Find-or-create organizations
