@@ -12,19 +12,26 @@ import type {
  * `@thomas/forgejo` — careful administration of a Forgejo (or Gitea) server
  * over its `/api/v1` REST API, authenticated with a scoped access token.
  *
- * PURPOSE (the repeatable kit): provision repositories and organizations, and
- * run GitHub pull-mirrors, as repeatable idempotent operations instead of
- * one-off UI clicks — find-or-create an org, find-or-create a repo and
- * converge its settings, find-or-create a pull-mirror of a GitHub repo, and
- * audit every mirror's sync health in one call.
+ * PURPOSE (the repeatable kit): provision repositories and organizations, run
+ * GitHub pull-mirrors, and drive pull requests, as repeatable idempotent
+ * operations instead of one-off UI clicks — find-or-create an org, find-or-create
+ * a repo and converge its settings, find-or-create a pull-mirror of a GitHub
+ * repo, audit every mirror's sync health in one call, and open / inspect /
+ * merge a pull request.
  *
  * SCOPE GUARANTEE: mutations are find-or-create (`*_ensure`) or reversible
- * (`repo_archive` / `repo_unarchive`). There are NO delete methods — removing
- * a repo, org, or mirror stays a deliberate manual act in the UI. A failed
- * migration's empty shell repo is DETECTED and reported by `mirror_ensure`,
- * never auto-deleted. Mirror source credentials (`authToken` for private
- * GitHub sources) are write-only: supplied via a vault reference, sent once
- * to `/repos/migrate`, and never read back or written to the data model.
+ * (`repo_archive` / `repo_unarchive`), with ONE deliberate exception:
+ * `pr_merge` writes to the base branch and cannot be undone from here. It is
+ * guarded — it refuses a PR that is closed, already merged, draft, or that the
+ * server does not report as mergeable, and `force` must be set explicitly to
+ * merge while CI is failing.
+ *
+ * There are NO delete methods — removing a repo, org, or mirror stays a
+ * deliberate manual act in the UI. A failed migration's empty shell repo is
+ * DETECTED and reported by `mirror_ensure`, never auto-deleted. Mirror source
+ * credentials (`authToken` for private GitHub sources) are write-only:
+ * supplied via a vault reference, sent once to `/repos/migrate`, and never
+ * read back or written to the data model.
  *
  * Auth: a Forgejo access token (Settings → Applications), sent per request as
  * `Authorization: token <t>`. Scopes for the full surface:
@@ -37,10 +44,11 @@ import type {
  *
  * Method sections (by prefix):
  *   - read/audit: `health`, `org_list`, `repo_list`, `user_list`,
- *     `mirror_status`.
+ *     `mirror_status`, `pr_list`, `pr_get`.
  *   - idempotent provisioning: `org_ensure`, `repo_ensure`, `mirror_ensure`,
- *     `mirror_sync_now`.
+ *     `mirror_sync_now`, `pr_ensure`.
  *   - reversible lifecycle: `repo_archive`, `repo_unarchive`.
+ *   - irreversible: `pr_merge`.
  *
  * Idempotency: every `*_ensure` probes by name first (404 ⇒ create, else
  * converge the supplied settings in place via PATCH) and reports an `action`
@@ -75,6 +83,7 @@ const Action = z.enum([
   "archived",
   "unarchived",
   "triggered",
+  "merged",
   "observed",
 ]);
 
@@ -152,6 +161,36 @@ const MirrorInfo = z.object({
     "True when the last sync is older than staleFactor × interval (or the " +
       "mirror never synced while periodic sync is enabled).",
   ),
+  action: Action,
+  timestamp: z.string(),
+});
+
+const PrInfo = z.object({
+  index: z.number().describe("PR number within the repo."),
+  repo: z.string().describe("Owning repo full name, owner/name."),
+  title: z.string(),
+  state: z.string().describe("open | closed"),
+  draft: z.boolean(),
+  merged: z.boolean(),
+  mergeable: z.boolean().optional().describe(
+    "Server's verdict on whether it can merge cleanly. Only populated on a " +
+      "single-PR fetch — absent in listings.",
+  ),
+  head: z.string().describe("Source branch ref."),
+  headSha: z.string().optional().describe("Head commit SHA."),
+  base: z.string().describe("Target branch ref."),
+  author: z.string().optional().describe("Login of the PR author."),
+  ciState: z.string().optional().describe(
+    "Combined commit status of the head SHA: success | pending | failure | " +
+      "error | none (no statuses reported). Only populated on a single-PR fetch.",
+  ),
+  htmlUrl: z.string().optional(),
+  additions: z.number().optional(),
+  deletions: z.number().optional(),
+  changedFiles: z.number().optional(),
+  comments: z.number().optional(),
+  created: z.string().optional(),
+  updated: z.string().optional(),
   action: Action,
   timestamp: z.string(),
 });
@@ -478,6 +517,98 @@ function toMirrorInfo(
   };
 }
 
+function prPath(owner: string, name: string, index?: number): string {
+  const base = `${repoPath(owner, name)}/pulls`;
+  return index === undefined ? base : `${base}/${index}`;
+}
+
+/**
+ * Normalise a raw pull-request object into the {@link PrInfo} shape.
+ * `detail` fields (`mergeable`, `ciState`) are only meaningful on a single-PR
+ * fetch; pass them through explicitly rather than trusting a listing payload.
+ */
+function toPrInfo(
+  p: Json,
+  action: z.infer<typeof Action>,
+  detail?: { mergeable?: boolean; ciState?: string },
+): z.infer<typeof PrInfo> {
+  const head = (p.head ?? {}) as Json;
+  const base = (p.base ?? {}) as Json;
+  const headRepo = (head.repo ?? {}) as Json;
+  const baseRepo = (base.repo ?? {}) as Json;
+  const user = (p.user ?? {}) as Json;
+  const str = (v: unknown): string | undefined =>
+    typeof v === "string" && v ? v : undefined;
+  const num = (v: unknown): number | undefined =>
+    v != null ? Number(v) : undefined;
+  return {
+    index: Number(p.number ?? p.index ?? 0),
+    repo: String(baseRepo.full_name ?? headRepo.full_name ?? ""),
+    title: String(p.title ?? ""),
+    state: String(p.state ?? ""),
+    draft: Boolean(p.draft),
+    merged: Boolean(p.merged),
+    mergeable: detail?.mergeable,
+    head: String(head.ref ?? ""),
+    headSha: str(head.sha),
+    base: String(base.ref ?? ""),
+    author: str(user.login),
+    ciState: detail?.ciState,
+    htmlUrl: str(p.html_url),
+    additions: num(p.additions),
+    deletions: num(p.deletions),
+    changedFiles: num(p.changed_files),
+    comments: num(p.comments),
+    created: str(p.created_at),
+    updated: str(p.updated_at),
+    action,
+    timestamp: nowIso(),
+  };
+}
+
+/**
+ * Combined CI state of a commit, from its statuses. Returns `"none"` when the
+ * commit carries no status at all (which is NOT a pass — a repo with CI
+ * disabled and a repo whose pipeline never started look identical here).
+ */
+async function combinedCiState(
+  g: GlobalArgsT,
+  owner: string,
+  name: string,
+  sha: string,
+): Promise<string> {
+  const r = await callTolerant(g, {
+    method: "GET",
+    path: `${repoPath(owner, name)}/commits/${enc(sha)}/status`,
+  }, [404]);
+  if (r.status === 404) return "none";
+  const state = String(r.body.state ?? "");
+  return state === "" ? "none" : state;
+}
+
+/** Fetch one PR by index, or null when it does not exist. */
+async function getPrOrNull(
+  g: GlobalArgsT,
+  owner: string,
+  name: string,
+  index: number,
+): Promise<Json | null> {
+  const r = await callTolerant(g, {
+    method: "GET",
+    path: prPath(owner, name, index),
+  }, [404]);
+  return r.status === 404 ? null : r.body;
+}
+
+/**
+ * Strip a cross-repo `owner:branch` qualifier down to the bare branch name, so
+ * a requested head matches the `head.ref` the API reports.
+ */
+function bareRef(ref: string): string {
+  const i = ref.indexOf(":");
+  return i === -1 ? ref : ref.slice(i + 1);
+}
+
 /** Normalise clone URLs for drift comparison (.git suffix, trailing /, case). */
 function normalizeCloneUrl(u: string): string {
   return u.trim().replace(/\.git$/i, "").replace(/\/+$/, "").toLowerCase();
@@ -604,17 +735,62 @@ const MirrorSyncArgs = z.object({
   name: z.string().describe("Mirror repository name."),
 });
 
+const PrListArgs = z.object({
+  owner: z.string().describe("Owning org or user login."),
+  name: z.string().describe("Repository name."),
+  state: z.enum(["open", "closed", "all"]).default("open").describe(
+    "Which pull requests to list.",
+  ),
+});
+
+const PrGetArgs = z.object({
+  owner: z.string().describe("Owning org or user login."),
+  name: z.string().describe("Repository name."),
+  index: z.coerce.number().int().describe("PR number within the repo."),
+});
+
+const PrEnsureArgs = z.object({
+  owner: z.string().describe("Owning org or user login."),
+  name: z.string().describe("Repository name."),
+  head: z.string().describe(
+    "Source branch. Use owner:branch for a cross-repo (fork) PR.",
+  ),
+  base: z.string().describe("Target branch, e.g. main."),
+  title: z.string().describe("PR title (converged on an existing open PR)."),
+  body: z.string().optional().describe(
+    "PR description (converged on an existing open PR).",
+  ),
+});
+
+const PrMergeArgs = z.object({
+  owner: z.string().describe("Owning org or user login."),
+  name: z.string().describe("Repository name."),
+  index: z.coerce.number().int().describe("PR number within the repo."),
+  strategy: z.enum(["merge", "rebase", "rebase-merge", "squash"]).default(
+    "squash",
+  ).describe("Merge strategy (Forgejo's `Do`)."),
+  title: z.string().optional().describe("Merge commit title override."),
+  message: z.string().optional().describe("Merge commit message override."),
+  deleteBranch: z.coerce.boolean().default(false).describe(
+    "Delete the head branch after a successful merge.",
+  ),
+  force: z.coerce.boolean().default(false).describe(
+    "Merge even when the head commit's combined CI state is failure/error/" +
+      "pending. Without this, a non-green PR is refused.",
+  ),
+});
+
 // ─────────────────────────── model ───────────────────────────
 
 /**
  * `@thomas/forgejo` model — administer a Forgejo server over its REST API
- * with a scoped token. Mutations are find-or-create or reversible; there are
- * no delete methods; mirror source credentials are write-only. See the file
- * header for the full scope guarantee.
+ * with a scoped token. Mutations are find-or-create or reversible apart from
+ * the guarded `pr_merge`; there are no delete methods; mirror source
+ * credentials are write-only. See the file header for the full scope guarantee.
  */
 export const model = {
   type: "@thomas/forgejo",
-  version: "2026.06.24.1",
+  version: "2026.08.15.1",
   globalArguments: GlobalArgs,
   checks: {
     "reachable": {
@@ -677,6 +853,12 @@ export const model = {
       schema: MirrorInfo,
       lifetime: "infinite",
       garbageCollection: 20,
+    },
+    "pull_request": {
+      description: "A pull request: state, mergeability, and head CI status.",
+      schema: PrInfo,
+      lifetime: "infinite",
+      garbageCollection: 50,
     },
   },
   methods: {
@@ -1128,6 +1310,219 @@ export const model = {
           "mirror",
           safeName(String(repo.full_name ?? `${a.owner}/${a.name}`)),
           toMirrorInfo(repo, 2, "triggered"),
+        );
+        return { dataHandles: [handle] };
+      },
+    },
+
+    // ───────────── pull requests ─────────────
+    pr_list: {
+      description:
+        "List a repository's pull requests with head/base, author and draft " +
+        "state (factory). Read-only. Mergeability and CI state are NOT in a " +
+        "listing — use pr_get for those.",
+      arguments: PrListArgs,
+      execute: async (
+        rawArgs,
+        context,
+      ): Promise<{ dataHandles: DataHandle[] }> => {
+        const a = PrListArgs.parse(rawArgs);
+        const g = context.globalArgs;
+        logInfo(context, "Listing pull requests", {
+          repo: `${a.owner}/${a.name}`,
+          state: a.state,
+        });
+        const prs = await pageAll(
+          g,
+          `${prPath(a.owner, a.name)}?state=${a.state}`,
+        );
+        const handles: DataHandle[] = [];
+        for (const p of prs) {
+          handles.push(
+            await context.writeResource(
+              "pull_request",
+              safeName(`${a.owner}/${a.name}#${p.number ?? p.id}`),
+              toPrInfo(p, "observed"),
+            ),
+          );
+        }
+        return { dataHandles: handles };
+      },
+    },
+    pr_get: {
+      description:
+        "Get one pull request including the server's mergeable verdict and " +
+        "the combined CI state of its head commit. Read-only.",
+      arguments: PrGetArgs,
+      execute: async (
+        rawArgs,
+        context,
+      ): Promise<{ dataHandles: DataHandle[] }> => {
+        const a = PrGetArgs.parse(rawArgs);
+        const g = context.globalArgs;
+        const pr = await getPrOrNull(g, a.owner, a.name, a.index);
+        if (pr === null) {
+          throw new Error(`${a.owner}/${a.name}#${a.index} does not exist`);
+        }
+        const head = (pr.head ?? {}) as Json;
+        const sha = String(head.sha ?? "");
+        const ciState = sha
+          ? await combinedCiState(g, a.owner, a.name, sha)
+          : "none";
+        const handle = await context.writeResource(
+          "pull_request",
+          safeName(`${a.owner}/${a.name}#${a.index}`),
+          toPrInfo(pr, "observed", {
+            mergeable: typeof pr.mergeable === "boolean"
+              ? pr.mergeable
+              : undefined,
+            ciState,
+          }),
+        );
+        return { dataHandles: [handle] };
+      },
+    },
+    pr_ensure: {
+      description:
+        "Find-or-create a pull request for a head→base branch pair, and " +
+        "converge its title/body. Idempotent — a re-run against an existing " +
+        "open PR reports updated/unchanged instead of failing on a duplicate.",
+      arguments: PrEnsureArgs,
+      execute: async (
+        rawArgs,
+        context,
+      ): Promise<{ dataHandles: DataHandle[] }> => {
+        const a = PrEnsureArgs.parse(rawArgs);
+        const g = context.globalArgs;
+        const wantHead = bareRef(a.head);
+        const open = await pageAll(
+          g,
+          `${prPath(a.owner, a.name)}?state=open`,
+        );
+        const existing = open.find((p) => {
+          const h = (p.head ?? {}) as Json;
+          const b = (p.base ?? {}) as Json;
+          return String(h.ref ?? "") === wantHead &&
+            String(b.ref ?? "") === a.base;
+        });
+        let pr: Json;
+        let action: z.infer<typeof Action>;
+        if (existing === undefined) {
+          logInfo(context, "Opening pull request", {
+            repo: `${a.owner}/${a.name}`,
+            head: a.head,
+            base: a.base,
+          });
+          const r = await call(g, {
+            method: "POST",
+            path: prPath(a.owner, a.name),
+            body: { head: a.head, base: a.base, title: a.title, body: a.body },
+          });
+          pr = r.body;
+          action = "created";
+        } else {
+          const body: Json = {};
+          if (a.title !== String(existing.title ?? "")) body.title = a.title;
+          if (a.body !== undefined && a.body !== String(existing.body ?? "")) {
+            body.body = a.body;
+          }
+          if (Object.keys(body).length > 0) {
+            const index = Number(existing.number ?? 0);
+            logInfo(context, "Updating pull request", {
+              repo: `${a.owner}/${a.name}`,
+              index,
+            });
+            const r = await call(g, {
+              method: "PATCH",
+              path: prPath(a.owner, a.name, index),
+              body,
+            });
+            pr = r.body;
+            action = "updated";
+          } else {
+            pr = existing;
+            action = "unchanged";
+          }
+        }
+        const handle = await context.writeResource(
+          "pull_request",
+          safeName(`${a.owner}/${a.name}#${pr.number ?? 0}`),
+          toPrInfo(pr, action),
+        );
+        return { dataHandles: [handle] };
+      },
+    },
+
+    // ───────────── irreversible ─────────────
+    pr_merge: {
+      description:
+        "Merge a pull request. NOT REVERSIBLE — this writes to the base " +
+        "branch. Refuses a PR that is closed, already merged, draft, or not " +
+        "mergeable; refuses a non-green head unless force=true. Verifies the " +
+        "PR before acting.",
+      arguments: PrMergeArgs,
+      execute: async (
+        rawArgs,
+        context,
+      ): Promise<{ dataHandles: DataHandle[] }> => {
+        const a = PrMergeArgs.parse(rawArgs);
+        const g = context.globalArgs;
+        const ref = `${a.owner}/${a.name}#${a.index}`;
+        const pr = await getPrOrNull(g, a.owner, a.name, a.index);
+        if (pr === null) throw new Error(`${ref} does not exist`);
+        if (pr.merged) {
+          throw new Error(`${ref} is already merged — nothing to do`);
+        }
+        if (String(pr.state ?? "") !== "open") {
+          throw new Error(
+            `${ref} is ${String(pr.state ?? "?")}, not open — reopen it first`,
+          );
+        }
+        if (pr.draft) {
+          throw new Error(`${ref} is a draft — mark it ready before merging`);
+        }
+        if (pr.mergeable === false) {
+          throw new Error(
+            `${ref} is not mergeable (conflicts, or a branch protection is ` +
+              "unsatisfied). Resolve it on the branch — this model will not " +
+              "force past it.",
+          );
+        }
+        const head = (pr.head ?? {}) as Json;
+        const sha = String(head.sha ?? "");
+        const ciState = sha
+          ? await combinedCiState(g, a.owner, a.name, sha)
+          : "none";
+        if (ciState !== "success" && !a.force) {
+          throw new Error(
+            `${ref} head ${sha.slice(0, 8)} has CI state "${ciState}", not ` +
+              'success. Re-run with force=true to merge anyway. ("none" means ' +
+              "the commit carries no status at all — CI may never have run.)",
+          );
+        }
+        logInfo(context, "Merging pull request", {
+          repo: `${a.owner}/${a.name}`,
+          index: a.index,
+          strategy: a.strategy,
+          ciState,
+        });
+        await call(g, {
+          method: "POST",
+          path: `${prPath(a.owner, a.name, a.index)}/merge`,
+          body: {
+            Do: a.strategy,
+            MergeTitleField: a.title,
+            MergeMessageField: a.message,
+            delete_branch_after_merge: a.deleteBranch,
+          },
+        });
+        // Re-fetch: the merge response carries no body, and the merged PR's
+        // recorded state is the point of the data output.
+        const after = await getPrOrNull(g, a.owner, a.name, a.index) ?? pr;
+        const handle = await context.writeResource(
+          "pull_request",
+          safeName(ref),
+          toPrInfo(after, "merged", { ciState }),
         );
         return { dataHandles: [handle] };
       },

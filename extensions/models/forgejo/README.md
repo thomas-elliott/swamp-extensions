@@ -1,16 +1,18 @@
 # @thomas/forgejo
 
 Careful administration of a self-hosted **[Forgejo](https://forgejo.org)** (or
-Gitea) server for swamp, over its **`/api/v1` REST API**. Built for two
-repeatable tasks: **provisioning repositories/organizations** and **running
-GitHub pull-mirrors** — find-or-create an org, find-or-create a repo and
-converge its settings, mirror a GitHub repo, and audit every mirror's sync
-health in one call, without the per-repo UI click-through.
+Gitea) server for swamp, over its **`/api/v1` REST API**. Built for three
+repeatable tasks: **provisioning repositories/organizations**, **running
+GitHub pull-mirrors**, and **driving pull requests** — find-or-create an org,
+find-or-create a repo and converge its settings, mirror a GitHub repo, audit
+every mirror's sync health in one call, and open/inspect/merge a PR, without
+the per-repo UI click-through.
 
 ## Scope guarantee (read this first)
 
 This extension can hold an admin-scoped token, so its surface is deliberately
-narrow and its mutations are **find-or-create or reversible**:
+narrow and its mutations are **find-or-create or reversible**, with one
+guarded exception (`pr_merge`):
 
 - ✅ **No delete methods.** Removing a repo, org, or mirror stays a deliberate
   manual act in the Forgejo UI. The leftover **empty shell repo** of a failed
@@ -31,6 +33,11 @@ narrow and its mutations are **find-or-create or reversible**:
   migration time; asking `mirror_ensure` for a different source on an existing
   mirror is an error, not a silent ignore. A name collision with a non-mirror
   repo is likewise refused.
+- ⚠️ **`pr_merge` is the one irreversible mutation** — it writes to the base
+  branch. It refuses a PR that is closed, already merged, draft, or that the
+  server does not report as mergeable, and refuses a head whose combined CI
+  state is not `success` unless `force=true` is passed. `force` overrides the
+  CI gate **only** — it never overrides a conflicting PR.
 
 ## Authentication — scoped access token
 
@@ -114,6 +121,34 @@ equals `8h0m0s`).
 
 **Reversible lifecycle:** `repo_archive` / `repo_unarchive`.
 
+**Pull requests:**
+
+```bash
+# Open a PR — find-or-create on the head→base pair, so a re-run converges the
+# title/body instead of failing on a duplicate.
+swamp model method run forgejo pr_ensure \
+  --input owner=apps --input name=damson \
+  --input head=feat/thing --input base=main --input title='Add the thing'
+
+# List open PRs (state: open | closed | all).
+swamp model method run forgejo pr_list --input owner=apps --input name=damson
+
+# One PR, with the mergeable verdict and the head commit's CI state.
+swamp model method run forgejo pr_get \
+  --input owner=apps --input name=damson --input index=4
+
+# Merge (strategy: squash | merge | rebase | rebase-merge; squash is default).
+swamp model method run forgejo pr_merge \
+  --input owner=apps --input name=damson --input index=4 \
+  --input deleteBranch=true
+```
+
+`mergeable` and `ciState` come from a **single-PR fetch only** — a listing
+carries neither, so `pr_list` leaves both absent rather than reporting a
+value it cannot stand behind. `ciState: "none"` means the head commit carries
+no status at all, which is **not** a pass: a repo with CI disabled and a
+pipeline that never started are indistinguishable here.
+
 ## Data model
 
 | Resource | What it holds |
@@ -123,9 +158,11 @@ equals `8h0m0s`).
 | `repo` | Repo settings incl. `empty`/`mirror`/`archived` flags. |
 | `user` | Admin user listing (id, login, email, isAdmin, lastLogin). |
 | `mirror` | Pull-mirror sync health (`lastSynced`, `interval`, `stale`). |
+| `pull_request` | PR state, head/base, `mergeable`, and head `ciState`. |
 
 Data instance names replace `/` with `:` (swamp rejects slashes), so
-`mirrors/scrappy` is stored as `mirrors:scrappy`.
+`mirrors/scrappy` is stored as `mirrors:scrappy` and PR 4 on `apps/damson` as
+`apps:damson#4`.
 
 ## Design notes
 
@@ -133,6 +170,8 @@ Data instance names replace `/` with `:` (swamp rejects slashes), so
 - Search responses (`{ok, data}`) and bare-array responses are both handled.
 - Repo paths on disk are lowercased by Forgejo while API names keep display
   case — instance names follow the API's display case.
-- Push-mirrors (Forgejo → GitHub), webhooks, teams, deploy keys, and branch
-  protection are deliberately out of scope for v1 — file an issue when a real
-  use-case lands.
+- A PR's head may be qualified (`owner:branch`) for a fork; find-or-create
+  matches on the bare branch name, since that is what the API reports back.
+- Push-mirrors (Forgejo → GitHub), webhooks, teams, deploy keys, branch
+  protection, and PR review/comment endpoints are deliberately out of scope —
+  file an issue when a real use-case lands.
