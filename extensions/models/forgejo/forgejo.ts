@@ -44,8 +44,9 @@ import type {
  *
  * Method sections (by prefix):
  *   - read/audit: `health`, `org_list`, `repo_list`, `user_list`,
- *     `mirror_status`, `pr_list`, `pr_get`.
- *   - idempotent provisioning: `org_ensure`, `repo_ensure`, `mirror_ensure`,
+ *     `mirror_status`, `pr_list`, `pr_get`, `branch_protection_list`.
+ *   - idempotent provisioning: `org_ensure`, `repo_ensure`,
+ *     `collaborator_ensure`, `branch_protection_ensure`, `mirror_ensure`,
  *     `mirror_sync_now`, `pr_ensure`.
  *   - reversible lifecycle: `repo_archive`, `repo_unarchive`.
  *   - irreversible: `pr_merge`.
@@ -141,6 +142,48 @@ const UserInfo = z.object({
   timestamp: z.string(),
 });
 
+const CollaboratorInfo = z.object({
+  repo: z.string().describe("Repo full name, owner/name."),
+  user: z.string().describe("Collaborator login."),
+  permission: z.string().describe("none | read | write | admin | owner"),
+  action: Action,
+  timestamp: z.string(),
+});
+
+const BranchProtectionInfo = z.object({
+  repo: z.string().describe("Repo full name, owner/name."),
+  ruleName: z.string().describe(
+    "The rule's branch name or glob (e.g. main, agents/*, *).",
+  ),
+  enablePush: z.boolean().describe(
+    "False = nobody may push directly; the branch is PR-only.",
+  ),
+  enablePushWhitelist: z.boolean().describe(
+    "True = direct push is limited to the whitelists below.",
+  ),
+  pushWhitelistUsernames: z.array(z.string()).describe(
+    "Logins allowed to push directly (only meaningful with the whitelist on).",
+  ),
+  requiredApprovals: z.number().describe(
+    "Approving reviews needed before a PR into this branch may merge.",
+  ),
+  requireSignedCommits: z.boolean(),
+  applyToAdmins: z.boolean().describe(
+    "True = repo admins are bound by this rule too. False leaves an admin " +
+      "able to push straight through it.",
+  ),
+  blockOnRejectedReviews: z.boolean(),
+  blockOnOutdatedBranch: z.boolean(),
+  enableStatusCheck: z.boolean(),
+  statusCheckContexts: z.array(z.string()),
+  protectedFilePatterns: z.string().describe(
+    "Semicolon-separated globs that may not be changed on this branch even " +
+      "by a whitelisted pusher — the CI-config guard.",
+  ),
+  action: Action,
+  timestamp: z.string(),
+});
+
 const MirrorInfo = z.object({
   fullName: z.string(),
   owner: z.string(),
@@ -203,7 +246,7 @@ export type Json = Record<string, unknown>;
 /** One REST request: method + path (relative to `apiUrl`) + optional JSON body. */
 export interface ApiCall {
   /** HTTP verb. */
-  method: "GET" | "POST" | "PATCH" | "DELETE";
+  method: "GET" | "POST" | "PATCH" | "PUT" | "DELETE";
   /** Path relative to `apiUrl`, e.g. `/api/v1/orgs`. */
   path: string;
   /** Optional JSON request body. */
@@ -459,6 +502,111 @@ function toOrgInfo(o: Json, action: z.infer<typeof Action>): z.infer<
   };
 }
 
+/** Normalise a raw branch-protection object into {@link BranchProtectionInfo}. */
+function toProtectionInfo(
+  repo: string,
+  p: Json,
+  action: z.infer<typeof Action>,
+): z.infer<typeof BranchProtectionInfo> {
+  const strs = (v: unknown): string[] =>
+    Array.isArray(v) ? v.map((x) => String(x)) : [];
+  return {
+    repo,
+    ruleName: String(p.rule_name ?? p.branch_name ?? ""),
+    enablePush: Boolean(p.enable_push),
+    enablePushWhitelist: Boolean(p.enable_push_whitelist),
+    pushWhitelistUsernames: strs(p.push_whitelist_usernames),
+    requiredApprovals: Number(p.required_approvals ?? 0),
+    requireSignedCommits: Boolean(p.require_signed_commits),
+    applyToAdmins: Boolean(p.apply_to_admins),
+    blockOnRejectedReviews: Boolean(p.block_on_rejected_reviews),
+    blockOnOutdatedBranch: Boolean(p.block_on_outdated_branch),
+    enableStatusCheck: Boolean(p.enable_status_check),
+    statusCheckContexts: strs(p.status_check_contexts),
+    protectedFilePatterns: String(p.protected_file_patterns ?? ""),
+    action,
+    timestamp: nowIso(),
+  };
+}
+
+/**
+ * Build a branch-protection payload from the supplied fields only, mapping
+ * camelCase args to the API's snake_case. `include` decides which keys are
+ * emitted: a create needs every supplied field, an update only the differing
+ * ones.
+ */
+function protectionBody(
+  desired: ProtectionDesired,
+  current: Json | null,
+): { body: Json; changed: boolean } {
+  const body: Json = {};
+  const same = (a: unknown, b: unknown): boolean =>
+    Array.isArray(a) && Array.isArray(b)
+      ? a.length === b.length && a.every((x, i) => String(x) === String(b[i]))
+      : a === b;
+  const diff = (key: string, want: unknown, cur: unknown) => {
+    if (want === undefined) return;
+    if (current !== null && same(want, cur)) return;
+    body[key] = want;
+  };
+  diff("enable_push", desired.enablePush, Boolean(current?.enable_push));
+  diff(
+    "enable_push_whitelist",
+    desired.enablePushWhitelist,
+    Boolean(current?.enable_push_whitelist),
+  );
+  diff(
+    "push_whitelist_usernames",
+    desired.pushWhitelistUsernames,
+    Array.isArray(current?.push_whitelist_usernames)
+      ? current.push_whitelist_usernames
+      : [],
+  );
+  diff(
+    "required_approvals",
+    desired.requiredApprovals,
+    Number(current?.required_approvals ?? 0),
+  );
+  diff(
+    "require_signed_commits",
+    desired.requireSignedCommits,
+    Boolean(current?.require_signed_commits),
+  );
+  diff(
+    "apply_to_admins",
+    desired.applyToAdmins,
+    Boolean(current?.apply_to_admins),
+  );
+  diff(
+    "block_on_rejected_reviews",
+    desired.blockOnRejectedReviews,
+    Boolean(current?.block_on_rejected_reviews),
+  );
+  diff(
+    "block_on_outdated_branch",
+    desired.blockOnOutdatedBranch,
+    Boolean(current?.block_on_outdated_branch),
+  );
+  diff(
+    "enable_status_check",
+    desired.enableStatusCheck,
+    Boolean(current?.enable_status_check),
+  );
+  diff(
+    "status_check_contexts",
+    desired.statusCheckContexts,
+    Array.isArray(current?.status_check_contexts)
+      ? current.status_check_contexts
+      : [],
+  );
+  diff(
+    "protected_file_patterns",
+    desired.protectedFilePatterns,
+    String(current?.protected_file_patterns ?? ""),
+  );
+  return { body, changed: Object.keys(body).length > 0 };
+}
+
 /** A Go zero time (and absent values) — "never happened" in the API. */
 function isZeroTime(v: unknown): boolean {
   return v == null || String(v).startsWith("0001-01-01");
@@ -707,6 +855,72 @@ const RepoEnsureArgs = z.object({
   ...RepoSettingsShape,
 });
 
+const CollaboratorEnsureArgs = z.object({
+  owner: z.string().describe("Owning org or user login."),
+  name: z.string().describe("Repository name."),
+  user: z.string().describe("Login of the user to grant access to."),
+  permission: z.enum(["read", "write", "admin"]).default("write").describe(
+    "Access level to converge.",
+  ),
+});
+
+/** The branch-protection settings the ensure method converges. */
+const ProtectionSettingsShape = {
+  enablePush: z.coerce.boolean().optional().describe(
+    "Allow direct pushes. False makes the branch PR-only.",
+  ),
+  enablePushWhitelist: z.coerce.boolean().optional().describe(
+    "Limit direct push to the whitelist (requires enablePush).",
+  ),
+  pushWhitelistUsernames: z.array(z.string()).optional().describe(
+    "Logins allowed to push directly. Converged as an exact set.",
+  ),
+  requiredApprovals: z.coerce.number().int().optional().describe(
+    "Approving reviews required before merge.",
+  ),
+  requireSignedCommits: z.coerce.boolean().optional(),
+  applyToAdmins: z.coerce.boolean().optional().describe(
+    "Bind repo admins to the rule too. Without this an admin bypasses it.",
+  ),
+  blockOnRejectedReviews: z.coerce.boolean().optional(),
+  blockOnOutdatedBranch: z.coerce.boolean().optional(),
+  enableStatusCheck: z.coerce.boolean().optional(),
+  statusCheckContexts: z.array(z.string()).optional(),
+  protectedFilePatterns: z.string().optional().describe(
+    "Semicolon-separated globs that may not be changed on this branch, e.g. " +
+      '".woodpecker.yml;.woodpecker/**". Applies even to whitelisted pushers.',
+  ),
+};
+
+type ProtectionDesired = {
+  enablePush?: boolean;
+  enablePushWhitelist?: boolean;
+  pushWhitelistUsernames?: string[];
+  requiredApprovals?: number;
+  requireSignedCommits?: boolean;
+  applyToAdmins?: boolean;
+  blockOnRejectedReviews?: boolean;
+  blockOnOutdatedBranch?: boolean;
+  enableStatusCheck?: boolean;
+  statusCheckContexts?: string[];
+  protectedFilePatterns?: string;
+};
+
+const BranchProtectionEnsureArgs = z.object({
+  owner: z.string().describe("Owning org or user login."),
+  name: z.string().describe("Repository name."),
+  rule: z.string().describe(
+    "Branch name or glob the rule applies to (find-or-create key), e.g. " +
+      "main, agents/*, or * for everything.",
+  ),
+  ...ProtectionSettingsShape,
+});
+
+const BranchProtectionListArgs = z.object({
+  owner: z.string().describe("Owning org or user login."),
+  name: z.string().describe("Repository name."),
+});
+
 const MirrorEnsureArgs = z.object({
   owner: z.string().describe("Owning org or user login for the mirror."),
   name: z.string().describe("Mirror repository name (find-or-create key)."),
@@ -790,7 +1004,7 @@ const PrMergeArgs = z.object({
  */
 export const model = {
   type: "@thomas/forgejo",
-  version: "2026.08.15.2",
+  version: "2026.08.23.1",
   globalArguments: GlobalArgs,
   checks: {
     "reachable": {
@@ -852,6 +1066,18 @@ export const model = {
       schema: UserInfo,
       lifetime: "infinite",
       garbageCollection: 10,
+    },
+    "collaborator": {
+      description: "A user's access level on a repository.",
+      schema: CollaboratorInfo,
+      lifetime: "infinite",
+      garbageCollection: 20,
+    },
+    "branch_protection": {
+      description: "A branch-protection rule and the constraints it enforces.",
+      schema: BranchProtectionInfo,
+      lifetime: "infinite",
+      garbageCollection: 20,
     },
     "mirror": {
       description: "A pull-mirror's sync health.",
@@ -1198,6 +1424,161 @@ export const model = {
           toRepoInfo(repo, action!),
         );
         return { dataHandles: [handle] };
+      },
+    },
+    collaborator_ensure: {
+      description:
+        "Grant a user access to a repository at a given permission level, or " +
+        "converge an existing grant. Idempotent — reports created/updated/" +
+        "unchanged. Never removes a collaborator.",
+      arguments: CollaboratorEnsureArgs,
+      execute: async (
+        rawArgs,
+        context,
+      ): Promise<{ dataHandles: DataHandle[] }> => {
+        const a = CollaboratorEnsureArgs.parse(rawArgs);
+        const g = context.globalArgs;
+        const full = `${a.owner}/${a.name}`;
+        // A non-collaborator answers 404 here; the owner answers "owner",
+        // which no PUT can produce and must never be downgraded.
+        const probe = await callTolerant(g, {
+          method: "GET",
+          path: `${repoPath(a.owner, a.name)}/collaborators/${
+            enc(a.user)
+          }/permission`,
+        }, [404]);
+        const current = probe.status === 404
+          ? "none"
+          : String(probe.body.permission ?? "none");
+        let action: z.infer<typeof Action>;
+        if (current === "owner") {
+          throw new Error(
+            `${a.user} owns ${full} — a collaborator grant cannot apply to ` +
+              "the repo owner.",
+          );
+        } else if (current === a.permission) {
+          action = "unchanged";
+        } else {
+          logInfo(context, "Setting collaborator permission", {
+            repo: full,
+            user: a.user,
+            from: current,
+            to: a.permission,
+          });
+          await call(g, {
+            method: "PUT",
+            path: `${repoPath(a.owner, a.name)}/collaborators/${enc(a.user)}`,
+            body: { permission: a.permission },
+          });
+          action = current === "none" ? "created" : "updated";
+        }
+        const handle = await context.writeResource(
+          "collaborator",
+          safeName(`${full}:${a.user}`),
+          {
+            repo: full,
+            user: a.user,
+            permission: a.permission,
+            action,
+            timestamp: nowIso(),
+          },
+        );
+        return { dataHandles: [handle] };
+      },
+    },
+    branch_protection_ensure: {
+      description:
+        "Find-or-create a branch-protection rule for a branch or glob and " +
+        "converge the supplied constraints. Idempotent — reports created/" +
+        "updated/unchanged. Never deletes a rule.",
+      arguments: BranchProtectionEnsureArgs,
+      execute: async (
+        rawArgs,
+        context,
+      ): Promise<{ dataHandles: DataHandle[] }> => {
+        const a = BranchProtectionEnsureArgs.parse(rawArgs);
+        const g = context.globalArgs;
+        const full = `${a.owner}/${a.name}`;
+        const base = `${repoPath(a.owner, a.name)}/branch_protections`;
+        const probe = await callTolerant(g, {
+          method: "GET",
+          path: `${base}/${enc(a.rule)}`,
+        }, [404]);
+        let rule: Json;
+        let action: z.infer<typeof Action>;
+        if (probe.status === 404) {
+          const { body } = protectionBody(a, null);
+          logInfo(context, "Creating branch protection", {
+            repo: full,
+            rule: a.rule,
+          });
+          const r = await call(g, {
+            method: "POST",
+            path: base,
+            body: { ...body, rule_name: a.rule },
+          });
+          rule = r.body;
+          action = "created";
+        } else {
+          const { body, changed } = protectionBody(a, probe.body);
+          if (changed) {
+            logInfo(context, "Updating branch protection", {
+              repo: full,
+              rule: a.rule,
+              body,
+            });
+            const r = await call(g, {
+              method: "PATCH",
+              path: `${base}/${enc(a.rule)}`,
+              body,
+            });
+            rule = r.body;
+            action = "updated";
+          } else {
+            rule = probe.body;
+            action = "unchanged";
+          }
+        }
+        const handle = await context.writeResource(
+          "branch_protection",
+          safeName(`${full}:${a.rule}`),
+          toProtectionInfo(full, rule, action),
+        );
+        return { dataHandles: [handle] };
+      },
+    },
+    branch_protection_list: {
+      description:
+        "List every branch-protection rule on a repository — the audit view " +
+        "of what a branch actually enforces.",
+      arguments: BranchProtectionListArgs,
+      execute: async (
+        rawArgs,
+        context,
+      ): Promise<{ dataHandles: DataHandle[] }> => {
+        const a = BranchProtectionListArgs.parse(rawArgs);
+        const g = context.globalArgs;
+        const full = `${a.owner}/${a.name}`;
+        const r = await call(g, {
+          method: "GET",
+          path: `${repoPath(a.owner, a.name)}/branch_protections`,
+        });
+        const handles: DataHandle[] = [];
+        for (const rule of listItems(r.body)) {
+          const info = toProtectionInfo(full, rule, "observed");
+          handles.push(
+            await context.writeResource(
+              "branch_protection",
+              safeName(`${full}:${info.ruleName}`),
+              info,
+            ),
+          );
+        }
+        logInfo(context, "Listed branch protections", {
+          repo: full,
+          count: handles.length,
+        });
+        return { dataHandles: handles };
       },
     },
     mirror_ensure: {

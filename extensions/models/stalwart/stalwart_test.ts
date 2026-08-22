@@ -126,14 +126,22 @@ function makeTypedJmap(table: Record<string, Json[]>) {
     if (name.endsWith("/query")) {
       return Promise.resolve({
         status: 200,
-        body: jmapOk(name, { ids: objs.map((o) => String(o.id)), total: objs.length, position: 0 }),
+        body: jmapOk(name, {
+          ids: objs.map((o) => String(o.id)),
+          total: objs.length,
+          position: 0,
+        }),
       });
     }
     if (name.endsWith("/get")) {
-      const want = new Set((args.ids as string[] | undefined) ?? objs.map((o) => String(o.id)));
+      const want = new Set(
+        (args.ids as string[] | undefined) ?? objs.map((o) => String(o.id)),
+      );
       return Promise.resolve({
         status: 200,
-        body: jmapOk(name, { list: objs.filter((o) => want.has(String(o.id))) }),
+        body: jmapOk(name, {
+          list: objs.filter((o) => want.has(String(o.id))),
+        }),
       });
     }
     if (name.endsWith("/set")) {
@@ -147,7 +155,9 @@ function makeTypedJmap(table: Record<string, Json[]>) {
         );
       }
       if (update) {
-        out.updated = Object.fromEntries(Object.keys(update).map((k) => [k, null]));
+        out.updated = Object.fromEntries(
+          Object.keys(update).map((k) => [k, null]),
+        );
       }
       return Promise.resolve({ status: 200, body: jmapOk(name, out) });
     }
@@ -387,7 +397,11 @@ Deno.test("domain_list: isEnabled maps to state, one resource per domain", async
       action: "observed",
       timestamp: written[0].data.timestamp,
     });
-    assertEquals(written[1].data.state, "inactive", "isEnabled:false → inactive");
+    assertEquals(
+      written[1].data.state,
+      "inactive",
+      "isEnabled:false → inactive",
+    );
   } finally {
     __setJmap(null);
     __setRest(null);
@@ -403,7 +417,9 @@ Deno.test("account_list: extracts aliases, type, and disabled detection", async 
         emailAddress: "swamp-admin@example.com",
         domainId: "c",
         "@type": "User",
-        aliases: { "0": { name: "ops@example.com", domainId: "c", enabled: true } },
+        aliases: {
+          "0": { name: "ops@example.com", domainId: "c", enabled: true },
+        },
         roles: { "@type": "Admin" },
         permissions: { "@type": "Inherit" },
       },
@@ -413,7 +429,11 @@ Deno.test("account_list: extracts aliases, type, and disabled detection", async 
         "@type": "User",
         aliases: {},
         roles: { "@type": "User" },
-        permissions: { "@type": "Replace", enabledPermissions: {}, disabledPermissions: {} },
+        permissions: {
+          "@type": "Replace",
+          enabledPermissions: {},
+          disabledPermissions: {},
+        },
       },
     ],
   });
@@ -426,7 +446,11 @@ Deno.test("account_list: extracts aliases, type, and disabled detection", async 
     assertEquals(written[0].data.aliases, ["ops@example.com"]);
     assertEquals(written[0].data.roles, "admin");
     assertEquals(written[0].data.enabled, true);
-    assertEquals(written[1].data.enabled, false, "Replace+empty perms → disabled");
+    assertEquals(
+      written[1].data.enabled,
+      false,
+      "Replace+empty perms → disabled",
+    );
   } finally {
     __setJmap(null);
     __setRest(null);
@@ -447,7 +471,10 @@ Deno.test("role_list: permission/role maps become arrays", async () => {
     const { context, written } = makeContext();
     await method("role_list").execute({}, context);
     assertEquals(written[0].data.description, "User");
-    assertEquals(written[0].data.enabledPermissions, ["authenticate", "emailSend"]);
+    assertEquals(written[0].data.enabledPermissions, [
+      "authenticate",
+      "emailSend",
+    ]);
     assertEquals(written[0].data.nestedRoleIds, []);
   } finally {
     __setJmap(null);
@@ -477,7 +504,10 @@ Deno.test("alias_list: filters to one account by name or full address", async ()
   });
   try {
     const { context, written } = makeContext();
-    await method("alias_list").execute({ account: "alice@example.com" }, context);
+    await method("alias_list").execute(
+      { account: "alice@example.com" },
+      context,
+    );
     assertEquals(written.length, 2, "only alice's two aliases");
     assertEquals(written.map((w) => w.data.address).sort(), [
       "a@example.com",
@@ -494,7 +524,10 @@ Deno.test("role_ensure: preset creates a role with the signed-off permissions", 
   const { setCalls } = makeTypedJmap({ "x:Role": [] });
   try {
     const { context, written } = makeContext();
-    await method("role_ensure").execute({ preset: "automated-mailbox" }, context);
+    await method("role_ensure").execute(
+      { preset: "automated-mailbox" },
+      context,
+    );
     assertEquals(setCalls.length, 1, "one create");
     const created = (setCalls[0].args.create as Json).new as Json;
     assertEquals(created.description, "Automated Mailbox");
@@ -529,7 +562,10 @@ Deno.test("role_ensure: idempotent — same permissions → unchanged, no set", 
   });
   try {
     const { context, written } = makeContext();
-    await method("role_ensure").execute({ preset: "automated-mailbox" }, context);
+    await method("role_ensure").execute(
+      { preset: "automated-mailbox" },
+      context,
+    );
     assertEquals(setCalls.length, 0, "no mutation when unchanged");
     assertEquals(written[0].data.action, "unchanged");
   } finally {
@@ -595,7 +631,11 @@ Deno.test("role_assign: verify-before-mutate — unknown account/role throw", as
   try {
     const { context } = makeContext();
     await rejects(
-      () => method("role_assign").execute({ account: "ghost@x", role: "user" }, context),
+      () =>
+        method("role_assign").execute(
+          { account: "ghost@x", role: "user" },
+          context,
+        ),
       /Account not found/,
     );
   } finally {
@@ -605,13 +645,18 @@ Deno.test("role_assign: verify-before-mutate — unknown account/role throw", as
 });
 
 Deno.test("settings_get: reads a singleton and strips the id into settings", async () => {
-  makeTypedJmap({ "x:Http": [{ id: "singleton", usePermissiveCors: true, enableHsts: false }] });
+  makeTypedJmap({
+    "x:Http": [{ id: "singleton", usePermissiveCors: true, enableHsts: false }],
+  });
   try {
     const { context, written } = makeContext();
     await method("settings_get").execute({ kind: "http" }, context);
     assertEquals(written[0].data.kind, "http");
     assertEquals(written[0].data.id, "singleton");
-    assertEquals(written[0].data.settings, { usePermissiveCors: true, enableHsts: false });
+    assertEquals(written[0].data.settings, {
+      usePermissiveCors: true,
+      enableHsts: false,
+    });
     assertEquals(written[0].data.action, "observed");
   } finally {
     __setJmap(null);
@@ -649,7 +694,9 @@ Deno.test("settings_set: changes the field, then reloads", async () => {
     );
     // One x:Http update + one x:Action ReloadSettings.
     assertEquals(setCalls.map((c) => c.type), ["x:Http", "x:Action"]);
-    assertEquals((setCalls[0].args.update as Json).singleton, { usePermissiveCors: true });
+    assertEquals((setCalls[0].args.update as Json).singleton, {
+      usePermissiveCors: true,
+    });
     const action = (setCalls[1].args.create as Json).c0 as Json;
     assertEquals(action["@type"], "ReloadSettings");
     assertEquals(written[0].data.action, "updated");
@@ -666,7 +713,10 @@ Deno.test("reload: creates a ReloadSettings action and reports reloaded", async 
     const { context, written } = makeContext();
     await method("reload").execute({}, context);
     assertEquals(setCalls[0].type, "x:Action");
-    assertEquals(((setCalls[0].args.create as Json).c0 as Json)["@type"], "ReloadSettings");
+    assertEquals(
+      ((setCalls[0].args.create as Json).c0 as Json)["@type"],
+      "ReloadSettings",
+    );
     assertEquals(written[0].data.action, "reloaded");
     assertEquals(written[0].data.kind, "server");
   } finally {
@@ -690,15 +740,26 @@ Deno.test("account_ensure: creates with resolved domain, aliases, role, password
     }, context);
     assertEquals(setCalls.length, 1);
     const c = (setCalls[0].args.create as Json).new as Json;
-    assertEquals(c["@type"], "User", "account union discriminator required on create");
+    assertEquals(
+      c["@type"],
+      "User",
+      "account union discriminator required on create",
+    );
     assertEquals(c.name, "alice");
     assertEquals(c.domainId, "d1");
-    assertEquals(c.aliases, { "0": { name: "a", domainId: "d1", enabled: true } });
+    assertEquals(c.aliases, {
+      "0": { name: "a", domainId: "d1", enabled: true },
+    });
     assertEquals(c.roles, { "@type": "User" }, "defaults to user role");
-    assertEquals(c.credentials, { "0": { "@type": "Password", secret: "secret" } });
+    assertEquals(c.credentials, {
+      "0": { "@type": "Password", secret: "secret" },
+    });
     assertEquals(written[0].data.action, "created");
     // Secret-once: the written resource must NOT echo the password.
-    assert(!JSON.stringify(written[0].data).includes("secret"), "no password in output");
+    assert(
+      !JSON.stringify(written[0].data).includes("secret"),
+      "no password in output",
+    );
   } finally {
     __setJmap(null);
     __setRest(null);
@@ -755,7 +816,10 @@ Deno.test("account_ensure: omitting aliases leaves existing aliases untouched", 
     );
     const patch = (setCalls[0].args.update as Json).a1 as Json;
     assertEquals(patch.description, "New");
-    assert(!("aliases" in patch), "aliases must NOT be in the patch when omitted");
+    assert(
+      !("aliases" in patch),
+      "aliases must NOT be in the patch when omitted",
+    );
   } finally {
     __setJmap(null);
     __setRest(null);
@@ -777,12 +841,137 @@ Deno.test("account_ensure: unknown domain is rejected before any write", async (
   }
 });
 
+Deno.test("account_ensure: memberOf resolves group addresses to memberGroupIds on create", async () => {
+  const { setCalls } = makeTypedJmap({
+    "x:Domain": [{ id: "d1", name: "example.com" }],
+    "x:Account": [
+      {
+        id: "g1",
+        "@type": "Group",
+        name: "gmail",
+        emailAddress: "gmail@example.com",
+        domainId: "d1",
+      },
+      {
+        id: "g2",
+        "@type": "Group",
+        name: "outlook",
+        emailAddress: "outlook@example.com",
+        domainId: "d1",
+      },
+    ],
+  });
+  try {
+    const { context, written } = makeContext();
+    await method("account_ensure").execute({
+      email: "me@example.com",
+      memberOf: ["gmail@example.com", "outlook@example.com"],
+    }, context);
+    const c = (setCalls[0].args.create as Json).new as Json;
+    assertEquals(
+      c.memberGroupIds,
+      { g1: true, g2: true },
+      "set-map of group ids",
+    );
+    assertEquals(written[0].data.memberOf, [
+      "gmail@example.com",
+      "outlook@example.com",
+    ]);
+  } finally {
+    __setJmap(null);
+    __setRest(null);
+  }
+});
+
+Deno.test("account_ensure: memberOf idempotent — same membership → no patch", async () => {
+  const { setCalls } = makeTypedJmap({
+    "x:Domain": [{ id: "d1", name: "example.com" }],
+    "x:Account": [
+      {
+        id: "g1",
+        "@type": "Group",
+        name: "gmail",
+        emailAddress: "gmail@example.com",
+        domainId: "d1",
+      },
+      {
+        id: "a1",
+        "@type": "User",
+        name: "me",
+        emailAddress: "me@example.com",
+        domainId: "d1",
+        roles: { "@type": "User" },
+        memberGroupIds: { g1: true },
+      },
+    ],
+  });
+  try {
+    const { context, written } = makeContext();
+    await method("account_ensure").execute(
+      { email: "me@example.com", memberOf: ["gmail@example.com"] },
+      context,
+    );
+    assertEquals(
+      setCalls.length,
+      0,
+      "no mutation when membership already matches",
+    );
+    assertEquals(written[0].data.action, "unchanged");
+  } finally {
+    __setJmap(null);
+    __setRest(null);
+  }
+});
+
+Deno.test("account_ensure: memberOf rejects a non-group / unknown address before any write", async () => {
+  const { setCalls } = makeTypedJmap({
+    "x:Domain": [{ id: "d1", name: "example.com" }],
+    "x:Account": [
+      {
+        id: "a2",
+        "@type": "User",
+        name: "bob",
+        emailAddress: "bob@example.com",
+        domainId: "d1",
+      },
+    ],
+  });
+  try {
+    const { context } = makeContext();
+    await rejects(
+      () =>
+        method("account_ensure").execute(
+          { email: "me@example.com", memberOf: ["bob@example.com"] },
+          context,
+        ),
+      /Not a group account/,
+    );
+    await rejects(
+      () =>
+        method("account_ensure").execute(
+          { email: "me@example.com", memberOf: ["ghost@example.com"] },
+          context,
+        ),
+      /Group not found/,
+    );
+    assertEquals(setCalls.length, 0);
+  } finally {
+    __setJmap(null);
+    __setRest(null);
+  }
+});
+
 Deno.test("domain_set_state: flips isEnabled, idempotent when already in state", async () => {
-  const t = { "x:Domain": [{ id: "d1", name: "example.com", isEnabled: true }] };
+  const t = {
+    "x:Domain": [{ id: "d1", name: "example.com", isEnabled: true }],
+  };
   let r = makeTypedJmap(t);
   try {
     const { context, written } = makeContext();
-    await method("domain_set_state").execute({ domain: "example.com", state: "inactive" }, context);
+    await method("domain_set_state").execute({
+      domain: "example.com",
+      state: "inactive",
+    }, context);
     assertEquals((r.setCalls[0].args.update as Json).d1, { isEnabled: false });
     assertEquals(written[0].data.action, "deactivated");
   } finally {
@@ -792,7 +981,10 @@ Deno.test("domain_set_state: flips isEnabled, idempotent when already in state",
   r = makeTypedJmap(t);
   try {
     const { context, written } = makeContext();
-    await method("domain_set_state").execute({ domain: "example.com", state: "active" }, context);
+    await method("domain_set_state").execute({
+      domain: "example.com",
+      state: "active",
+    }, context);
     assertEquals(r.setCalls.length, 0, "already active → no write");
     assertEquals(written[0].data.action, "unchanged");
   } finally {
@@ -812,9 +1004,16 @@ Deno.test("account_set_state: disable replaces permissions with empty (reversibl
   });
   try {
     const { context, written } = makeContext();
-    await method("account_set_state").execute({ account: "x@example.com", state: "inactive" }, context);
+    await method("account_set_state").execute({
+      account: "x@example.com",
+      state: "inactive",
+    }, context);
     assertEquals((setCalls[0].args.update as Json).a1, {
-      permissions: { "@type": "Replace", enabledPermissions: {}, disabledPermissions: {} },
+      permissions: {
+        "@type": "Replace",
+        enabledPermissions: {},
+        disabledPermissions: {},
+      },
     });
     assertEquals(written[0].data.action, "deactivated");
   } finally {
@@ -861,7 +1060,10 @@ Deno.test("report_query: dmarc reports carry a summary, no id leak", async () =>
     assertEquals(written[0].data.kind, "dmarc");
     assertEquals(written[0].data.domain, "example.com");
     assert(String(written[0].data.summary).includes('"count":5'));
-    assert(!String(written[0].data.summary).includes('"id"'), "id stripped from summary");
+    assert(
+      !String(written[0].data.summary).includes('"id"'),
+      "id stripped from summary",
+    );
   } finally {
     __setJmap(null);
     __setRest(null);
@@ -882,9 +1084,15 @@ Deno.test("certificate_install: creates when none exist, reloads, hides the key"
     assertEquals(c.certificate, { "@type": "Text", value: "-----CERT-----" });
     assertEquals(c.privateKey, { "@type": "Text", secret: "-----KEY-----" });
     assertEquals(setCalls[1].type, "x:Action");
-    assertEquals(((setCalls[1].args.create as Json).c0 as Json)["@type"], "ReloadTlsCertificates");
+    assertEquals(
+      ((setCalls[1].args.create as Json).c0 as Json)["@type"],
+      "ReloadTlsCertificates",
+    );
     assertEquals(written[0].data.action, "created");
-    assert(!JSON.stringify(written[0].data).includes("KEY"), "private key never echoed");
+    assert(
+      !JSON.stringify(written[0].data).includes("KEY"),
+      "private key never echoed",
+    );
   } finally {
     __setJmap(null);
     __setRest(null);
@@ -903,7 +1111,10 @@ Deno.test("certificate_install: updates the sole existing cert; refuses when amb
       certificate: { "@type": "Text", value: "C" },
       privateKey: { "@type": "Text", secret: "K" },
     });
-    assert(!r.setCalls.some((c) => c.type === "x:Action"), "reload=false → no action");
+    assert(
+      !r.setCalls.some((c) => c.type === "x:Action"),
+      "reload=false → no action",
+    );
     assertEquals(written[0].data.action, "updated");
   } finally {
     __setJmap(null);
@@ -913,7 +1124,11 @@ Deno.test("certificate_install: updates the sole existing cert; refuses when amb
   try {
     const { context } = makeContext();
     await rejects(
-      () => method("certificate_install").execute({ certificate: "C", privateKey: "K" }, context),
+      () =>
+        method("certificate_install").execute({
+          certificate: "C",
+          privateKey: "K",
+        }, context),
       /pass certificateId/,
     );
   } finally {
@@ -937,8 +1152,14 @@ Deno.test("mailing_list_ensure: create sets recipients as a set-map {addr:true}"
     const c = (setCalls[0].args.create as Json).new as Json;
     assertEquals(c.name, "team");
     assertEquals(c.domainId, "d1");
-    assertEquals(c.recipients, { "a@example.com": true, "b@example.com": true });
-    assertEquals(written[0].data.recipients, ["a@example.com", "b@example.com"]);
+    assertEquals(c.recipients, {
+      "a@example.com": true,
+      "b@example.com": true,
+    });
+    assertEquals(written[0].data.recipients, [
+      "a@example.com",
+      "b@example.com",
+    ]);
     assertEquals(written[0].data.action, "created");
   } finally {
     __setJmap(null);

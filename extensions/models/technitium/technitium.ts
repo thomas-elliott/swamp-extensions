@@ -457,7 +457,14 @@ function toStringArray(v: unknown): string[] | undefined {
  * record names are flattened.
  */
 export function slug(s: string): string {
-  const out = s.replace(/[^A-Za-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "");
+  // Map `*` to a literal token BEFORE the alnum strip so a wildcard label slugs
+  // distinctly from its bare form. Otherwise `*.s3.x` and `s3.x` both flatten to
+  // `s3-x`, colliding instance names — which aborts `record_list` (swamp rejects
+  // duplicate data-instance names) for any zone holding both a name and its wildcard.
+  const out = s.replace(/\*/g, "star").replace(/[^A-Za-z0-9_-]+/g, "-").replace(
+    /^-+|-+$/g,
+    "",
+  );
   return out.length > 0 ? out : "root";
 }
 

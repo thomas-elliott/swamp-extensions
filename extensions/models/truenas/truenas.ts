@@ -26,14 +26,16 @@ import type {
  *     definition (the dataset/data is left untouched); the removed config is recorded
  *     so it can be re-created.
  * It does NOT touch pools, datasets, users, snapshots, replication, or service
- * start/stop (a stopped ssh/nfs service is a lockout/outage risk — left an explicit
+ * start/stop (`filesystem_list` reads a directory and `replication_list` reads task
+ * definitions — neither writes, and no verb runs or edits a replication task) (a stopped ssh/nfs service is a lockout/outage risk — left an explicit
  * gap). Every mutating verb verifies its target by id/name first (CLAUDE.md rule 5);
  * the set-access verbs are reversible (re-run with the prior values) and the delete
  * verbs record the removed config so the share can be re-created.
  *
  * Method sections (by prefix):
  *   - read/audit: `system_info`, `app_list`, `nfs_share_list`, `smb_share_list`,
- *     `service_list`, `network_info`, `exposure_audit` (the R28 report data source).
+ *     `service_list`, `network_info`, `filesystem_list`, `app_storage`,
+ *     `replication_list`, `exposure_audit` (the R28 report data source).
  *   - mutate: `app_set_port_bind`, `app_set_networks`, `nfs_share_set_access`,
  *     `smb_share_set_access`, `nfs_share_delete`, `smb_share_delete`.
  *
@@ -183,6 +185,80 @@ const ServiceInfo = z.object({
   state: z.string().describe("RUNNING | STOPPED"),
   enable: z.boolean().describe("Starts on boot"),
   running: z.boolean(),
+  action: Action,
+  timestamp: z.string(),
+});
+
+/** One entry in a directory listing (`filesystem.listdir` row). */
+const DirEntry = z.object({
+  name: z.string(),
+  type: z.string().describe("DIRECTORY | FILE | SYMLINK | OTHER"),
+  size: z.number().nullable().optional(),
+  isMountpoint: z.boolean().describe(
+    "The entry is a mountpoint — for /mnt/<pool> children, a child DATASET " +
+      "rather than a plain directory",
+  ),
+});
+
+const DirListing = z.object({
+  path: z.string(),
+  exists: z.boolean().describe(
+    "False when the path is absent (or not a directory) — recorded instead of " +
+      "failing, so a missing backup/app source path is data, not an error",
+  ),
+  entryCount: z.number().describe("Entries returned (after any truncation)"),
+  truncated: z.boolean().describe("More entries exist than maxEntries"),
+  entries: z.array(DirEntry),
+  error: z.string().optional().describe("The listdir error when exists=false"),
+  action: Action,
+  timestamp: z.string(),
+});
+
+/** One host-path bind an app mounts (a `host_path` entry in the app's config). */
+const HostPathMount = z.object({
+  configPath: z.string().describe(
+    "Where it sits in the app config, e.g. storage.additional_storage[1]",
+  ),
+  mountPath: z.string().describe("Path INSIDE the container"),
+  hostPath: z.string().describe("Path on the NAS"),
+  readOnly: z.boolean(),
+});
+
+const AppStorage = z.object({
+  app: z.string(),
+  mountCount: z.number(),
+  mounts: z.array(HostPathMount),
+  action: Action,
+  timestamp: z.string(),
+});
+
+const ReplicationTask = z.object({
+  id: z.number(),
+  name: z.string(),
+  direction: z.string().describe("PUSH | PULL"),
+  transport: z.string().describe("LOCAL | SSH | SSH+NETCAT"),
+  enabled: z.boolean(),
+  auto: z.boolean().describe("Runs on its schedule (vs manual-only)"),
+  recursive: z.boolean().describe(
+    "Child datasets ride along — the difference between a source's children " +
+      "being replicated and silently skipped",
+  ),
+  sourceDatasets: z.array(z.string()),
+  targetDataset: z.string(),
+  schedule: z.string().optional().describe(
+    "cron-ish minute hour dom month dow, or absent when not scheduled",
+  ),
+  readonlyPolicy: z.string().optional().describe(
+    "TrueNAS readonly policy for the DESTINATION (SET/REQUIRE/IGNORE). SET " +
+      "rewrites the destination's readonly property, which remounts it.",
+  ),
+  sendsProperties: z.boolean().describe(
+    "Replicates dataset PROPERTIES (incl. mountpoint/readonly) — a property " +
+      "change on receive can unmount/remount the destination dataset",
+  ),
+  state: z.string().optional().describe("Last run state (FINISHED/ERROR/…)"),
+  lastRunAt: z.string().optional(),
+  lastError: z.string().optional(),
   action: Action,
   timestamp: z.string(),
 });
@@ -696,6 +772,100 @@ function shapeService(raw: unknown, ts: string): z.infer<typeof ServiceInfo> {
   };
 }
 
+function shapeDirEntry(raw: unknown): z.infer<typeof DirEntry> {
+  const e = asObj(raw);
+  return {
+    name: String(e.name ?? ""),
+    type: String(e.type ?? "OTHER"),
+    size: nullableNum(e.size),
+    isMountpoint: asBool(e.is_mountpoint),
+  };
+}
+
+/**
+ * Collect every host-path bind in an app's config. Catalog apps place these
+ * differently (`storage.data`, `storage.additional_storage[]`, per-app keys…), so
+ * this walks the config for the shape TrueNAS always uses — an object carrying a
+ * `host_path_config.path` (or `type: "host_path"` + `path`) — rather than assuming
+ * one layout. `configPath` records where each was found.
+ */
+function collectHostPaths(
+  config: unknown,
+  breadcrumb: string,
+  out: z.infer<typeof HostPathMount>[],
+): void {
+  if (Array.isArray(config)) {
+    config.forEach((v, i) => collectHostPaths(v, `${breadcrumb}[${i}]`, out));
+    return;
+  }
+  if (!config || typeof config !== "object") return;
+  const o = config as Record<string, unknown>;
+  const hpc = asObj(o.host_path_config);
+  const hostPath = asStr(hpc.path) ??
+    (String(o.type ?? "") === "host_path" ? asStr(o.path) : undefined);
+  if (hostPath) {
+    out.push({
+      configPath: breadcrumb || "config",
+      mountPath: asStr(o.mount_path) ?? "",
+      hostPath,
+      readOnly: asBool(o.read_only) || asBool(hpc.read_only),
+    });
+  }
+  for (const [k, v] of Object.entries(o)) {
+    if (k === "host_path_config") continue;
+    collectHostPaths(v, breadcrumb ? `${breadcrumb}.${k}` : k, out);
+  }
+}
+
+/**
+ * TrueNAS timestamps arrive either as an ISO string or as `{"$date": <epoch ms>}`.
+ * Normalise to ISO; undefined when neither form is present.
+ */
+function isoDate(v: unknown): string | undefined {
+  if (v === null || v === undefined) return undefined;
+  if (typeof v === "string") return v;
+  const epoch = asNum(asObj(v).$date);
+  return epoch === undefined ? undefined : new Date(epoch).toISOString();
+}
+
+function shapeReplication(
+  raw: unknown,
+  ts: string,
+): z.infer<typeof ReplicationTask> {
+  const r = asObj(raw);
+  const sched = asObj(r.schedule);
+  const state = asObj(r.state);
+  const scheduleStr = r.schedule
+    ? [sched.minute, sched.hour, sched.dom, sched.month, sched.dow]
+      .map((f) => String(f ?? "*")).join(" ")
+    : undefined;
+  return {
+    id: asNum(r.id) ?? 0,
+    name: String(r.name ?? ""),
+    direction: String(r.direction ?? ""),
+    transport: String(r.transport ?? ""),
+    enabled: asBool(r.enabled),
+    auto: asBool(r.auto),
+    recursive: asBool(r.recursive),
+    sourceDatasets: strArr(r.source_datasets),
+    targetDataset: String(r.target_dataset ?? ""),
+    schedule: scheduleStr,
+    readonlyPolicy: asStr(r.readonly),
+    sendsProperties: asBool(r.properties),
+    state: asStr(state.state),
+    lastRunAt: isoDate(state.datetime),
+    lastError: asStr(state.error),
+    action: "observed",
+    timestamp: ts,
+  };
+}
+
+/** A path as a data-instance name: `/mnt/Backup/apps` → `mnt-Backup-apps`. */
+function pathKey(path: string): string {
+  const key = path.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
+  return key || "root";
+}
+
 // ─────────────────────────── method argument schemas ───────────────────────────
 
 const Empty = z.object({});
@@ -723,6 +893,33 @@ const AppSetPortBindArgs = z.object({
   (a) => a.bindMode !== undefined || a.hostIps !== undefined,
   { message: "provide bindMode and/or hostIps (nothing to change otherwise)" },
 );
+
+const FilesystemListArgs = z.object({
+  // `--input path='["/a","/b"]'` arrives as a STRING (the CLI only decodes JSON for
+  // a declared array type, and this field also accepts a bare path) — so decode a
+  // leading-`[` string here, or the whole JSON blob gets listed as one path name.
+  path: z.preprocess((v) => {
+    if (typeof v === "string" && v.trimStart().startsWith("[")) {
+      try {
+        return JSON.parse(v);
+      } catch { /* not JSON after all — treat it as a literal path */ }
+    }
+    return v;
+  }, z.union([z.string(), z.array(z.string())])).describe(
+    "Absolute path to list, e.g. /mnt/Backup, or a JSON LIST of paths to list in " +
+      'one run, e.g. \'["/mnt/Backup","/mnt/Backup/apps"]\' (host paths, not ' +
+      "container paths)",
+  ),
+  maxEntries: z.coerce.number().int().default(500).describe(
+    "Cap on entries recorded (a media dataset can hold thousands)",
+  ),
+});
+
+const AppStorageArgs = z.object({
+  app: z.string().optional().describe(
+    "App name (from app_list). Omit to report every app's host-path binds.",
+  ),
+});
 
 const AppSetNetworksArgs = z.object({
   app: z.string().describe("App name (from app_list)"),
@@ -995,6 +1192,25 @@ export const model = {
       lifetime: "1h",
       garbageCollection: 5,
     },
+    "dir-listing": {
+      description: "One directory's entries (existence + children)",
+      schema: DirListing,
+      lifetime: "1h",
+      garbageCollection: 5,
+    },
+    "app-storage": {
+      description: "An app's host-path binds (container path ← NAS path)",
+      schema: AppStorage,
+      lifetime: "1h",
+      garbageCollection: 5,
+    },
+    "replication-task": {
+      description:
+        "A replication task (source/target datasets, schedule, last run)",
+      schema: ReplicationTask,
+      lifetime: "1h",
+      garbageCollection: 5,
+    },
     "exposure-audit": {
       description:
         "Service-exposure roll-up across apps/shares/services (R28 source)",
@@ -1247,6 +1463,169 @@ export const model = {
             timestamp: ts,
           });
           return { dataHandles: [handle] };
+        } finally {
+          session.close();
+        }
+      },
+    },
+
+    filesystem_list: {
+      description:
+        "List directories on the NAS (`filesystem.listdir`) — entries with type/size " +
+        "and a mountpoint flag (a child dataset). Read-only. Takes one path or a LIST " +
+        "of paths and writes one `dir-listing` each (fan-out: one session, one model " +
+        "lock). A path that is absent records exists=false instead of failing, so this " +
+        'answers "does this backup/app source path still exist?" in one call.',
+      arguments: FilesystemListArgs,
+      execute: async (
+        rawArgs,
+        context,
+      ): Promise<{ dataHandles: DataHandle[] }> => {
+        const g = context.globalArgs;
+        const a = FilesystemListArgs.parse(rawArgs);
+        const paths = Array.isArray(a.path) ? a.path : [a.path];
+        const session = await openSession(g);
+        try {
+          const handles: DataHandle[] = [];
+          for (const path of paths) {
+            logInfo(context, "Listing directory", { path });
+            const ts = new Date().toISOString();
+            let rows: unknown[];
+            try {
+              rows = asArr(await session.call("filesystem.listdir", [path]));
+            } catch (e) {
+              // ENOENT / ENOTDIR is the interesting answer here, not a failure.
+              const message = (e as Error).message;
+              if (
+                !/ENOENT|ENOTDIR|does not exist|not a directory/i.test(message)
+              ) {
+                throw e;
+              }
+              handles.push(
+                await context.writeResource("dir-listing", pathKey(path), {
+                  path,
+                  exists: false,
+                  entryCount: 0,
+                  truncated: false,
+                  entries: [],
+                  error: message,
+                  action: "observed",
+                  timestamp: ts,
+                }),
+              );
+              continue;
+            }
+            // Sort BEFORE truncating, so which entries survive maxEntries is
+            // deterministic rather than dependent on listdir order.
+            const all = rows.map(shapeDirEntry)
+              .sort((x, y) => x.name.localeCompare(y.name));
+            const entries = all.slice(0, a.maxEntries);
+            handles.push(
+              await context.writeResource("dir-listing", pathKey(path), {
+                path,
+                exists: true,
+                entryCount: entries.length,
+                truncated: all.length > entries.length,
+                entries,
+                action: "observed",
+                timestamp: ts,
+              }),
+            );
+          }
+          return { dataHandles: handles };
+        } finally {
+          session.close();
+        }
+      },
+    },
+
+    app_storage: {
+      description:
+        "List an app's host-path binds — container mount path ← NAS path, plus where " +
+        "each sits in the app config (factory: one `app-storage` per app; omit `app` " +
+        "for all apps). Read-only. Shows whether an app mounts one parent directory or " +
+        "each source individually — the difference that decides whether child datasets " +
+        "mounted under it are visible inside the container.",
+      arguments: AppStorageArgs,
+      execute: async (
+        rawArgs,
+        context,
+      ): Promise<{ dataHandles: DataHandle[] }> => {
+        const g = context.globalArgs;
+        const a = AppStorageArgs.parse(rawArgs);
+        const session = await openSession(g);
+        try {
+          logInfo(context, "Querying app storage", { app: a.app ?? "(all)" });
+          const filter = a.app ? [["name", "=", a.app]] : [];
+          const apps = asArr(
+            await session.call("app.query", [filter, {
+              extra: { retrieve_config: true },
+            }]),
+          );
+          if (a.app && apps.length === 0) {
+            throw new Error(`app ${JSON.stringify(a.app)} not found`);
+          }
+          const ts = new Date().toISOString();
+          const handles: DataHandle[] = [];
+          for (const raw of apps) {
+            const app = asObj(raw);
+            const name = String(app.name ?? "");
+            if (!name) continue;
+            const mounts: z.infer<typeof HostPathMount>[] = [];
+            collectHostPaths(app.config, "", mounts);
+            mounts.sort((x, y) => x.mountPath.localeCompare(y.mountPath));
+            handles.push(
+              // Suffixed: a bare app name would collide with the `app` instance
+              // app_list writes into this model's shared data namespace.
+              await context.writeResource("app-storage", `${name}-storage`, {
+                app: name,
+                mountCount: mounts.length,
+                mounts,
+                action: "observed",
+                timestamp: ts,
+              }),
+            );
+          }
+          return { dataHandles: handles };
+        } finally {
+          session.close();
+        }
+      },
+    },
+
+    replication_list: {
+      description:
+        "List replication tasks with their source/target datasets, recursive flag, " +
+        "schedule, readonly + send-properties policy, and last-run state (factory: one " +
+        "`replication-task` each). Read-only — it never creates, edits, or runs a task. " +
+        "Answers which task writes into a destination dataset and when (a receive can " +
+        "remount the destination, which invalidates a container's bind mount of it).",
+      arguments: Empty,
+      execute: async (
+        _rawArgs,
+        context,
+      ): Promise<{ dataHandles: DataHandle[] }> => {
+        const g = context.globalArgs;
+        const session = await openSession(g);
+        try {
+          logInfo(context, "Querying replication tasks");
+          const rows = asArr(await session.call("replication.query", [[]]));
+          const ts = new Date().toISOString();
+          const handles: DataHandle[] = [];
+          for (const raw of rows) {
+            const shaped = shapeReplication(raw, ts);
+            handles.push(
+              // Prefixed: TrueNAS id sequences are PER-TABLE, so a bare id would
+              // collide with the nfs-share/smb-share instances in this model's
+              // shared data namespace and silently overwrite them.
+              await context.writeResource(
+                "replication-task",
+                `repl-${shaped.id}`,
+                shaped,
+              ),
+            );
+          }
+          return { dataHandles: handles };
         } finally {
           session.close();
         }

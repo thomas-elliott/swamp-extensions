@@ -138,6 +138,9 @@ Deno.test("slug flattens dotted domains into a safe instance-name fragment", () 
   assertEquals(slug("foo.example.com"), "foo-example-com");
   assertEquals(slug("_dmarc.example.com"), "_dmarc-example-com");
   assertEquals(slug(""), "root");
+  // wildcard label must NOT collapse onto its bare form
+  assertEquals(slug("*.s3.example.com"), "star-s3-example-com");
+  assert(slug("*.s3.example.com") !== slug("s3.example.com"));
 });
 
 Deno.test("recordInstanceName is identity-stable, case-normalized, and collision-free per record", () => {
@@ -177,6 +180,14 @@ Deno.test("recordInstanceName is identity-stable, case-normalized, and collision
       }),
     ),
     "unexpected instance-name shape",
+  );
+  // a wildcard record and its bare sibling — identical rData — stay distinct
+  // (the bug that aborted record_list on a zone holding both s3 + *.s3)
+  const appData = { appName: "Split Horizon", classPath: "S.A", data: "{}" };
+  assert(
+    recordInstanceName("ex.com", "*.s3.ex.com", "APP", appData) !==
+      recordInstanceName("ex.com", "s3.ex.com", "APP", appData),
+    "wildcard and bare record must yield distinct instance names",
   );
 });
 

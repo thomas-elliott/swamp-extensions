@@ -98,6 +98,9 @@ const AccountInfo = z.object({
   roles: z.string().optional().describe(
     "Role assignment: admin | user | custom | unknown",
   ),
+  memberOf: z.array(z.string()).optional().describe(
+    "Group account ids this account is a member of (shared-folder access)",
+  ),
   enabled: z.boolean().optional().describe(
     "False when the account is disabled (permissions replaced with empty)",
   ),
@@ -941,6 +944,11 @@ const AccountEnsureArgs = z.object({
   role: z.string().optional().describe(
     "Role: admin | user | a custom role name (default `user` on create)",
   ),
+  memberOf: jsonArray.optional().describe(
+    "Group addresses this account is a member of (converged to exactly this " +
+      "set when provided; each group's inbox then appears as a shared folder " +
+      "for this account). Omit to leave membership untouched; pass [] to clear.",
+  ),
   password: z.string().meta({ sensitive: true }).optional().describe(
     "Initial password, set once on CREATE only (hashed by Stalwart; never read back)",
   ),
@@ -1165,6 +1173,7 @@ export const model = {
           "@type",
           "aliases",
           "roles",
+          "memberGroupIds",
           "permissions",
           "description",
         ]);
@@ -1188,6 +1197,7 @@ export const model = {
               type: accountType(a["@type"]),
               aliases: aliasAddresses(a.aliases),
               roles: rolesLabel(a.roles),
+              memberOf: mapKeys(a.memberGroupIds),
               enabled: !disabled,
               description: typeof a.description === "string"
                 ? a.description
@@ -1605,9 +1615,10 @@ export const model = {
     account_ensure: {
       description:
         "Create or converge an individual mailbox (idempotent by address). " +
-        "Resolves the domain, converges aliases + role + description; an optional " +
-        "password is set ONCE on create (hashed by Stalwart, never read back). " +
-        "Never deletes; removing an alias = omit it from `aliases`.",
+        "Resolves the domain, converges aliases + role + group membership " +
+        "(`memberOf`) + description; an optional password is set ONCE on " +
+        "create (hashed by Stalwart, never read back). Never deletes; removing " +
+        "an alias/membership = omit it from `aliases`/`memberOf`.",
       arguments: AccountEnsureArgs,
       execute: async (
         rawArgs,
@@ -1645,11 +1656,13 @@ export const model = {
         // Verify-before-mutate: find an existing account by full address.
         const accounts = await listAll(g, JMAP_TYPES.account, accountId, [
           "id",
+          "@type",
           "name",
           "emailAddress",
           "domainId",
           "aliases",
           "roles",
+          "memberGroupIds",
           "description",
         ]);
         const want = a.email.toLowerCase();
@@ -1658,6 +1671,28 @@ export const model = {
           (String(x.name).toLowerCase() === local.toLowerCase() &&
             String(x.domainId) === domainId)
         );
+
+        // Resolve group memberships ONLY when explicitly provided. Each entry
+        // must be an existing GROUP account; membership lives here on the
+        // member (`memberGroupIds`), not on the group. Set-semantics Map, like
+        // `roleIds`: { "<groupId>": true }.
+        let desiredMembers: Json | undefined;
+        let desiredMemberKeys: string[] | undefined;
+        if (a.memberOf) {
+          desiredMembers = {};
+          for (const addr of a.memberOf) {
+            const wantGrp = addr.toLowerCase();
+            const grp = accounts.find((x) =>
+              String(x.emailAddress).toLowerCase() === wantGrp
+            );
+            if (!grp) throw new Error(`Group not found: ${addr}`);
+            if (grp["@type"] !== "Group") {
+              throw new Error(`Not a group account: ${addr}`);
+            }
+            (desiredMembers as Json)[String(grp.id)] = true;
+          }
+          desiredMemberKeys = Object.keys(desiredMembers).sort();
+        }
 
         let id: string;
         let action: "created" | "updated" | "unchanged";
@@ -1670,6 +1705,7 @@ export const model = {
               (await buildRolesUnion(g, accountId, a.role ?? "user")).union,
           };
           if (a.aliases) create.aliases = desiredAliases;
+          if (desiredMembers) create.memberGroupIds = desiredMembers;
           if (a.description) create.description = a.description;
           if (a.password) {
             create.credentials = {
@@ -1719,6 +1755,15 @@ export const model = {
                   JSON.stringify(mapKeys(union.roleIds).sort()));
             if (!same) patch.roles = union;
           }
+          if (desiredMembers && desiredMemberKeys) {
+            const curMemberKeys = mapKeys(existing.memberGroupIds).sort();
+            if (
+              JSON.stringify(curMemberKeys) !==
+                JSON.stringify(desiredMemberKeys)
+            ) {
+              patch.memberGroupIds = desiredMembers;
+            }
+          }
           if (Object.keys(patch).length === 0) {
             action = "unchanged";
           } else {
@@ -1741,6 +1786,7 @@ export const model = {
           type: "individual",
           aliases: a.aliases ?? [],
           roles: a.role ? a.role.toLowerCase() : undefined,
+          memberOf: a.memberOf ?? [],
           description: a.description,
           action,
           timestamp: nowIso(),

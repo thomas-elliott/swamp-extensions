@@ -81,7 +81,8 @@ Optional global arg: `httpTimeoutMs` (default 30000).
 
 **Read / audit:** `health` (version + healthz), `org_list`, `repo_list`
 (all repos or one owner's), `user_list` (admin view; never any credential),
-`mirror_status` (every mirror's last sync, interval, and a `stale` flag).
+`mirror_status` (every mirror's last sync, interval, and a `stale` flag),
+`branch_protection_list` (what each branch actually enforces).
 
 ```bash
 # Mirror fleet audit — is anything failing to sync?
@@ -102,6 +103,23 @@ swamp model method run forgejo org_ensure \
 swamp model method run forgejo repo_ensure \
   --input owner=apps --input name=damson \
   --input private=true --input hasWiki=false
+
+# Grant a user access to a repo (never removes a collaborator; refuses the owner).
+swamp model method run forgejo collaborator_ensure \
+  --input owner=apps --input name=damson \
+  --input user=ci-bot --input permission=write
+
+# Make a branch PR-only, and bind admins to the rule too.
+swamp model method run forgejo branch_protection_ensure \
+  --input owner=apps --input name=damson --input rule=main \
+  --input enablePush=false --input applyToAdmins=true
+
+# Let one account push to a namespace, but never to the CI config.
+swamp model method run forgejo branch_protection_ensure \
+  --input owner=apps --input name=damson --input 'rule=agents/*' \
+  --input enablePush=true --input enablePushWhitelist=true \
+  --input 'pushWhitelistUsernames=["ci-bot"]' \
+  --input 'protectedFilePatterns=.woodpecker.yml;.woodpecker/**'
 
 # Find-or-create a GitHub pull-mirror (the workhorse).
 swamp model method run forgejo mirror_ensure \
@@ -157,6 +175,8 @@ pipeline that never started are indistinguishable here.
 | `org` | Org visibility/description. |
 | `repo` | Repo settings incl. `empty`/`mirror`/`archived` flags. |
 | `user` | Admin user listing (id, login, email, isAdmin, lastLogin). |
+| `collaborator` | A user's access level on a repo. |
+| `branch_protection` | A rule and the constraints it enforces. |
 | `mirror` | Pull-mirror sync health (`lastSynced`, `interval`, `stale`). |
 | `pull_request` | PR state, head/base, `mergeable`, and head `ciState`. |
 

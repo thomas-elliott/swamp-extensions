@@ -1227,3 +1227,239 @@ Deno.test("repo_list: a genuinely absent owner is still a 404, not a scope error
     __setCaller(null);
   }
 });
+
+// ───────────── collaborator_ensure ─────────────
+
+const COLLAB_ARGS = {
+  owner: "telliott",
+  name: "agent-scratch",
+  user: "factory-agents",
+  permission: "write",
+};
+
+Deno.test("collaborator_ensure grants access when the user has none", async () => {
+  const { caller, calls } = makeFakeApi((c) => {
+    if (c.method === "GET") return undefined; // 404 = not a collaborator
+    return {};
+  });
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("collaborator_ensure").execute(COLLAB_ARGS, context);
+    const put = calls.find((c) => c.method === "PUT");
+    assertEquals(
+      put?.path,
+      "/api/v1/repos/telliott/agent-scratch/collaborators/factory-agents",
+    );
+    assertEquals((put?.body as Record<string, unknown>).permission, "write");
+    assertEquals(written[0].data.action, "created");
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("collaborator_ensure is unchanged at the same permission", async () => {
+  const { caller, calls } = makeFakeApi(() => ({ permission: "write" }));
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("collaborator_ensure").execute(COLLAB_ARGS, context);
+    assert(!calls.some((c) => c.method !== "GET"), "no mutation expected");
+    assertEquals(written[0].data.action, "unchanged");
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("collaborator_ensure reports an existing grant as updated", async () => {
+  const { caller } = makeFakeApi((c) =>
+    c.method === "GET" ? { permission: "read" } : {}
+  );
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("collaborator_ensure").execute(COLLAB_ARGS, context);
+    assertEquals(written[0].data.action, "updated");
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("collaborator_ensure refuses to touch the repo owner", async () => {
+  const { caller, calls } = makeFakeApi(() => ({ permission: "owner" }));
+  __setCaller(caller);
+  try {
+    const { context } = makeContext();
+    await rejects(
+      () =>
+        method("collaborator_ensure").execute(
+          { ...COLLAB_ARGS, user: "telliott" },
+          context,
+        ),
+      /owns telliott\/agent-scratch/,
+    );
+    assert(!calls.some((c) => c.method !== "GET"), "must not mutate");
+  } finally {
+    __setCaller(null);
+  }
+});
+
+// ───────────── branch_protection_ensure ─────────────
+
+Deno.test("branch_protection_ensure creates a PR-only rule", async () => {
+  const { caller, calls } = makeFakeApi((c) => {
+    if (c.method === "GET") return undefined;
+    return { rule_name: "main", enable_push: false, required_approvals: 0 };
+  });
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("branch_protection_ensure").execute(
+      {
+        owner: "telliott",
+        name: "agent-scratch",
+        rule: "main",
+        enablePush: false,
+        applyToAdmins: false,
+      },
+      context,
+    );
+    const post = calls.find((c) => c.method === "POST");
+    assertEquals(
+      post?.path,
+      "/api/v1/repos/telliott/agent-scratch/branch_protections",
+    );
+    const body = post?.body as Record<string, unknown>;
+    assertEquals(body.rule_name, "main");
+    assertEquals(body.enable_push, false);
+    // A supplied-but-false field must still be sent on create — omitting it
+    // would let the server default decide.
+    assertEquals(body.apply_to_admins, false);
+    assertEquals(written[0].data.action, "created");
+    assertEquals(written[0].data.enablePush, false);
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("branch_protection_ensure patches only what differs", async () => {
+  const { caller, calls } = makeFakeApi((c) => {
+    if (c.method === "GET") {
+      return {
+        rule_name: "agents/*",
+        enable_push: true,
+        enable_push_whitelist: true,
+        push_whitelist_usernames: ["factory-agents"],
+        protected_file_patterns: "",
+      };
+    }
+    return {
+      rule_name: "agents/*",
+      protected_file_patterns: ".woodpecker.yml",
+    };
+  });
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("branch_protection_ensure").execute(
+      {
+        owner: "telliott",
+        name: "agent-scratch",
+        rule: "agents/*",
+        enablePush: true,
+        enablePushWhitelist: true,
+        pushWhitelistUsernames: ["factory-agents"],
+        protectedFilePatterns: ".woodpecker.yml",
+      },
+      context,
+    );
+    const patch = calls.find((c) => c.method === "PATCH");
+    assertEquals(
+      patch?.path,
+      "/api/v1/repos/telliott/agent-scratch/branch_protections/agents%2F*",
+    );
+    assertEquals(Object.keys(patch?.body as Record<string, unknown>), [
+      "protected_file_patterns",
+    ]);
+    assertEquals(written[0].data.action, "updated");
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("branch_protection_ensure is unchanged when converged", async () => {
+  const { caller, calls } = makeFakeApi(() => ({
+    rule_name: "main",
+    enable_push: false,
+    required_approvals: 1,
+  }));
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("branch_protection_ensure").execute(
+      {
+        owner: "telliott",
+        name: "agent-scratch",
+        rule: "main",
+        enablePush: false,
+        requiredApprovals: 1,
+      },
+      context,
+    );
+    assert(!calls.some((c) => c.method !== "GET"), "no mutation expected");
+    assertEquals(written[0].data.action, "unchanged");
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("branch_protection_ensure converges a whitelist as an exact set", async () => {
+  const { caller, calls } = makeFakeApi((c) =>
+    c.method === "GET"
+      ? {
+        rule_name: "agents/*",
+        push_whitelist_usernames: ["factory-agents", "stale-account"],
+      }
+      : { rule_name: "agents/*" }
+  );
+  __setCaller(caller);
+  try {
+    const { context } = makeContext();
+    await method("branch_protection_ensure").execute(
+      {
+        owner: "telliott",
+        name: "agent-scratch",
+        rule: "agents/*",
+        pushWhitelistUsernames: ["factory-agents"],
+      },
+      context,
+    );
+    const patch = calls.find((c) => c.method === "PATCH");
+    assertEquals(
+      (patch?.body as Record<string, unknown>).push_whitelist_usernames,
+      ["factory-agents"],
+    );
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("branch_protection_list writes one resource per rule", async () => {
+  const { caller } = makeFakeApi(() => [
+    { rule_name: "main", enable_push: false },
+    { rule_name: "agents/*", enable_push: true },
+  ]);
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("branch_protection_list").execute(
+      { owner: "telliott", name: "agent-scratch" },
+      context,
+    );
+    assertEquals(written.length, 2);
+    assertEquals(written[0].name, "telliott:agent-scratch:main");
+    assertEquals(written[1].data.action, "observed");
+  } finally {
+    __setCaller(null);
+  }
+});
