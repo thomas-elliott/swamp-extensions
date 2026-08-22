@@ -220,6 +220,229 @@ Deno.test("app_list: factory shapes one app per result, sorted port bindings", a
   }
 });
 
+// ─────────────────────────── filesystem_list ───────────────────────────
+
+Deno.test("filesystem_list: shapes entries, sorts them, flags truncation", async () => {
+  const fake = makeFakeSession((m) =>
+    m === "filesystem.listdir" ? [
+      { name: "offsite", type: "DIRECTORY", size: 4096, is_mountpoint: true },
+      { name: "app-config", type: "DIRECTORY", size: 4096 },
+    ] : undefined
+  );
+  __setTruenasSession(fake.factory);
+  try {
+    const { context, written } = makeContext();
+    await method("filesystem_list").execute(
+      { path: "/mnt/Primary/backup", maxEntries: 1 },
+      context,
+    );
+    assertEquals(written[0].specName, "dir-listing");
+    assertEquals(written[0].name, "mnt-Primary-backup");
+    const l = written[0].data;
+    assertEquals(l.exists, true);
+    assertEquals(l.truncated, true, "maxEntries=1 of 2 entries");
+    assertEquals(
+      (l.entries as Array<Record<string, unknown>>).map((e) => e.name),
+      ["app-config"],
+      "entries sort by name",
+    );
+    assertEquals(find(fake.calls, "filesystem.listdir")!.params, [
+      "/mnt/Primary/backup",
+    ]);
+    assert(fake.isClosed(), "session must be closed");
+  } finally {
+    __setTruenasSession(null);
+  }
+});
+
+Deno.test("filesystem_list: an absent path is data (exists=false), not a failure", async () => {
+  const fake = makeFakeSession(() => {
+    throw new Error("[ENOENT] /mnt/Backup/apps/paperless does not exist");
+  });
+  __setTruenasSession(fake.factory);
+  try {
+    const { context, written } = makeContext();
+    await method("filesystem_list").execute(
+      { path: "/mnt/Backup/apps/paperless", maxEntries: 500 },
+      context,
+    );
+    const l = written[0].data;
+    assertEquals(l.exists, false);
+    assertEquals(l.entryCount, 0);
+    assert(/ENOENT/.test(String(l.error)), "records the listdir error");
+  } finally {
+    __setTruenasSession(null);
+  }
+});
+
+Deno.test("filesystem_list: a JSON-string path list is decoded (CLI --input form)", async () => {
+  const fake = makeFakeSession((m) => (m === "filesystem.listdir" ? [] : undefined));
+  __setTruenasSession(fake.factory);
+  try {
+    const { context, written } = makeContext();
+    await method("filesystem_list").execute(
+      { path: '["/mnt/Backup","/mnt/Backup/apps"]', maxEntries: 500 },
+      context,
+    );
+    assertEquals(written.length, 2, "the JSON blob must not become one path");
+    assertEquals(
+      fake.calls.map((c) => c.params[0]),
+      ["/mnt/Backup", "/mnt/Backup/apps"],
+    );
+  } finally {
+    __setTruenasSession(null);
+  }
+});
+
+Deno.test("app_storage: finds host paths wherever the app config puts them", async () => {
+  const fake = makeFakeSession((m) =>
+    m === "app.query" ? [{
+      name: "kopia",
+      config: {
+        storage: {
+          config: {
+            type: "host_path",
+            mount_path: "/app/config",
+            host_path_config: { path: "/mnt/Primary/apps/kopia" },
+          },
+          additional_storage: [
+            {
+              type: "host_path",
+              mount_path: "/data/backup",
+              read_only: true,
+              host_path_config: { path: "/mnt/Backup" },
+            },
+          ],
+        },
+        // A non-host_path entry must not be collected.
+        cache: { type: "ix_volume", mount_path: "/app/cache" },
+      },
+    }] : undefined
+  );
+  __setTruenasSession(fake.factory);
+  try {
+    const { context, written } = makeContext();
+    await method("app_storage").execute({ app: "kopia" }, context);
+    assertEquals(written[0].specName, "app-storage");
+    assertEquals(
+      written[0].name,
+      "kopia-storage",
+      "a bare app name would clobber app_list's `app` instance",
+    );
+    assertEquals(written[0].data.mountCount, 2, "ix_volume is not a host path");
+    const mounts = written[0].data.mounts as Array<Record<string, unknown>>;
+    assertEquals(mounts.map((m) => m.mountPath), ["/app/config", "/data/backup"]);
+    assertEquals(mounts[1].hostPath, "/mnt/Backup");
+    assertEquals(mounts[1].readOnly, true);
+    assertEquals(mounts[1].configPath, "storage.additional_storage[0]");
+    assertEquals(find(fake.calls, "app.query")!.params[0], [[
+      "name",
+      "=",
+      "kopia",
+    ]]);
+  } finally {
+    __setTruenasSession(null);
+  }
+});
+
+Deno.test("app_storage: unknown app is an error, not an empty result", async () => {
+  const fake = makeFakeSession((m) => (m === "app.query" ? [] : undefined));
+  __setTruenasSession(fake.factory);
+  try {
+    const { context } = makeContext();
+    await rejects(
+      () => method("app_storage").execute({ app: "nope" }, context),
+      /not found/,
+    );
+  } finally {
+    __setTruenasSession(null);
+  }
+});
+
+Deno.test("replication_list: instance names are PREFIXED (no nfs/smb id collision)", async () => {
+  const fake = makeFakeSession((m) =>
+    m === "replication.query" ? [{
+      id: 3,
+      name: "Apps - Backup",
+      direction: "PUSH",
+      transport: "LOCAL",
+      enabled: true,
+      auto: true,
+      recursive: true,
+      source_datasets: ["Primary/apps"],
+      target_dataset: "Backup/apps",
+      readonly: "SET",
+      properties: true,
+      state: { state: "FINISHED", datetime: { $date: 1785585769000 } },
+    }] : undefined
+  );
+  __setTruenasSession(fake.factory);
+  try {
+    const { context, written } = makeContext();
+    await method("replication_list").execute({}, context);
+    assertEquals(written[0].specName, "replication-task");
+    assertEquals(written[0].name, "repl-3", "a bare id would clobber nfs-share 3");
+    const t = written[0].data;
+    assertEquals(t.recursive, true);
+    assertEquals(t.sendsProperties, true);
+    assertEquals(t.readonlyPolicy, "SET");
+    assertEquals(t.lastRunAt, "2026-08-01T12:02:49.000Z", "{$date} → ISO");
+  } finally {
+    __setTruenasSession(null);
+  }
+});
+
+Deno.test("filesystem_list: a LIST of paths fans out over one session", async () => {
+  const fake = makeFakeSession((m, p) => {
+    if (m !== "filesystem.listdir") return undefined;
+    if (p[0] === "/mnt/Backup/apps") {
+      return [{ name: "paperless", type: "DIRECTORY", is_mountpoint: true }];
+    }
+    throw new Error("[ENOENT] does not exist");
+  });
+  __setTruenasSession(fake.factory);
+  try {
+    const { context, written } = makeContext();
+    await method("filesystem_list").execute(
+      { path: ["/mnt/Backup/apps", "/mnt/Backup/nope"], maxEntries: 500 },
+      context,
+    );
+    assertEquals(written.length, 2, "one dir-listing per path");
+    assertEquals(written.map((w) => w.name), [
+      "mnt-Backup-apps",
+      "mnt-Backup-nope",
+    ]);
+    assertEquals(written[0].data.exists, true);
+    assertEquals(written[1].data.exists, false, "ENOENT doesn't abort the fan-out");
+    assertEquals(
+      fake.calls.filter((c) => c.method === "filesystem.listdir").length,
+      2,
+    );
+  } finally {
+    __setTruenasSession(null);
+  }
+});
+
+Deno.test("filesystem_list: a NON-ENOENT error still fails loudly", async () => {
+  const fake = makeFakeSession(() => {
+    throw new Error("[EACCES] permission denied");
+  });
+  __setTruenasSession(fake.factory);
+  try {
+    const { context } = makeContext();
+    await rejects(
+      () =>
+        method("filesystem_list").execute(
+          { path: "/mnt/Backup", maxEntries: 500 },
+          context,
+        ),
+      /EACCES/,
+    );
+  } finally {
+    __setTruenasSession(null);
+  }
+});
+
 // ─────────────────────────── exposure_audit ───────────────────────────
 
 Deno.test("exposure_audit: flags plaintext LDAP + 0.0.0.0 ports + unrestricted shares", async () => {

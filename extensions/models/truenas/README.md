@@ -72,6 +72,9 @@ After that the `wss://` handshake validates normally and `insecureSkipTlsVerify`
 | `smb_share_list` | SMB shares with `hostsallow`/`hostsdeny`; flags `unrestricted`. |
 | `service_list` | System services (state + boot-enable). |
 | `network_info` | Bindable host IPs (the app port-bind selector contents), interfaces, GUI bind addresses. |
+| `filesystem_list` | Directory entries (`filesystem.listdir`) with type/size and a mountpoint flag (= a child dataset). Takes one path or a JSON list (fan-out: one session per run). An absent path records `exists=false` rather than failing — the check for "has this backup/app source path gone missing?". |
+| `app_storage` | An app's host-path binds — container mount path ← NAS path, and where each sits in the app config. Shows whether an app mounts one parent directory or each source individually. |
+| `replication_list` | Replication tasks: source/target datasets, `recursive`, schedule, destination readonly policy, whether dataset **properties** are sent, and last-run state. Read-only — never runs or edits a task. Answers "what writes into this destination dataset, and when?" — a receive remounts the destination, which invalidates any container bind-mount of it. |
 | `exposure_audit` | One roll-up: published ports across all apps, ports on `0.0.0.0`, unrestricted NFS/SMB shares, a plaintext-LDAP flag, and the non-wildcard bindable IPs. The R28 data source. |
 
 ### Mutate (verify-first, reversible)
@@ -87,6 +90,15 @@ After that the `wss://` handshake validates normally and `insecureSkipTlsVerify`
 # Audit exposure (read-only)
 swamp model method run nas exposure_audit
 swamp data get nas exposure-audit --json | jq '.content.flags'
+
+# Does a backup source path still exist? (read-only; one path or a JSON list)
+swamp model method run nas filesystem_list --input path=/mnt/Backup
+swamp model method run nas filesystem_list --input path='["/mnt/Backup","/mnt/Backup/apps"]'
+swamp data get nas mnt-Backup --json | jq '.content | {exists, entries: [.entries[].name]}'
+
+# What replicates into a destination dataset, and how? (read-only)
+swamp model method run nas replication_list
+swamp data query nas 'attributes.targetDataset.startsWith("Backup/")'
 
 # Close lldap's plaintext LDAP + LDAPS (no consumers) — container-internal only
 swamp model method run nas app_set_port_bind --input app=lldap --input portKey=ldap_port  --input bindMode=exposed
