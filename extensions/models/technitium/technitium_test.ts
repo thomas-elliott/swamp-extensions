@@ -446,6 +446,41 @@ Deno.test("zone_create posts zone+type and writes a created zone", async () => {
   }
 });
 
+Deno.test("zone_create joins a catalog zone when catalog is given", async () => {
+  const calls: Call[] = [];
+  scriptTransport(calls, () => ({}));
+  try {
+    const { context, written } = makeContext();
+    await method("zone_create").execute({
+      zone: "40.168.192.in-addr.arpa",
+      type: "Primary",
+      catalog: "cluster-catalog.smol.internal",
+    }, context);
+    assertEquals(calls[0].params, {
+      zone: "40.168.192.in-addr.arpa",
+      type: "Primary",
+      catalog: "cluster-catalog.smol.internal",
+    });
+    assertEquals(written[0].data.catalog, "cluster-catalog.smol.internal");
+  } finally {
+    __setTechnitiumTransport(null);
+  }
+});
+
+Deno.test("zone_list surfaces catalog membership", async () => {
+  const calls: Call[] = [];
+  scriptTransport(calls, () => ({
+    zones: [{ name: "a.com", type: "Primary", catalog: "cat.example.com" }],
+  }));
+  try {
+    const { context, written } = makeContext();
+    await method("zone_list").execute({}, context);
+    assertEquals(written[0].data.catalog, "cat.example.com");
+  } finally {
+    __setTechnitiumTransport(null);
+  }
+});
+
 Deno.test("zone_list is a factory with unique slugged instance names", async () => {
   const calls: Call[] = [];
   scriptTransport(calls, () => ({
