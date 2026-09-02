@@ -72,7 +72,10 @@ swamp model method run dns-home cache_flush
   `blocking_set_state` (enable/disable), `blocking_temporary_disable`,
   `blocking_set_lists` (block/allow list URLs), `blocking_force_update_lists`.
 - **`zone_*`** — `zone_list`, `zone_create`, `zone_delete`, `zone_enable`,
-  `zone_disable`.
+  `zone_disable`. `zone_create` takes an optional `catalog` — the name of an
+  existing catalog zone to join, so secondaries provision the new zone
+  automatically instead of it living only on the primary. Valid for Primary,
+  Secondary, Stub and Forwarder zones; `zone_list` reports membership.
 - **`record_*`** — `record_list`, `record_get`, `record_add`, `record_update`,
   `record_delete`. Type-specific fields go in `rData` (e.g. `{ipAddress}` for A,
   `{cname}` for CNAME, `{exchange, preference}` for MX). Updates carry the new

@@ -67,6 +67,9 @@ const ZoneResource = z.object({
   disabled: z.boolean().optional(),
   internal: z.boolean().optional(),
   dnssecStatus: z.string().optional(),
+  catalog: z.string().optional().describe(
+    "Name of the catalog zone this zone is a member of, if any",
+  ),
   action: Action,
   observedAt: z.string(),
 });
@@ -857,6 +860,11 @@ const DnssecValidationSetArgs = z.object({
 const ZoneCreateArgs = z.object({
   zone: z.string().describe("Zone name, e.g. lab.example.com"),
   type: ZoneType.default("Primary"),
+  catalog: z.string().optional().describe(
+    "Name of an existing catalog zone to join as a member zone, so secondaries " +
+      "provision it automatically. Valid only for Primary, Secondary, Stub and " +
+      "Forwarder zones.",
+  ),
 });
 
 const RecordAddArgs = z.object({
@@ -958,7 +966,7 @@ const SettingsRestoreArgs = z.object({
 /** The `@thomas/technitium` swamp model: schema, methods, and lifecycle for managing a Technitium DNS server. */
 export const model = {
   type: "@thomas/technitium",
-  version: "2026.06.24.1",
+  version: "2026.09.01.1",
   globalArguments: GlobalArgs,
   checks: {
     "reachable": {
@@ -1311,6 +1319,7 @@ export const model = {
               disabled: pick(z, "disabled") as boolean | undefined,
               internal: pick(z, "internal") as boolean | undefined,
               dnssecStatus: asString(pick(z, "dnssecStatus")),
+              catalog: asString(pick(z, "catalog")),
               action: "observed",
               observedAt,
             }),
@@ -1329,10 +1338,15 @@ export const model = {
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const g: GlobalArgsT = context.globalArgs;
-        logInfo(context, "Creating zone", { zone: args.zone, type: args.type });
+        logInfo(context, "Creating zone", {
+          zone: args.zone,
+          type: args.type,
+          catalog: args.catalog,
+        });
         await apiCall(g, "POST", "/zones/create", {
           zone: args.zone,
           type: args.type,
+          ...(args.catalog ? { catalog: args.catalog } : {}),
         });
         const handle = await context.writeResource(
           "zone",
@@ -1340,6 +1354,7 @@ export const model = {
           {
             name: args.zone,
             type: args.type,
+            catalog: args.catalog,
             disabled: false,
             action: "created",
             observedAt: new Date().toISOString(),
