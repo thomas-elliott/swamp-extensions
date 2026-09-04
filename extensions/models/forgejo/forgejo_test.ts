@@ -1463,3 +1463,275 @@ Deno.test("branch_protection_list writes one resource per rule", async () => {
     __setCaller(null);
   }
 });
+
+// ─────────────────────────── webhooks ───────────────────────────
+
+const FUNNEL = "https://duna.ghost-eagle.ts.net:8443/api/hook";
+const INCLUSTER =
+  "http://woodpecker-server.woodpecker.svc.cluster.local/api/hook";
+
+function hookObj(over: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    id: 3,
+    type: "forgejo",
+    active: true,
+    events: ["push", "pull_request"],
+    created_at: "2026-06-19T00:00:00Z",
+    updated_at: "2026-06-19T00:00:00Z",
+    // The real API never returns `secret`; include it here precisely so the
+    // tests can prove we drop it even if a future version starts to.
+    config: { url: FUNNEL, content_type: "json", secret: "s3cr3t" },
+    ...over,
+  };
+}
+
+Deno.test("webhook_audit flags drift against expectedUrl", async () => {
+  const { caller } = makeFakeApi((c) => {
+    if (c.path.startsWith("/api/v1/repos/search")) {
+      return c.path.includes("page=1")
+        ? [
+          repoObj({
+            full_name: "telliott/scrappy",
+            owner: { login: "telliott" },
+            name: "scrappy",
+          }),
+        ]
+        : [];
+    }
+    if (c.path.endsWith("/hooks")) {
+      return [hookObj(), hookObj({ id: 4, config: { url: INCLUSTER } })];
+    }
+    return undefined;
+  });
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("webhook_audit").execute({ expectedUrl: INCLUSTER }, context);
+    assertEquals(written.length, 2);
+    assertEquals(
+      written[0].data.matchesExpected,
+      false,
+      "stale funnel hook is drift",
+    );
+    assertEquals(
+      written[1].data.matchesExpected,
+      true,
+      "in-cluster hook matches",
+    );
+    assertEquals(written[0].name, "telliott:scrappy:3");
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("webhook_audit omits matchesExpected when no expectation given", async () => {
+  const { caller } = makeFakeApi((c) => {
+    if (c.path.startsWith("/api/v1/repos/search")) {
+      return c.path.includes("page=1") ? [repoObj()] : [];
+    }
+    if (c.path.endsWith("/hooks")) return [hookObj()];
+    return undefined;
+  });
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("webhook_audit").execute({}, context);
+    // Held as `undefined`, per the file's convention for optional fields. What
+    // matters is that it does not persist as a misleading `false` — an audit
+    // that reports drift when none was asked about is worse than silent.
+    const persisted = JSON.parse(JSON.stringify(written[0].data));
+    assert(!("matchesExpected" in persisted), "should be absent, not false");
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("webhook_audit never emits the secret", async () => {
+  const { caller } = makeFakeApi((c) => {
+    if (c.path.startsWith("/api/v1/repos/search")) {
+      return c.path.includes("page=1") ? [repoObj()] : [];
+    }
+    if (c.path.endsWith("/hooks")) return [hookObj()];
+    return undefined;
+  });
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("webhook_audit").execute({}, context);
+    assert(
+      !JSON.stringify(written[0].data).includes("s3cr3t"),
+      "webhook secret leaked into the data model",
+    );
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("webhook_audit skips a repo whose hooks it may not read", async () => {
+  const { caller } = makeFakeApi((c) => {
+    if (c.path.startsWith("/api/v1/repos/search")) {
+      return c.path.includes("page=1")
+        ? [
+          repoObj({ full_name: "a/one", owner: { login: "a" }, name: "one" }),
+          repoObj({ full_name: "b/two", owner: { login: "b" }, name: "two" }),
+        ]
+        : [];
+    }
+    if (c.path === "/api/v1/repos/a/one/hooks") {
+      return { status: 403, body: { message: "forbidden" } };
+    }
+    if (c.path === "/api/v1/repos/b/two/hooks") return [hookObj()];
+    return undefined;
+  });
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("webhook_audit").execute({}, context);
+    assertEquals(written.length, 1, "the readable repo still audits");
+    assertEquals(written[0].data.repo, "b/two");
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("webhook_audit rejects name without owner", async () => {
+  const { caller } = makeFakeApi(() => undefined);
+  __setCaller(caller);
+  try {
+    const { context } = makeContext();
+    await rejects(
+      () => method("webhook_audit").execute({ name: "scrappy" }, context),
+      /requires `owner`/,
+    );
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("webhook_retarget patches only config.url, preserving the secret", async () => {
+  const { caller, calls } = makeFakeApi((c) => {
+    if (c.method === "GET" && c.path.endsWith("/hooks")) return [hookObj()];
+    if (c.method === "PATCH") return hookObj({ config: { url: INCLUSTER } });
+    return undefined;
+  });
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("webhook_retarget").execute(
+      { owner: "telliott", name: "scrappy", url: INCLUSTER },
+      context,
+    );
+    const patch = calls.find((c) => c.method === "PATCH");
+    assertEquals(patch?.path, "/api/v1/repos/telliott/scrappy/hooks/3");
+    assertEquals(patch?.body, { config: { url: INCLUSTER } });
+    assert(
+      !JSON.stringify(patch?.body).includes("secret"),
+      "must not send a secret key — that could clear the stored one",
+    );
+    assertEquals(written[0].data.action, "updated");
+    assertEquals(written[0].data.url, INCLUSTER);
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("webhook_retarget is a no-op when already correct", async () => {
+  const { caller, calls } = makeFakeApi((c) => {
+    if (c.method === "GET" && c.path.endsWith("/hooks")) {
+      return [hookObj({ config: { url: INCLUSTER } })];
+    }
+    return undefined;
+  });
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("webhook_retarget").execute(
+      { owner: "telliott", name: "scrappy", url: INCLUSTER },
+      context,
+    );
+    assertEquals(calls.filter((c) => c.method === "PATCH").length, 0);
+    assertEquals(written[0].data.action, "unchanged");
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("webhook_retarget refuses to guess between several hooks", async () => {
+  const { caller } = makeFakeApi((c) => {
+    if (c.method === "GET" && c.path.endsWith("/hooks")) {
+      return [
+        hookObj(),
+        hookObj({ id: 4, config: { url: "https://other.example/hook" } }),
+      ];
+    }
+    return undefined;
+  });
+  __setCaller(caller);
+  try {
+    const { context } = makeContext();
+    await rejects(
+      () =>
+        method("webhook_retarget").execute(
+          { owner: "telliott", name: "scrappy", url: INCLUSTER },
+          context,
+        ),
+      /refusing to guess/,
+    );
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("webhook_retarget picks the one hook matchUrl identifies", async () => {
+  const { caller, calls } = makeFakeApi((c) => {
+    if (c.method === "GET" && c.path.endsWith("/hooks")) {
+      return [
+        hookObj(),
+        hookObj({ id: 4, config: { url: "https://other.example/hook" } }),
+      ];
+    }
+    if (c.method === "PATCH") return hookObj({ config: { url: INCLUSTER } });
+    return undefined;
+  });
+  __setCaller(caller);
+  try {
+    const { context } = makeContext();
+    await method("webhook_retarget").execute(
+      {
+        owner: "telliott",
+        name: "scrappy",
+        url: INCLUSTER,
+        matchUrl: "ghost-eagle.ts.net",
+      },
+      context,
+    );
+    assertEquals(
+      calls.find((c) => c.method === "PATCH")?.path,
+      "/api/v1/repos/telliott/scrappy/hooks/3",
+    );
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("webhook_retarget never creates a hook when none exists", async () => {
+  const { caller, calls } = makeFakeApi((c) => {
+    if (c.method === "GET" && c.path.endsWith("/hooks")) return [];
+    return undefined;
+  });
+  __setCaller(caller);
+  try {
+    const { context } = makeContext();
+    await rejects(
+      () =>
+        method("webhook_retarget").execute(
+          { owner: "telliott", name: "scrappy", url: INCLUSTER },
+          context,
+        ),
+      /does not create one/,
+    );
+    assertEquals(calls.filter((c) => c.method === "POST").length, 0);
+  } finally {
+    __setCaller(null);
+  }
+});
