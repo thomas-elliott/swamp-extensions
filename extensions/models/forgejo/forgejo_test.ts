@@ -1467,6 +1467,9 @@ Deno.test("branch_protection_list writes one resource per rule", async () => {
 // ─────────────────────────── webhooks ───────────────────────────
 
 const FUNNEL = "https://duna.ghost-eagle.ts.net:8443/api/hook";
+// Woodpecker appends a per-repo JWT to the hook URL; the fixtures carry one
+// so the tests exercise the real shape rather than a tidied-up one.
+const TOKEN = "eyJhbGciOiJIUzI1NiJ9.eyJ0eXBlIjoiaG9vayJ9.sig";
 const INCLUSTER =
   "http://woodpecker-server.woodpecker.svc.cluster.local/api/hook";
 
@@ -1731,6 +1734,148 @@ Deno.test("webhook_retarget never creates a hook when none exists", async () => 
       /does not create one/,
     );
     assertEquals(calls.filter((c) => c.method === "POST").length, 0);
+  } finally {
+    __setCaller(null);
+  }
+});
+
+// The query string on a CI hook URL is a credential, not metadata. These pin
+// both halves of that: it must never be emitted, and it must never be lost.
+
+Deno.test("webhook_audit redacts the access token from the URL", async () => {
+  const { caller } = makeFakeApi((c) => {
+    if (c.path.startsWith("/api/v1/repos/search")) {
+      return c.path.includes("page=1") ? [repoObj()] : [];
+    }
+    if (c.path.endsWith("/hooks")) {
+      return [
+        hookObj({ config: { url: `${INCLUSTER}?access_token=${TOKEN}` } }),
+      ];
+    }
+    return undefined;
+  });
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("webhook_audit").execute({}, context);
+    const blob = JSON.stringify(written[0].data);
+    assert(
+      !blob.includes(TOKEN),
+      "hook access token leaked into the data model",
+    );
+    assertEquals(written[0].data.url, `${INCLUSTER}?access_token=REDACTED`);
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("webhook_audit matches on the target, ignoring the token query", async () => {
+  const { caller } = makeFakeApi((c) => {
+    if (c.path.startsWith("/api/v1/repos/search")) {
+      return c.path.includes("page=1") ? [repoObj()] : [];
+    }
+    if (c.path.endsWith("/hooks")) {
+      return [
+        hookObj({ config: { url: `${INCLUSTER}?access_token=${TOKEN}` } }),
+        hookObj({ id: 4, config: { url: `${FUNNEL}?access_token=${TOKEN}` } }),
+      ];
+    }
+    return undefined;
+  });
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("webhook_audit").execute({ expectedUrl: INCLUSTER }, context);
+    assertEquals(
+      written[0].data.matchesExpected,
+      true,
+      "a correct hook must not read as drift merely for carrying its token",
+    );
+    assertEquals(written[1].data.matchesExpected, false);
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("webhook_retarget carries the access token over to the new host", async () => {
+  const { caller, calls } = makeFakeApi((c) => {
+    if (c.method === "GET" && c.path.endsWith("/hooks")) {
+      return [hookObj({ config: { url: `${FUNNEL}?access_token=${TOKEN}` } })];
+    }
+    if (c.method === "PATCH") return hookObj();
+    return undefined;
+  });
+  __setCaller(caller);
+  try {
+    const { context } = makeContext();
+    await method("webhook_retarget").execute(
+      { owner: "telliott", name: "scrappy", url: INCLUSTER },
+      context,
+    );
+    const body = calls.find((c) => c.method === "PATCH")?.body as
+      | { config: { url: string } }
+      | undefined;
+    assertEquals(
+      body?.config.url,
+      `${INCLUSTER}?access_token=${TOKEN}`,
+      "dropping the token would de-authenticate a hook that still fires",
+    );
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("webhook_retarget is a no-op when only the token differs", async () => {
+  const { caller, calls } = makeFakeApi((c) => {
+    if (c.method === "GET" && c.path.endsWith("/hooks")) {
+      return [
+        hookObj({ config: { url: `${INCLUSTER}?access_token=${TOKEN}` } }),
+      ];
+    }
+    return undefined;
+  });
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("webhook_retarget").execute(
+      { owner: "telliott", name: "scrappy", url: INCLUSTER },
+      context,
+    );
+    assertEquals(calls.filter((c) => c.method === "PATCH").length, 0);
+    assertEquals(written[0].data.action, "unchanged");
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("webhook_retarget error messages never show the token", async () => {
+  const { caller } = makeFakeApi((c) => {
+    if (c.method === "GET" && c.path.endsWith("/hooks")) {
+      return [
+        hookObj({ config: { url: `${FUNNEL}?access_token=${TOKEN}` } }),
+        hookObj({
+          id: 4,
+          config: { url: `${INCLUSTER}?access_token=${TOKEN}` },
+        }),
+      ];
+    }
+    return undefined;
+  });
+  __setCaller(caller);
+  try {
+    const { context } = makeContext();
+    let msg = "";
+    try {
+      await method("webhook_retarget").execute(
+        { owner: "telliott", name: "scrappy", url: INCLUSTER },
+        context,
+      );
+    } catch (e) {
+      msg = (e as Error).message;
+    }
+    assert(/refusing to guess/.test(msg), `unexpected message: ${msg}`);
+    assert(!msg.includes(TOKEN), "token leaked into an error message");
+    assert(msg.includes("REDACTED"), "should show the redacted form");
   } finally {
     __setCaller(null);
   }
