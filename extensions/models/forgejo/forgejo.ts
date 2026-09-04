@@ -253,9 +253,12 @@ const WebhookInfo = z.object({
   id: z.number().describe("Hook id, unique within the repo."),
   type: z.string().describe("Hook driver: gitea | forgejo | slack | ..."),
   url: z.string().describe(
-    "The target the hook POSTs to. NB this is the field that silently rots — " +
-      "a CI server whose address changed leaves every repo pointing at the " +
-      "old one, and a hook that cannot be delivered fails quietly.",
+    "The target the hook POSTs to, with every query-string VALUE redacted. " +
+      "This is the field that silently rots — a CI server whose address " +
+      "changed leaves every repo pointing at the old one, and a hook that " +
+      "cannot be delivered fails quietly. Redacted because the query string " +
+      "is credential-bearing: Woodpecker authenticates its hooks with an " +
+      "`?access_token=<JWT>` on the URL itself, so the raw URL is a secret.",
   ),
   contentType: z.string().optional().describe("json | form."),
   events: z.array(z.string()).describe("Event names that trigger the hook."),
@@ -441,6 +444,35 @@ function hooksPath(owner: string, name: string): string {
 }
 
 /**
+ * A webhook URL split into the part that identifies the target and the part
+ * that must never be shown.
+ *
+ * Proven against Woodpecker (2026-09-04): it registers its hooks as
+ * `<host>/api/hook?access_token=<JWT>`, so the query string is a CREDENTIAL,
+ * not metadata. Two consequences, and both are easy to get wrong:
+ *   - `redacted` is the only form safe to store or print.
+ *   - `target` (scheme+host+path, no query) is the only sound thing to compare
+ *     an expected URL against; comparing raw URLs reports every hook as
+ *     drifted because no caller can supply the per-repo token.
+ */
+function splitHookUrl(raw: string): { target: string; redacted: string } {
+  let u: URL;
+  try {
+    u = new URL(raw);
+  } catch {
+    // Not parseable as absolute — nothing safe to split out, so treat the
+    // whole string as opaque rather than risk printing a token inside it.
+    return { target: raw, redacted: raw };
+  }
+  const target = `${u.origin}${u.pathname}`;
+  const keys = [...u.searchParams.keys()];
+  const redacted = keys.length === 0
+    ? target
+    : `${target}?${keys.map((k) => `${k}=REDACTED`).join("&")}`;
+  return { target, redacted };
+}
+
+/**
  * Items from a Forgejo list response: either a bare array (most endpoints) or
  * a `{ ok, data: [...] }` envelope (the search endpoints).
  */
@@ -533,20 +565,22 @@ function toWebhookInfo(
   action: z.infer<typeof Action>,
 ): z.infer<typeof WebhookInfo> {
   const config = (h.config ?? {}) as Json;
-  const url = String(config.url ?? "");
+  const { target, redacted } = splitHookUrl(String(config.url ?? ""));
   return {
     repo: repoFullName,
     id: Number(h.id ?? 0),
     type: String(h.type ?? ""),
-    url,
+    url: redacted,
     contentType: typeof config.content_type === "string"
       ? config.content_type
       : undefined,
     events: Array.isArray(h.events) ? h.events.map(String) : [],
     active: Boolean(h.active),
+    // Compared on the target only — see splitHookUrl. The caller cannot know
+    // the per-repo token, so an expectedUrl is always query-free.
     matchesExpected: expectedUrl === undefined
       ? undefined
-      : url === expectedUrl,
+      : target === splitHookUrl(expectedUrl).target,
     created: typeof h.created_at === "string" ? h.created_at : undefined,
     updated: typeof h.updated_at === "string" ? h.updated_at : undefined,
     action,
@@ -1101,7 +1135,7 @@ const PrMergeArgs = z.object({
  */
 export const model = {
   type: "@thomas/forgejo",
-  version: "2026.09.04.1",
+  version: "2026.09.04.2",
   globalArguments: GlobalArgs,
   checks: {
     "reachable": {
@@ -1463,9 +1497,11 @@ export const model = {
     // ───────────── idempotent provisioning ─────────────
     webhook_retarget: {
       description:
-        "Repoint an existing webhook at a new URL. CONVERGE-ONLY: it never " +
-        "creates a hook and never sends, reads, or clears the shared secret " +
-        "— only the URL is written. Idempotent; already-correct is a no-op.",
+        "Repoint an existing webhook at a new scheme/host/path. CONVERGE-ONLY: " +
+        "it never creates a hook, never sends or clears the stored secret, and " +
+        "carries the existing query string over verbatim (a CI hook's " +
+        "?access_token= is what authenticates it). Idempotent — " +
+        "already-correct is a no-op.",
       arguments: WebhookRetargetArgs,
       execute: async (
         rawArgs,
@@ -1489,41 +1525,53 @@ export const model = {
           );
         }
 
+        // Match on the TARGET, never the raw URL — the query string holds a
+        // per-repo token, so matching it would be both useless and unsafe.
+        const hookUrl = (h: Json) =>
+          String(((h.config ?? {}) as Json).url ?? "");
         const candidates = a.matchUrl
           ? hooks.filter((h) =>
-            String(((h.config ?? {}) as Json).url ?? "").includes(a.matchUrl!)
+            splitHookUrl(hookUrl(h)).target.includes(a.matchUrl!)
           )
           : hooks;
+        const listRedacted = (hs: Json[]) =>
+          hs.map((h) => `#${h.id} ${splitHookUrl(hookUrl(h)).redacted}`)
+            .join(", ");
         if (candidates.length === 0) {
           throw new Error(
             `${full}: no webhook whose URL contains ${a.matchUrl}. ` +
-              `Existing: ${
-                hooks.map((h) => String(((h.config ?? {}) as Json).url ?? ""))
-                  .join(", ")
-              }`,
+              `Existing: ${listRedacted(hooks)}`,
           );
         }
         if (candidates.length > 1) {
           throw new Error(
             `${full}: ${candidates.length} webhooks match — refusing to ` +
               `guess. Narrow it with matchUrl. Matched: ${
-                candidates.map((h) =>
-                  `#${h.id} ${String(((h.config ?? {}) as Json).url ?? "")}`
-                ).join(", ")
+                listRedacted(candidates)
               }`,
           );
         }
 
         const hook = candidates[0];
-        const current = String(((hook.config ?? {}) as Json).url ?? "");
+        const current = hookUrl(hook);
+        const currentTarget = splitHookUrl(current).target;
+        const wantTarget = splitHookUrl(a.url).target;
         let action: z.infer<typeof Action> = "unchanged";
         let updated = hook;
-        if (current !== a.url) {
+        if (currentTarget !== wantTarget) {
+          // CARRY THE QUERY STRING OVER VERBATIM. Woodpecker authenticates its
+          // hooks with an `?access_token=<JWT>` on the URL, so writing the
+          // caller's query-free URL would silently de-authenticate the hook —
+          // it would still fire, and every delivery would be rejected.
+          const query = current.includes("?")
+            ? current.slice(current.indexOf("?"))
+            : "";
           logInfo(context, "Retargeting webhook", {
             repo: full,
             hook: Number(hook.id),
-            from: current,
-            to: a.url,
+            from: currentTarget,
+            to: wantTarget,
+            carriedQuery: query !== "",
           });
           // `config` is a partial map: Forgejo applies only the keys present,
           // so omitting `secret` leaves the stored one intact. Sending the
@@ -1531,7 +1579,7 @@ export const model = {
           const r = await call(g, {
             method: "PATCH",
             path: `${hooksPath(a.owner, a.name)}/${Number(hook.id)}`,
-            body: { config: { url: a.url } },
+            body: { config: { url: `${wantTarget}${query}` } },
           });
           updated = r.body;
           action = "updated";

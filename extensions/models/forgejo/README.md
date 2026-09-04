@@ -32,11 +32,18 @@ exception (`pr_merge`):
   migration time; asking `mirror_ensure` for a different source on an existing
   mirror is an error, not a silent ignore. A name collision with a non-mirror
   repo is likewise refused.
-- ✅ **Webhooks are read and repointed, never created, and the secret is never
-  touched.** `webhook_audit` reports where every hook posts; `webhook_retarget`
+- ✅ **Webhooks are read and repointed, never created, and no credential is ever
+  emitted.** `webhook_audit` reports where every hook posts; `webhook_retarget`
   writes `config.url` alone. Neither sends a `secret` key — doing so would
   overwrite the shared secret the CI server relies on. Creating a hook is left
   to the CI server that owns that secret (Woodpecker: `repo_repair`).
+- ✅ **A hook URL's query string is treated as a credential.** Woodpecker
+  authenticates its hooks with an `?access_token=<JWT>` on the URL itself, so
+  the raw URL is a secret. Every reported `url` has its query **values
+  redacted**, including in error messages; `matchesExpected` compares
+  scheme/host/path only; and `webhook_retarget` **carries the existing query
+  over verbatim** — writing a query-free URL would leave a hook that still fires
+  but no longer authenticates.
 - ⚠️ **`pr_merge` is the one irreversible mutation** — it writes to the base
   branch. It refuses a PR that is closed, already merged, draft, or that the
   server does not report as mergeable, and refuses a head whose combined CI
@@ -182,6 +189,10 @@ swamp model method run forgejo webhook_retarget \
   --input matchUrl=old-ci.example \
   --input url=http://ci.internal.example/api/hook
 ```
+
+`expectedUrl` and `matchUrl` are matched against **scheme/host/path only**, so
+pass them query-free — you cannot know a hook's per-repo token, and comparing
+raw URLs would report every hook as drifted.
 
 A repo with several hooks needs `matchUrl` to say which one; an ambiguous match
 is **refused, not guessed**. A repo with no hooks is an error rather than a
