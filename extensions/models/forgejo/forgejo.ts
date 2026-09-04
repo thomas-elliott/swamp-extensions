@@ -44,16 +44,26 @@ import type {
  *
  * Method sections (by prefix):
  *   - read/audit: `health`, `org_list`, `repo_list`, `user_list`,
- *     `mirror_status`, `pr_list`, `pr_get`, `branch_protection_list`.
+ *     `mirror_status`, `pr_list`, `pr_get`, `branch_protection_list`,
+ *     `webhook_audit`.
  *   - idempotent provisioning: `org_ensure`, `repo_ensure`,
  *     `collaborator_ensure`, `branch_protection_ensure`, `mirror_ensure`,
- *     `mirror_sync_now`, `pr_ensure`.
+ *     `mirror_sync_now`, `pr_ensure`, `webhook_retarget`.
  *   - reversible lifecycle: `repo_archive`, `repo_unarchive`.
  *   - irreversible: `pr_merge`.
  *
  * Idempotency: every `*_ensure` probes by name first (404 ⇒ create, else
  * converge the supplied settings in place via PATCH) and reports an `action`
  * of created/updated/unchanged so a re-run is a no-op when nothing changed.
+ *
+ * WEBHOOKS are read and repointed, never created — which is why the retarget
+ * method is not named `*_ensure`. A CI webhook carries a shared secret only
+ * the CI server knows, so registering one belongs to that server (Woodpecker:
+ * `repo_repair`). What this model adds is the part the CI server cannot:
+ * telling you WHERE every hook currently points, so a stale target is visible
+ * instead of silently undelivered. `webhook_retarget` therefore writes
+ * `config.url` alone and never sends a `secret` key, which would overwrite
+ * the stored one.
  */
 
 // ─────────────────────────── global arguments ───────────────────────────
@@ -238,6 +248,28 @@ const PrInfo = z.object({
   timestamp: z.string(),
 });
 
+const WebhookInfo = z.object({
+  repo: z.string().describe("Owning repo full name, owner/name."),
+  id: z.number().describe("Hook id, unique within the repo."),
+  type: z.string().describe("Hook driver: gitea | forgejo | slack | ..."),
+  url: z.string().describe(
+    "The target the hook POSTs to. NB this is the field that silently rots — " +
+      "a CI server whose address changed leaves every repo pointing at the " +
+      "old one, and a hook that cannot be delivered fails quietly.",
+  ),
+  contentType: z.string().optional().describe("json | form."),
+  events: z.array(z.string()).describe("Event names that trigger the hook."),
+  active: z.boolean(),
+  matchesExpected: z.boolean().optional().describe(
+    "Only present when the caller supplied `expectedUrl`: true when this " +
+      "hook's URL equals it. False is the drift signal.",
+  ),
+  created: z.string().optional(),
+  updated: z.string().optional(),
+  action: Action,
+  timestamp: z.string(),
+});
+
 // ─────────────────────────── HTTP / auth seam ───────────────────────────
 
 /** A JSON-ish bag — structurally the resolved global args or an API body. */
@@ -404,6 +436,10 @@ function repoPath(owner: string, name: string): string {
   return `/api/v1/repos/${enc(owner)}/${enc(name)}`;
 }
 
+function hooksPath(owner: string, name: string): string {
+  return `${repoPath(owner, name)}/hooks`;
+}
+
 /**
  * Items from a Forgejo list response: either a bare array (most endpoints) or
  * a `{ ok, data: [...] }` envelope (the search endpoints).
@@ -478,6 +514,41 @@ function toRepoInfo(r: Json, action: z.infer<typeof Action>): z.infer<
       : undefined,
     htmlUrl: typeof r.html_url === "string" ? r.html_url : undefined,
     sizeKb: r.size != null ? Number(r.size) : undefined,
+    action,
+    timestamp: nowIso(),
+  };
+}
+
+/**
+ * Normalise a raw hook object into the {@link WebhookInfo} shape.
+ *
+ * The `secret` in `config` is deliberately dropped rather than mapped: Forgejo
+ * does not return it, and nothing here should ever put a webhook secret into
+ * the data model even if a future version starts to.
+ */
+function toWebhookInfo(
+  repoFullName: string,
+  h: Json,
+  expectedUrl: string | undefined,
+  action: z.infer<typeof Action>,
+): z.infer<typeof WebhookInfo> {
+  const config = (h.config ?? {}) as Json;
+  const url = String(config.url ?? "");
+  return {
+    repo: repoFullName,
+    id: Number(h.id ?? 0),
+    type: String(h.type ?? ""),
+    url,
+    contentType: typeof config.content_type === "string"
+      ? config.content_type
+      : undefined,
+    events: Array.isArray(h.events) ? h.events.map(String) : [],
+    active: Boolean(h.active),
+    matchesExpected: expectedUrl === undefined
+      ? undefined
+      : url === expectedUrl,
+    created: typeof h.created_at === "string" ? h.created_at : undefined,
+    updated: typeof h.updated_at === "string" ? h.updated_at : undefined,
     action,
     timestamp: nowIso(),
   };
@@ -816,6 +887,32 @@ const RepoListArgs = z.object({
   ),
 });
 
+const WebhookAuditArgs = z.object({
+  owner: z.string().optional().describe(
+    "Restrict to one org/user's repos. Omit to audit every repo the token " +
+      "can see.",
+  ),
+  name: z.string().optional().describe(
+    "Audit a single repository. Requires `owner`.",
+  ),
+  expectedUrl: z.string().optional().describe(
+    "The URL every hook is supposed to point at. Supplying it populates " +
+      "`matchesExpected`, turning the audit into a drift check.",
+  ),
+});
+
+const WebhookRetargetArgs = z.object({
+  owner: z.string().describe("Owning org or user login."),
+  name: z.string().describe("Repository name."),
+  url: z.string().describe("The URL the matched hook(s) should POST to."),
+  matchUrl: z.string().optional().describe(
+    "Substring identifying WHICH hook to repoint (matched against the " +
+      "current URL) — e.g. the old CI host. Omit only when the repo has " +
+      "exactly one hook; with several, an ambiguous match is refused rather " +
+      "than guessed.",
+  ),
+});
+
 const MirrorStatusArgs = z.object({
   staleFactor: z.coerce.number().default(2).describe(
     "A mirror is stale when its last sync is older than staleFactor × its " +
@@ -1004,7 +1101,7 @@ const PrMergeArgs = z.object({
  */
 export const model = {
   type: "@thomas/forgejo",
-  version: "2026.08.23.1",
+  version: "2026.09.04.1",
   globalArguments: GlobalArgs,
   checks: {
     "reachable": {
@@ -1088,6 +1185,14 @@ export const model = {
     "pull_request": {
       description: "A pull request: state, mergeability, and head CI status.",
       schema: PrInfo,
+      lifetime: "infinite",
+      garbageCollection: 50,
+    },
+    "webhook": {
+      description:
+        "A repository webhook: where it posts, what triggers it, whether it " +
+        "matches the expected target. Never the secret.",
+      schema: WebhookInfo,
       lifetime: "infinite",
       garbageCollection: 50,
     },
@@ -1284,7 +1389,166 @@ export const model = {
       },
     },
 
+    webhook_audit: {
+      description:
+        "List every repository's webhooks and where they point (factory). " +
+        "Supply expectedUrl to flag drift. Read-only; never reads the secret.",
+      arguments: WebhookAuditArgs,
+      execute: async (
+        rawArgs,
+        context,
+      ): Promise<{ dataHandles: DataHandle[] }> => {
+        const a = WebhookAuditArgs.parse(rawArgs);
+        const g = context.globalArgs;
+        if (a.name && !a.owner) {
+          throw new Error("`name` requires `owner` — pass both or neither.");
+        }
+
+        // One repo, one owner's repos, or everything the token can see.
+        let repos: Json[];
+        if (a.name && a.owner) {
+          const r = await getRepoOrNull(g, a.owner, a.name);
+          if (!r) throw new Error(`No such repo: ${a.owner}/${a.name}`);
+          repos = [r];
+        } else {
+          repos = await pageAll(
+            g,
+            a.owner
+              ? `/api/v1/repos/search?q=&uid=0&owner=${enc(a.owner)}`
+              : "/api/v1/repos/search?q=",
+          );
+          if (a.owner) {
+            // The search `owner` filter is a uid in some versions and ignored
+            // in others, so filter client-side too rather than trust it.
+            repos = repos.filter((r) =>
+              String(((r.owner ?? {}) as Json).login ?? "") === a.owner
+            );
+          }
+        }
+
+        logInfo(context, "Auditing webhooks", { repos: repos.length });
+        const handles: DataHandle[] = [];
+        for (const r of repos) {
+          const owner = String(((r.owner ?? {}) as Json).login ?? "");
+          const name = String(r.name ?? "");
+          const full = String(r.full_name ?? `${owner}/${name}`);
+          // A token without admin on a repo cannot list its hooks; that is a
+          // gap in the audit, not a failure of it — skip, having said so.
+          const res = await callTolerant(g, {
+            method: "GET",
+            path: hooksPath(owner, name),
+          }, [403, 404]);
+          if (res.status >= 400) {
+            logInfo(context, "Skipping repo: hooks not readable", {
+              repo: full,
+              status: res.status,
+            });
+            continue;
+          }
+          for (const h of listItems(res.body)) {
+            const info = toWebhookInfo(full, h, a.expectedUrl, "observed");
+            handles.push(
+              await context.writeResource(
+                "webhook",
+                safeName(`${full}:${info.id}`),
+                info,
+              ),
+            );
+          }
+        }
+        return { dataHandles: handles };
+      },
+    },
+
     // ───────────── idempotent provisioning ─────────────
+    webhook_retarget: {
+      description:
+        "Repoint an existing webhook at a new URL. CONVERGE-ONLY: it never " +
+        "creates a hook and never sends, reads, or clears the shared secret " +
+        "— only the URL is written. Idempotent; already-correct is a no-op.",
+      arguments: WebhookRetargetArgs,
+      execute: async (
+        rawArgs,
+        context,
+      ): Promise<{ dataHandles: DataHandle[] }> => {
+        const a = WebhookRetargetArgs.parse(rawArgs);
+        const g = context.globalArgs;
+        const full = `${a.owner}/${a.name}`;
+
+        const listed = await call(g, {
+          method: "GET",
+          path: hooksPath(a.owner, a.name),
+        });
+        const hooks = listItems(listed.body);
+        if (hooks.length === 0) {
+          throw new Error(
+            `${full} has no webhooks to retarget. This method deliberately ` +
+              `does not create one: a CI hook needs a shared secret that only ` +
+              `the CI server knows, so let the CI server register it (for ` +
+              `Woodpecker: repo_repair) instead of hand-building one here.`,
+          );
+        }
+
+        const candidates = a.matchUrl
+          ? hooks.filter((h) =>
+            String(((h.config ?? {}) as Json).url ?? "").includes(a.matchUrl!)
+          )
+          : hooks;
+        if (candidates.length === 0) {
+          throw new Error(
+            `${full}: no webhook whose URL contains ${a.matchUrl}. ` +
+              `Existing: ${
+                hooks.map((h) => String(((h.config ?? {}) as Json).url ?? ""))
+                  .join(", ")
+              }`,
+          );
+        }
+        if (candidates.length > 1) {
+          throw new Error(
+            `${full}: ${candidates.length} webhooks match — refusing to ` +
+              `guess. Narrow it with matchUrl. Matched: ${
+                candidates.map((h) =>
+                  `#${h.id} ${String(((h.config ?? {}) as Json).url ?? "")}`
+                ).join(", ")
+              }`,
+          );
+        }
+
+        const hook = candidates[0];
+        const current = String(((hook.config ?? {}) as Json).url ?? "");
+        let action: z.infer<typeof Action> = "unchanged";
+        let updated = hook;
+        if (current !== a.url) {
+          logInfo(context, "Retargeting webhook", {
+            repo: full,
+            hook: Number(hook.id),
+            from: current,
+            to: a.url,
+          });
+          // `config` is a partial map: Forgejo applies only the keys present,
+          // so omitting `secret` leaves the stored one intact. Sending the
+          // whole config back would risk clearing it.
+          const r = await call(g, {
+            method: "PATCH",
+            path: `${hooksPath(a.owner, a.name)}/${Number(hook.id)}`,
+            body: { config: { url: a.url } },
+          });
+          updated = r.body;
+          action = "updated";
+        }
+
+        return {
+          dataHandles: [
+            await context.writeResource(
+              "webhook",
+              safeName(`${full}:${Number(hook.id)}`),
+              toWebhookInfo(full, updated, a.url, action),
+            ),
+          ],
+        };
+      },
+    },
+
     org_ensure: {
       description:
         "Find-or-create an organization and converge its description/" +
