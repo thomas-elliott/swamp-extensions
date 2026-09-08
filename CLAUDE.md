@@ -124,4 +124,21 @@ These keep `swamp extension quality` at **14/14 (100%)** — proven on `@thomas/
    `@types/node` resolution warnings — only `<file>`-pointed errors matter) →
    `deno test` → `swamp extension fmt --check` → `swamp extension quality` (expect
    `allPassed: true`).
+5. **`swamp extension push` also wants an adversarial review** of the current code, keyed
+   to a content hash, or it refuses. `--dry-run --json` prints the fill-in skeleton and the
+   exact path to write it to. Review the change honestly against the 15 dimensions — a
+   rubber-stamped report is worse than none, because it looks like evidence.
+
+## Git
+
+**A publish is not finished until the source is committed and pushed.** `swamp extension
+push` puts a version in the registry that nothing can trace back, so committing the source
+that produced it belongs to the same act, not to a follow-up — the registry sitting ahead
+of `main` is the failure mode to avoid.
+
+That is also the extent of the standing permission here: **commit and push are
+pre-authorised only as part of a publish.** Any other change stays in the working tree
+until Thomas asks for it. History rewrites, force-push and branch deletion always warrant
+a heads-up. Bump the version in **both** the model's `version:` field and its
+`manifest.yaml` before pushing, so the commit and the registry name the same thing.
 
