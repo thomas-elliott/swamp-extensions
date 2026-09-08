@@ -49,8 +49,9 @@ Optional global arg: `httpTimeoutMs` (default 30000).
 ## Methods
 
 **Read / audit (never emit secret values):** `repo_list`, `repo_get`,
-`repo_available` (forge repos + whether each is enabled), `org_get`,
-`org_secret_list`, `repo_secret_list`, `pipeline_list`, `pipeline_last`.
+`forge_list` (the server's forges, flagging the token's own), `repo_available`
+(forge repos + whether each is enabled), `org_get`, `org_secret_list`,
+`repo_secret_list`, `pipeline_list`, `pipeline_last`.
 
 **Observability (the day-to-day surface):**
 
@@ -158,6 +159,18 @@ and a `timestamp`.
   all three.
 - A repo reference is a numeric id or `owner/name`. Enabling resolves the forge
   `forge_remote_id` by name from `/api/user/repos?all=true`.
+- **On a multi-forge server, onboarding is single-forge.** A Woodpecker user
+  record is bound to the forge it authenticated against, so `/api/user/*` — and
+  therefore `repo_available` and the activation half of `repo_enable` — only
+  ever sees that one forge. There is no argument that changes this; the token
+  *is* the forge selector. Point the model at a token minted while logged in to
+  the other forge (a second model instance is the tidiest way), or enable the
+  repo in the UI. `forge_list` shows which forges exist and which one the
+  current token belongs to, and `repo_enable` says so in its error rather than
+  leaving you with a bare "not found".
+  Everything downstream of onboarding — `repo_list`, `repo_get`, `repo_update`,
+  `repo_secret_*`, every `pipeline_*` — goes through the admin `/api/repos`
+  endpoints and already works across forges with one token.
 - **Method arguments go through `--input`** (a `key=value` pair or a JSON
   object), not `--arg`. `${{ vault.get(...) }}` references inside an `--input`
   value resolve server-side, so secret values never reach the command line.

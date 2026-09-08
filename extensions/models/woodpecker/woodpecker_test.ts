@@ -779,3 +779,115 @@ Deno.test("server_info: healthz 503 -> healthy:false, version surfaced", async (
     __setCaller(null);
   }
 });
+
+Deno.test("repo_enable: a cross-forge repo explains the forge binding", async () => {
+  // The blind spot this covers: /api/user/repos is scoped to the forge the
+  // token's user authenticated against, so a repo on the server's OTHER forge
+  // is absent from it and the bare symptom reads as "no such repo".
+  const { caller } = makeFakeApi((c) => {
+    if (c.path.startsWith("/api/repos/lookup/")) return undefined; // 404
+    if (c.path === "/api/user/repos?all=true") {
+      return {
+        status: 200,
+        body: ([{
+          full_name: "thomas-elliott/damson",
+          forge_remote_id: "586125582",
+          forge_id: 1,
+          active: false,
+        }] as unknown) as Record<string, unknown>,
+      };
+    }
+    if (c.path === "/api/user") return { login: "thomas-elliott", forge_id: 1 };
+    if (c.path === "/api/forges") {
+      return {
+        status: 200,
+        body: ([
+          { id: 1, type: "github", url: "https://github.com" },
+          { id: 2, type: "forgejo", url: "https://git.smol.cloud" },
+        ] as unknown) as Record<string, unknown>,
+      };
+    }
+    return undefined;
+  });
+  __setCaller(caller);
+  try {
+    const { context } = makeContext();
+    await rejects(
+      () => method("repo_enable").execute({ repo: "telliott/damson" }, context),
+      /bound to the forge it authenticated against.*thomas-elliott on forge 1 \(github/s,
+    );
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("repo_enable: a broken diagnostic never masks the real error", async () => {
+  // forgeBindingHint runs on the error path; if /api/user itself fails, the
+  // caller must still get the not-found error rather than the probe's.
+  const { caller } = makeFakeApi((c) => {
+    if (c.path === "/api/user/repos?all=true") {
+      return { status: 200, body: ([] as unknown) as Record<string, unknown> };
+    }
+    return undefined; // lookup 404s, and so does /api/user
+  });
+  __setCaller(caller);
+  try {
+    const { context } = makeContext();
+    await rejects(
+      () => method("repo_enable").execute({ repo: "telliott/damson" }, context),
+      /not found among forge repos the token can access\.$/,
+    );
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("forge_list: flags the token's own forge", async () => {
+  const { caller } = makeFakeApi((c) => {
+    if (c.path === "/api/user") return { login: "telliott", forge_id: 2 };
+    if (c.path === "/api/forges") {
+      return {
+        status: 200,
+        body: ([
+          { id: 1, type: "github", url: "https://github.com" },
+          { id: 2, type: "forgejo", url: "https://git.smol.cloud" },
+        ] as unknown) as Record<string, unknown>,
+      };
+    }
+    return undefined;
+  });
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("forge_list").execute({}, context);
+    assertEquals(written.map((w) => w.data.isTokenForge), [false, true]);
+    assertEquals(written[1].data.type, "forgejo");
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("repo_available: carries forge_id through to the resource", async () => {
+  const { caller } = makeFakeApi((c) => {
+    if (c.path === "/api/user/repos?all=true") {
+      return {
+        status: 200,
+        body: ([{
+          full_name: "telliott/damson",
+          forge_remote_id: "42",
+          forge_id: 2,
+          active: false,
+        }] as unknown) as Record<string, unknown>,
+      };
+    }
+    return undefined;
+  });
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("repo_available").execute({}, context);
+    assertEquals(written[0].data.forgeId, 2);
+  } finally {
+    __setCaller(null);
+  }
+});
