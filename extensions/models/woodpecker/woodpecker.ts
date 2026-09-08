@@ -29,8 +29,9 @@ import type {
  * the model beyond the global argument (resolved from a vault).
  *
  * Method sections (by prefix):
- *   - read/audit: `repo_list`, `repo_get`, `repo_available`, `org_get`,
- *     `org_secret_list`, `repo_secret_list`, `pipeline_list`, `pipeline_last`.
+ *   - read/audit: `repo_list`, `repo_get`, `forge_list`, `repo_available`,
+ *     `org_get`, `org_secret_list`, `repo_secret_list`, `pipeline_list`,
+ *     `pipeline_last`.
  *   - observability: `pipeline_steps`, `pipeline_logs`, `pipeline_wait`,
  *     `status_all` (fleet dashboard).
  *   - provision: `repo_enable`, `repo_update`, `repo_repair`,
@@ -116,7 +117,25 @@ const RepoInfo = z.object({
 const AvailableRepo = z.object({
   fullName: z.string(),
   forgeRemoteId: z.string().optional(),
+  forgeId: z.number().optional().describe(
+    "Which forge the repo is on. Always the token's own forge — see " +
+      "`repo_available`.",
+  ),
   active: z.boolean().describe("Already enabled on this Woodpecker server."),
+  action: Action,
+  timestamp: z.string(),
+});
+
+const ForgeInfo = z.object({
+  id: z.number(),
+  type: z.string().describe(
+    "Forge kind: github, gitlab, gitea, forgejo, bitbucket, …",
+  ),
+  url: z.string().optional(),
+  isTokenForge: z.boolean().describe(
+    "Whether the configured token's user authenticated against this forge — " +
+      "i.e. the one forge this model can enumerate and enable repos on.",
+  ),
   action: Action,
   timestamp: z.string(),
 });
@@ -501,6 +520,55 @@ async function findForgeRemoteId(
     }
   }
   return null;
+}
+
+/**
+ * The forge the configured token belongs to. A Woodpecker user record is bound
+ * to the forge it authenticated against, so this is the only forge the
+ * user-scoped endpoints (`/api/user/*`) will ever report on.
+ */
+async function tokenForge(
+  g: GlobalArgsT,
+): Promise<{ login: string; forgeId: number }> {
+  const r = await call(g, { method: "GET", path: "/api/user" });
+  return {
+    login: String(r.body.login ?? "?"),
+    forgeId: Number(r.body.forge_id ?? 0),
+  };
+}
+
+/** Every forge registered on the server (`GET /api/forges`). */
+async function listForges(g: GlobalArgsT): Promise<Json[]> {
+  const r = await call(g, { method: "GET", path: "/api/forges" });
+  return asArray(r.body);
+}
+
+/**
+ * Explain a `/api/user/*` miss in terms of the forge binding, because the bare
+ * symptom ("not found") reads as "no such repo" and sends you looking in the
+ * wrong place. Never throws: this runs on an error path, and a diagnostic that
+ * fails must not replace the error it was meant to describe.
+ */
+async function forgeBindingHint(g: GlobalArgsT): Promise<string> {
+  try {
+    const me = await tokenForge(g);
+    let who = `this token is ${me.login} on forge ${me.forgeId}`;
+    try {
+      const f = listForges(g);
+      const mine = (await f).find((x) => Number(x.id) === me.forgeId);
+      if (mine) {
+        who += ` (${String(mine.type ?? "?")}, ${String(mine.url ?? "?")})`;
+      }
+    } catch { /* forge listing is a nicety, not the point */ }
+    return ` A Woodpecker user is bound to the forge it authenticated against,` +
+      ` so /api/user/repos only ever lists that one (${who}). To onboard a repo` +
+      ` on a different forge, enable it in the UI, or point this model at a` +
+      ` token minted while logged in to that forge. Everything after onboarding` +
+      ` (repo_update, repo_secret_*, pipeline_*) addresses a repo by its` +
+      ` Woodpecker id and already works across forges.`;
+  } catch {
+    return "";
+  }
 }
 
 /**
@@ -977,7 +1045,7 @@ const CronDeleteArgs = z.object({
  */
 export const model = {
   type: "@thomas/woodpecker",
-  version: "2026.06.04.1",
+  version: "2026.09.08.1",
   globalArguments: GlobalArgs,
   checks: {
     "reachable": {
@@ -1020,6 +1088,12 @@ export const model = {
     "available-repo": {
       description: "A forge repo the token can access (enabled or not).",
       schema: AvailableRepo,
+      lifetime: "infinite",
+      garbageCollection: 10,
+    },
+    "forge": {
+      description: "A forge registered on the server.",
+      schema: ForgeInfo,
       lifetime: "infinite",
       garbageCollection: 10,
     },
@@ -1130,10 +1204,44 @@ export const model = {
         return { dataHandles: [handle] };
       },
     },
+    forge_list: {
+      description:
+        "List the forges registered on the server, flagging the one the " +
+        "configured token belongs to (factory). Read-only.",
+      arguments: Empty,
+      execute: async (
+        _rawArgs,
+        context,
+      ): Promise<{ dataHandles: DataHandle[] }> => {
+        const g = context.globalArgs;
+        logInfo(context, "Listing forges");
+        const me = await tokenForge(g);
+        const ts = nowIso();
+        const handles: DataHandle[] = [];
+        for (const forge of await listForges(g)) {
+          const id = Number(forge.id);
+          handles.push(
+            await context.writeResource("forge", String(id), {
+              id,
+              type: String(forge.type ?? "?"),
+              url: forge.url != null ? String(forge.url) : undefined,
+              isTokenForge: id === me.forgeId,
+              action: "observed",
+              timestamp: ts,
+            }),
+          );
+        }
+        return { dataHandles: handles };
+      },
+    },
     repo_available: {
       description:
-        "List repos the token can access on the forge, with whether each is " +
-        "already enabled (factory). Read-only.",
+        "List repos on the token's own forge, with whether each is already " +
+        "enabled (factory). SINGLE-FORGE: a Woodpecker user is bound to the " +
+        "forge it authenticated against, so on a multi-forge server this " +
+        "never sees the other forges' repos and there is no argument that " +
+        "would make it — use a token minted on that forge. `forge_list` " +
+        "shows which one this is. Read-only.",
       arguments: RepoAvailableArgs,
       execute: async (
         rawArgs,
@@ -1157,6 +1265,9 @@ export const model = {
               fullName: full,
               forgeRemoteId: repo.forge_remote_id != null
                 ? String(repo.forge_remote_id)
+                : undefined,
+              forgeId: repo.forge_id != null
+                ? Number(repo.forge_id)
                 : undefined,
               active: Boolean(repo.active),
               action: "observed",
@@ -1472,7 +1583,9 @@ export const model = {
       description:
         "Onboard a repo: activate it from the forge if needed, then converge " +
         "the supplied settings (trusted/timeout/visibility/…). Idempotent — a " +
-        "re-run with the same settings is a no-op.",
+        "re-run with the same settings is a no-op. ACTIVATION is limited to " +
+        "the token's own forge (see `repo_available`); converging an " +
+        "already-enabled repo works on any forge.",
       arguments: RepoEnableArgs,
       execute: async (
         rawArgs,
@@ -1501,7 +1614,7 @@ export const model = {
               `repo ${
                 JSON.stringify(a.repo)
               } not found among forge repos the ` +
-                `token can access`,
+                `token can access.${await forgeBindingHint(g)}`,
             );
           }
           logInfo(context, "Enabling repo", { repo: a.repo });
