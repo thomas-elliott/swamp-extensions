@@ -9,6 +9,7 @@ import {
   __setComposeValidator,
   b64,
   coerceList,
+  type Json,
   model,
   projectHealthy,
   pruneResult,
@@ -985,7 +986,7 @@ Deno.test("swarm_stack_remove re-issues DELETE until the record clears (teardown
   try {
     const { context, written } = makeContext(TEST_GLOBALS);
     await method("swarm_stack_remove").execute(
-      { name: "two", pollIntervalSec: 0, removeTimeoutSec: 5 },
+      { name: "two", pollIntervalSec: 1, removeTimeoutSec: 5 },
       context,
     );
     const stackDeletes = calls.filter((c) =>
@@ -1025,7 +1026,7 @@ Deno.test("swarm_stack_remove throws if the record never clears within the deadl
     let threw = false;
     try {
       await method("swarm_stack_remove").execute(
-        { name: "stuck", pollIntervalSec: 0, removeTimeoutSec: 0 },
+        { name: "stuck", pollIntervalSec: 1, removeTimeoutSec: 0 },
         context,
       );
     } catch (e) {
@@ -1950,7 +1951,7 @@ Deno.test("project_create always validates; validate:false is not an option", as
   }
 });
 
-Deno.test("project_restart sends down then up for each project", async () => {
+Deno.test("project_restart uses Arcane's restart for each project", async () => {
   const calls: Call[] = [];
   __setArcaneTransport(
     (_g: unknown, m: string, p: string): Promise<unknown> => {
@@ -1961,7 +1962,10 @@ Deno.test("project_restart sends down then up for each project", async () => {
           data: [{ id: "p1", name: "web" }],
         });
       }
-      return Promise.resolve('{"type":"activity","id":"a1"}\n');
+      return Promise.resolve({
+        success: true,
+        data: { message: "Project restarted" },
+      });
     },
   );
   try {
@@ -1969,7 +1973,7 @@ Deno.test("project_restart sends down then up for each project", async () => {
     await method("project_restart").execute({ names: ["web"] }, context);
     assertEquals(
       calls.filter((c) => c.method === "POST").map((c) => c.path),
-      ["/environments/0/projects/p1/down", "/environments/0/projects/p1/up"],
+      ["/environments/0/projects/p1/restart"],
     );
     assertEquals(
       written.filter((w) => w.specName === "operation-result").length,
@@ -2078,4 +2082,61 @@ Deno.test("project_deploy bounds the redeploy call by healthTimeoutSec", async (
     __setArcaneTransport(null);
     __setComposeValidator(null);
   }
+});
+
+Deno.test("project_deploy fails on an error line in the redeploy's 200 body", async () => {
+  __setComposeValidator(() => Promise.resolve({ version: "v2.test" }));
+  __setArcaneTransport(
+    deployTransport(
+      () =>
+        Promise.resolve(
+          '{"type":"activity","id":"a1"}\n{"error":"pull access denied for ghcr.io/x/y"}\n',
+        ),
+      "healthy",
+    ),
+  );
+  try {
+    const message = await deployError();
+    assert(
+      /redeploy failed: pull access denied/.test(message),
+      `got: ${message}`,
+    );
+  } finally {
+    __setArcaneTransport(null);
+    __setComposeValidator(null);
+  }
+});
+
+Deno.test("the 2026.10.11.1 upgrade maps the retired authType and targetType values", () => {
+  const upgrade = model.upgrades.find((u) => u.toVersion === "2026.10.11.1")!;
+  const out = upgrade.upgradeAttributes({
+    baseUrl: "https://arcane.example.com",
+    repository: { name: "r", url: "u", authType: "token" },
+    syncs: [
+      { name: "a", composePath: "a.yaml", targetType: "swarm" },
+      { name: "b", composePath: "b.yaml", targetType: "project" },
+      { name: "c", composePath: "c.yaml" },
+    ],
+  });
+  assertEquals((out.repository as Json).authType, "http");
+  assertEquals(
+    (out.syncs as Json[]).map((s) => s.targetType),
+    ["swarm_stack", "project", undefined],
+  );
+  assertEquals(out.baseUrl, "https://arcane.example.com");
+  assertEquals(upgrade.upgradeAttributes({ baseUrl: "x" }), { baseUrl: "x" });
+});
+
+Deno.test("project_deploy refuses a zero healthTimeoutSec, which would switch the timeout off", () => {
+  const schema = (model.methods as unknown as Record<string, {
+    arguments: { safeParse: (v: unknown) => { success: boolean } };
+  }>).project_deploy.arguments;
+  assertEquals(
+    schema.safeParse({ name: "web", healthTimeoutSec: 0 }).success,
+    false,
+  );
+  assertEquals(
+    schema.safeParse({ name: "web", healthTimeoutSec: 30 }).success,
+    true,
+  );
 });
