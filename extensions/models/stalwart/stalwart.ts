@@ -352,6 +352,9 @@ export function __setJmap(fn: JmapFn | null): void {
 /** Test-only seam: substitute the REST caller. Pass `null` to restore the real one. */
 export function __setRest(fn: RestFn | null): void {
   _restOverride = fn;
+  // The cached accountId was answered by the previous transport, so a different
+  // transport (a different fake server) must not inherit it.
+  _accountIdCache.clear();
 }
 
 function baseUrl(g: GlobalArgsT): string {
@@ -478,10 +481,28 @@ function nowIso(): string {
   return new Date().toISOString();
 }
 
+/**
+ * Cache key for the resolved accountId. The session's primary account depends on
+ * who is asking, so two credentials against one URL must not share an entry.
+ * The key carries a digest of the token rather than the token, so the map never
+ * holds the secret in clear.
+ */
+async function accountIdCacheKey(g: GlobalArgsT): Promise<string> {
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(g.apiKey),
+  );
+  const hex = Array.from(new Uint8Array(digest))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+  return `${g.apiUrl}#${hex}`;
+}
+
 /** Resolve the management `accountId` (explicit arg, else the session's primary). */
 async function resolveAccountId(g: GlobalArgsT): Promise<string | undefined> {
   if (g.accountId) return g.accountId;
-  const cached = _accountIdCache.get(g.apiUrl);
+  const cacheKey = await accountIdCacheKey(g);
+  const cached = _accountIdCache.get(cacheKey);
   if (cached !== undefined) return cached;
   // The session resource lists accounts under `.accounts` and names the primary
   // under `.primaryAccounts`. Field shapes are confirmed in the Phase 0 spike.
@@ -492,7 +513,7 @@ async function resolveAccountId(g: GlobalArgsT): Promise<string | undefined> {
     (typeof primary[USING.mgmt] === "string"
       ? primary[USING.mgmt] as string
       : Object.keys(accounts)[0]) ?? undefined;
-  _accountIdCache.set(g.apiUrl, id);
+  _accountIdCache.set(cacheKey, id);
   return id;
 }
 const _accountIdCache = new Map<string, string | undefined>();
@@ -631,12 +652,22 @@ function mapKeys(v: unknown): string[] {
   return v && typeof v === "object" ? Object.keys(v as Json) : [];
 }
 
-/** The `name` addresses out of an `aliases` List<EmailAlias> wire object. */
-function aliasAddresses(v: unknown): string[] {
+/**
+ * Full addresses out of an `aliases` List<EmailAlias> wire object. Stalwart
+ * stores an alias as a local part (`name`) plus a `domainId`, so the domain
+ * name has to be joined back on; `domainNames` maps domain id to name.
+ */
+function aliasAddresses(
+  v: unknown,
+  domainNames: Map<string, string>,
+): string[] {
   if (!v || typeof v !== "object") return [];
   return Object.values(v as Record<string, Json>)
-    .map((a) => (a && typeof a.name === "string" ? a.name : ""))
-    .filter((s) => s.length > 0);
+    .filter((a) => a && typeof a.name === "string" && a.name.length > 0)
+    .map((a) => {
+      const domainId = String(a.domainId ?? "");
+      return `${a.name}@${domainNames.get(domainId) ?? domainId}`;
+    });
 }
 
 /** Friendly role label from a `roles` union (`{@type:"Admin"}` → `admin`). */
@@ -668,6 +699,15 @@ async function domainIdMap(
 ): Promise<Map<string, string>> {
   const rows = await listAll(g, JMAP_TYPES.domain, accountId, ["id", "name"]);
   return new Map(rows.map((d) => [String(d.name), String(d.id)]));
+}
+
+/** The inverse of {@link domainIdMap}: `id → name`, for rebuilding alias addresses. */
+async function domainNameMap(
+  g: GlobalArgsT,
+  accountId: string | undefined,
+): Promise<Map<string, string>> {
+  const byName = await domainIdMap(g, accountId);
+  return new Map([...byName].map(([name, id]) => [id, name]));
 }
 
 /**
@@ -1165,6 +1205,7 @@ export const model = {
         const g = context.globalArgs;
         const accountId = await resolveAccountId(g);
         logInfo(context, "Listing accounts");
+        const domainNames = await domainNameMap(g, accountId);
         const rows = await listAll(g, JMAP_TYPES.account, accountId, [
           "id",
           "name",
@@ -1195,7 +1236,7 @@ export const model = {
                 : undefined,
               domainId: typeof a.domainId === "string" ? a.domainId : undefined,
               type: accountType(a["@type"]),
-              aliases: aliasAddresses(a.aliases),
+              aliases: aliasAddresses(a.aliases, domainNames),
               roles: rolesLabel(a.roles),
               memberOf: mapKeys(a.memberGroupIds),
               enabled: !disabled,
@@ -1223,6 +1264,7 @@ export const model = {
         const g = context.globalArgs;
         const accountId = await resolveAccountId(g);
         logInfo(context, "Listing aliases", { account: a.account });
+        const domainNames = await domainNameMap(g, accountId);
         const rows = await listAll(g, JMAP_TYPES.account, accountId, [
           "id",
           "name",
@@ -1240,7 +1282,7 @@ export const model = {
           if (
             want && want !== name.toLowerCase() && want !== email.toLowerCase()
           ) continue;
-          for (const addr of aliasAddresses(acct.aliases)) {
+          for (const addr of aliasAddresses(acct.aliases, domainNames)) {
             handles.push(
               await context.writeResource("alias", addr, {
                 id: String(acct.id ?? ""),
@@ -1671,6 +1713,17 @@ export const model = {
           (String(x.name).toLowerCase() === local.toLowerCase() &&
             String(x.domainId) === domainId)
         );
+        // Groups share the x:Account collection, so an address match alone is
+        // not enough: patching a Group with individual fields would either be
+        // rejected by the server or quietly change the group. Refuse instead.
+        if (existing && existing["@type"] !== "User") {
+          throw new Error(
+            `${a.email} is a ${
+              accountType(existing["@type"])
+            } account, not an individual; account_ensure only manages ` +
+              "individuals (use group_ensure for groups)",
+          );
+        }
 
         // Resolve group memberships ONLY when explicitly provided. Each entry
         // must be an existing GROUP account; membership lives here on the
