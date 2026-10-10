@@ -1074,10 +1074,10 @@ export const model = {
         "Verify the instance is reachable and the service-account key authenticates (token exchange)",
       labels: ["live"],
       execute: async (context: Pick<Ctx, "globalArgs">) => {
-        const g = context.globalArgs;
-        // `swamp model validate` does not resolve vault expressions, so keyJson
-        // is still a literal `${{ … }}` there and can't authenticate. Skip; the
-        // real check runs at method-run time when the secret is resolved.
+        // Checks get globalArgs without the schema's defaults; parse to apply them.
+        const g = GlobalArgs.parse(context.globalArgs);
+        // Older swamp left keyJson as an unresolved `${{ … }}` here. Skip then;
+        // the method run checks it.
         if (/\$\{\{/.test(String(g.keyJson))) return { pass: true };
         try {
           await getToken(g);

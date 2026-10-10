@@ -605,11 +605,10 @@ export const model = {
         "Verify the Postgres server is reachable (SELECT 1 to maintenanceDb)",
       labels: ["live"],
       execute: async (context: Pick<Ctx, "globalArgs">) => {
-        const g = context.globalArgs;
-        // `swamp model validate` does NOT resolve vault expressions before running
-        // checks, so the password is still a literal `${{ … }}` string there and a
-        // probe can't authenticate. Skip in that case — the real connectivity check
-        // runs at method-run time, where the secret is resolved.
+        // Checks get globalArgs without the schema's defaults; parse to apply them.
+        const g = GlobalArgs.parse(context.globalArgs);
+        // Older swamp left the password as an unresolved `${{ … }}` here. Skip then;
+        // the method run checks it.
         if (/\$\{\{/.test(String(g.adminPassword))) return { pass: true };
         try {
           await withConn(g, g.maintenanceDb, true, async (q) => {

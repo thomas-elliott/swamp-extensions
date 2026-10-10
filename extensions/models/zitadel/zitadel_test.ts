@@ -1140,3 +1140,59 @@ Deno.test("grant_list: filters by user + project and is a factory", async () => 
     __setCaller(null);
   }
 });
+
+// ─────────────────────────── reachable check ───────────────────────────
+
+// A check receives globalArgs without the schema's defaults. An unset
+// httpTimeoutMs used to abort the token exchange at once, and an unset
+// tokenScope was sent as the literal string "undefined".
+Deno.test("reachable check applies the schema defaults to globalArgs", async () => {
+  const kp = await crypto.subtle.generateKey(
+    {
+      name: "RSASSA-PKCS1-v1_5",
+      modulusLength: 2048,
+      publicExponent: new Uint8Array([1, 0, 1]),
+      hash: "SHA-256",
+    },
+    true,
+    ["sign", "verify"],
+  ) as CryptoKeyPair;
+  const pem = derToPem(
+    new Uint8Array(await crypto.subtle.exportKey("pkcs8", kp.privateKey)),
+    "PRIVATE KEY",
+  );
+  let scope = null as string | null;
+  let abortedInFlight = true;
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (_url, init) => {
+    scope = new URLSearchParams(String(init?.body)).get("scope");
+    // An undefined timeout fires on the next tick, so look after a pause.
+    await new Promise((r) => setTimeout(r, 20));
+    abortedInFlight = init?.signal?.aborted ?? false;
+    return new Response(JSON.stringify({ access_token: "t", expires_in: 60 }));
+  };
+  try {
+    const checks = (model as unknown as {
+      checks: Record<
+        string,
+        { execute: (c: unknown) => Promise<{ pass: boolean }> }
+      >;
+    }).checks;
+    const res = await checks.reachable.execute({
+      globalArgs: {
+        apiUrl: GLOBALS.apiUrl,
+        // A keyId of its own, so the module's token cache cannot answer first.
+        keyJson: JSON.stringify({
+          keyId: "check-defaults",
+          key: pem,
+          userId: "u123",
+        }),
+      },
+    });
+    assertEquals(res.pass, true);
+    assertEquals(abortedInFlight, false);
+    assert(scope?.startsWith("openid"), `default scope expected, got ${scope}`);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});

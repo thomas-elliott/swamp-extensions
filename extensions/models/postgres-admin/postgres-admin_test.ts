@@ -326,3 +326,29 @@ Deno.test("connection is always closed — even when the method throws", async (
     __setPgConnect(null);
   }
 });
+
+// A check receives globalArgs without the schema's defaults, so an unset port,
+// adminUser, maintenanceDb or ssl used to reach the connection as undefined.
+Deno.test("reachable check applies the schema defaults to globalArgs", async () => {
+  const fake = makeFakeDb();
+  let seen: Record<string, unknown> = {};
+  __setPgConnect((g, database) => {
+    seen = g;
+    return fake.connect(g, database);
+  });
+  try {
+    const checks = (model as unknown as {
+      checks: Record<string, { execute: (c: unknown) => Promise<{ pass: boolean }> }>;
+    }).checks;
+    const res = await checks.reachable.execute({
+      globalArgs: { host: GLOBALS.host, adminPassword: GLOBALS.adminPassword },
+    });
+    assertEquals(res.pass, true);
+    assertEquals(fake.connectDbs, ["postgres"]);
+    assertEquals(seen.port, 5432);
+    assertEquals(seen.adminUser, "postgres");
+    assertEquals(seen.ssl, { mode: "disable" });
+  } finally {
+    __setPgConnect(null);
+  }
+});

@@ -770,10 +770,10 @@ export const model = {
         "Verify the Garage Admin API is reachable (GET /v2/GetClusterHealth)",
       labels: ["live"],
       execute: async (context: Pick<Ctx, "globalArgs">) => {
-        const g = context.globalArgs;
-        // `swamp model validate` does NOT resolve vault expressions before running
-        // checks, so the token is still a literal `${{ … }}` and a probe can't
-        // authenticate. Skip then — real reachability is exercised at method-run time.
+        // Checks get globalArgs without the schema's defaults; parse to apply them.
+        const g = GlobalArgs.parse(context.globalArgs);
+        // Older swamp left the token as an unresolved `${{ … }}` here. Skip then;
+        // the method run checks it.
         if (/\$\{\{/.test(String(g.adminToken))) return { pass: true };
         try {
           await api(g, "GET", "GetClusterHealth");

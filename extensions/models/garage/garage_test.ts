@@ -710,3 +710,25 @@ Deno.test("cluster_init: idempotent — already-initialised layout is unchanged,
     __setGarageApi(null);
   }
 });
+
+// A check receives globalArgs without the schema's defaults, so an unset
+// timeoutMs used to become NaN, which aborts the request at once.
+Deno.test("reachable check: applies the schema defaults to globalArgs", async () => {
+  let seenTimeout: unknown;
+  __setGarageApi((g) => {
+    seenTimeout = g.timeoutMs;
+    return Promise.resolve({ status: "healthy" });
+  });
+  try {
+    const checks = (model as unknown as {
+      checks: Record<string, { execute: (c: unknown) => Promise<{ pass: boolean }> }>;
+    }).checks;
+    const res = await checks.reachable.execute({
+      globalArgs: { endpoint: GLOBALS.endpoint, adminToken: GLOBALS.adminToken },
+    });
+    assertEquals(res.pass, true);
+    assertEquals(seenTimeout, 30000);
+  } finally {
+    __setGarageApi(null);
+  }
+});
