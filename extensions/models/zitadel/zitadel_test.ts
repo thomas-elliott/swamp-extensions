@@ -589,6 +589,7 @@ Deno.test("machine_user_ensure: resolves an existing user by ListUsers `id`", as
           id: "900",
           userName: "smoke-bot",
           state: "USER_STATE_ACTIVE",
+          machine: { name: "Smoke Bot" },
         }],
       };
     }
@@ -1358,5 +1359,79 @@ Deno.test("boolean arguments reject anything but true/false", () => {
       !fieldFails(good),
       `devMode=${JSON.stringify(good)} must be accepted`,
     );
+  }
+});
+
+// ─────────────────────────── user lookup ───────────────────────────
+
+Deno.test("machine_user_ensure: a human with the same username is not taken for a machine", async () => {
+  const { caller, calls } = makeFakeApi((c) => {
+    if (c.path.endsWith("/users/_search")) {
+      return {
+        result: [{ id: "500", userName: "smoke-bot", human: { profile: {} } }],
+      };
+    }
+    if (c.path.endsWith("/users/machine")) return { userId: "901" };
+  });
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("machine_user_ensure").execute(
+      { username: "smoke-bot", name: "Smoke Bot" },
+      context,
+    );
+    assertEquals(written[0].data.action, "created");
+    const search = calls.find((c) => c.path.endsWith("/users/_search"));
+    assert(
+      JSON.stringify(search?.body).includes("TYPE_MACHINE"),
+      "the search asks for machine users",
+    );
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("grant_list: a user can be named by login name", async () => {
+  const { caller, calls } = makeFakeApi((c) => {
+    if (c.path.endsWith("/users/_search")) {
+      return {
+        result: [{
+          id: "700",
+          preferredLoginName: "alice@example.com",
+          loginNames: ["alice@example.com"],
+        }],
+      };
+    }
+    if (c.path.endsWith("/users/grants/_search")) return { result: [] };
+  });
+  __setCaller(caller);
+  try {
+    const { context } = makeContext();
+    await method("grant_list").execute({ user: "alice@example.com" }, context);
+    const search = calls.find((c) => c.path.endsWith("/users/_search"));
+    assert(JSON.stringify(search?.body).includes("loginNameQuery"));
+    const grants = calls.find((c) => c.path.endsWith("/users/grants/_search"));
+    assert(JSON.stringify(grants?.body).includes("700"), "filters on the id");
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("grant_list: a machine username still resolves when no login name matches", async () => {
+  const { caller } = makeFakeApi((c) => {
+    if (c.path.endsWith("/users/_search")) {
+      const byLoginName = JSON.stringify(c.body).includes("loginNameQuery");
+      return byLoginName ? { result: [] } : {
+        result: [{ id: "900", userName: "smoke-bot", machine: { name: "x" } }],
+      };
+    }
+    if (c.path.endsWith("/users/grants/_search")) return { result: [] };
+  });
+  __setCaller(caller);
+  try {
+    const { context } = makeContext();
+    await method("grant_list").execute({ user: "smoke-bot" }, context);
+  } finally {
+    __setCaller(null);
   }
 });
