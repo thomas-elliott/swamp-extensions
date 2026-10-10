@@ -427,6 +427,90 @@ Deno.test("oidc_app_redirect_set: no-op when add present & remove absent", async
   }
 });
 
+Deno.test("oidc_app_ensure: a new app gets the defaults for fields left out", async () => {
+  let createBody: Record<string, unknown> | undefined;
+  const { caller } = makeFakeApi((c) => {
+    if (c.path.endsWith("/projects/_search")) {
+      return { result: [{ id: "p1", name: "homelab" }] };
+    }
+    if (c.path.endsWith("/apps/_search")) return { result: [] };
+    if (c.path.endsWith("/apps/oidc") && c.method === "POST") {
+      createBody = c.body as Record<string, unknown>;
+      return { appId: "a1", clientId: "cid" };
+    }
+  });
+  __setCaller(caller);
+  try {
+    const { context } = makeContext();
+    await method("oidc_app_ensure").execute(
+      { project: "homelab", name: "grafana", redirectUris: ["https://g/cb"] },
+      context,
+    );
+    assertEquals(createBody, {
+      name: "grafana",
+      redirectUris: ["https://g/cb"],
+      postLogoutRedirectUris: [],
+      responseTypes: ["OIDC_RESPONSE_TYPE_CODE"],
+      grantTypes: [
+        "OIDC_GRANT_TYPE_AUTHORIZATION_CODE",
+        "OIDC_GRANT_TYPE_REFRESH_TOKEN",
+      ],
+      appType: "OIDC_APP_TYPE_WEB",
+      authMethodType: "OIDC_AUTH_METHOD_TYPE_BASIC",
+      accessTokenType: "OIDC_TOKEN_TYPE_BEARER",
+      devMode: false,
+    });
+  } finally {
+    __setCaller(null);
+  }
+});
+
+// Same bug class as forgejo issue #4. Zitadel's update replaces every field,
+// so a re-run must carry over what it was not given — including fields this
+// method does not model, such as role assertions.
+Deno.test("oidc_app_ensure: an existing app keeps every field that was not passed", async () => {
+  const current = {
+    clientId: "cid",
+    // In the order the update body is built, since assertEquals compares JSON.
+    redirectUris: ["https://spa/cb", "https://spa/cb2"],
+    responseTypes: ["OIDC_RESPONSE_TYPE_CODE"],
+    grantTypes: ["OIDC_GRANT_TYPE_AUTHORIZATION_CODE"],
+    appType: "OIDC_APP_TYPE_USER_AGENT",
+    authMethodType: "OIDC_AUTH_METHOD_TYPE_NONE",
+    postLogoutRedirectUris: ["https://spa/bye"],
+    accessTokenType: "OIDC_TOKEN_TYPE_JWT",
+    idTokenRoleAssertion: true,
+    additionalOrigins: ["https://spa"],
+  };
+  let putBody: unknown;
+  const { caller } = makeFakeApi((c) => {
+    if (c.path.endsWith("/projects/_search")) {
+      return { result: [{ id: "p1", name: "homelab" }] };
+    }
+    if (c.path.endsWith("/apps/_search")) {
+      return {
+        result: [{ id: "a1", name: "spa", oidcConfig: current }],
+      };
+    }
+    if (c.method === "PUT") {
+      putBody = c.body;
+      return {};
+    }
+  });
+  __setCaller(caller);
+  try {
+    const { context } = makeContext();
+    await method("oidc_app_ensure").execute(
+      { project: "homelab", name: "spa", devMode: true },
+      context,
+    );
+    const { clientId: _, ...updatable } = current;
+    assertEquals(putBody, { ...updatable, devMode: true });
+  } finally {
+    __setCaller(null);
+  }
+});
+
 Deno.test("oidc_app_ensure: treats Zitadel 'No changes' 400 as unchanged", async () => {
   const caller: CallerFn = (_g, c) => {
     if (c.path.endsWith("/projects/_search")) {

@@ -244,7 +244,16 @@ Deno.test("app_provision: idempotent — existing role+db ⇒ no CREATE, grants 
   __setPgConnect(fake.connect);
   try {
     const { context, written, logs } = makeContext();
-    await method("app_provision").execute({ database: "myapp", role: "myapp", password: "SENT" }, context);
+    await method("app_provision").execute(
+      {
+        database: "myapp",
+        role: "myapp",
+        password: "SENT",
+        tablePrivs: ["SELECT", "INSERT", "UPDATE", "DELETE"],
+        includeFuture: true,
+      },
+      context,
+    );
     assert(!hasSql(fake.queries, /CREATE ROLE/) && !hasSql(fake.queries, /CREATE DATABASE/), "nothing created when both exist");
     assert(hasSql(fake.queries, /GRANT CONNECT ON DATABASE "myapp" TO "myapp"/), "CONNECT");
     assert(hasSql(fake.queries, /GRANT USAGE, CREATE ON SCHEMA "public" TO "myapp"/), "schema");
@@ -267,7 +276,27 @@ Deno.test("app_provision: creates role+db when absent ⇒ action=created", async
     await method("app_provision").execute({ database: "fresh", role: "fresh", password: "SENT" }, context);
     assert(hasSql(fake.queries, /CREATE ROLE "fresh" LOGIN CONNECTION LIMIT -1 PASSWORD 'SENT'/), "role created");
     assert(hasSql(fake.queries, /CREATE DATABASE "fresh" OWNER "fresh"/), "db created");
+    assert(hasSql(fake.queries, /GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA "public" TO "fresh"/), "default table privs");
+    assert(hasSql(fake.queries, /ALTER DEFAULT PRIVILEGES FOR ROLE "fresh" IN SCHEMA "public" GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES/), "default future privs");
     assertEquals(written[0].data.action, "created");
+  } finally {
+    __setPgConnect(null);
+  }
+});
+
+// Same bug class as forgejo issue #4: GRANT only adds, so a re-run that
+// re-applied the default privileges would widen a read-only role.
+Deno.test("app_provision: re-run without tablePrivs/includeFuture leaves table grants alone", async () => {
+  const fake = makeFakeDb((sql) =>
+    /FROM pg_roles WHERE rolname/.test(sql) || /FROM pg_database WHERE datname/.test(sql) ? [{ x: 1 }] : undefined
+  );
+  __setPgConnect(fake.connect);
+  try {
+    const { context, written } = makeContext();
+    await method("app_provision").execute({ database: "reports", role: "reader" }, context);
+    assert(!hasSql(fake.queries, /ON ALL TABLES/), "no table grant");
+    assert(!hasSql(fake.queries, /ALTER DEFAULT PRIVILEGES/), "no default privileges");
+    assertEquals(written[0].data.defaultPrivileges, false);
   } finally {
     __setPgConnect(null);
   }

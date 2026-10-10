@@ -863,14 +863,6 @@ function jsonArray<T extends z.ZodTypeAny>(item: T): z.ZodType<z.infer<T>[]> {
   }, z.array(item)) as z.ZodType<z.infer<T>[]>;
 }
 
-/** A boolean argument that also accepts the strings "true"/"false" (raw CLI). */
-function boolArg(def: boolean): z.ZodType<boolean> {
-  return z.preprocess(
-    (v) => v === undefined ? def : v === true || v === "true",
-    z.boolean(),
-  ) as z.ZodType<boolean>;
-}
-
 const Empty = z.object({});
 
 const AppListArgs = z.object({
@@ -913,27 +905,102 @@ const OidcAppEnsureArgs = z.object({
   name: z.string().describe(
     "Application name (find-or-create within the project)",
   ),
-  redirectUris: jsonArray(z.string()).default([]).describe(
+  // No schema defaults: they would read as explicit values and reset an
+  // existing app. OIDC_APP_DEFAULTS applies on create.
+  redirectUris: jsonArray(z.string()).optional().describe(
     "Allowed redirect URIs",
   ),
-  postLogoutUris: jsonArray(z.string()).default([]).describe(
+  postLogoutUris: jsonArray(z.string()).optional().describe(
     "Allowed post-logout redirect URIs",
   ),
-  appType: z.enum(["web", "spa", "native"]).default("web"),
-  authMethod: z.enum(["basic", "post", "none", "jwt"]).default("basic")
+  appType: z.enum(["web", "spa", "native"]).optional(),
+  authMethod: z.enum(["basic", "post", "none", "jwt"]).optional()
     .describe(
       "OIDC client auth method. Use `none` for public PKCE (SPA/native).",
     ),
   grantTypes: jsonArray(
     z.enum(["authorization_code", "implicit", "refresh_token", "device_code"]),
-  ).default(["authorization_code", "refresh_token"]),
+  ).optional(),
   responseTypes: jsonArray(z.enum(["code", "id_token", "id_token_token"]))
-    .default(["code"]),
-  accessTokenType: z.enum(["bearer", "jwt"]).default("bearer"),
-  devMode: boolArg(false).describe(
+    .optional(),
+  accessTokenType: z.enum(["bearer", "jwt"]).optional(),
+  devMode: optBoolArg().describe(
     "Relax redirect-URI checks (non-https/localhost). Test only.",
   ),
 });
+
+/** What a new OIDC app gets for each config field the caller leaves out. */
+const OIDC_APP_DEFAULTS = {
+  redirectUris: [] as string[],
+  postLogoutUris: [] as string[],
+  appType: "web",
+  authMethod: "basic",
+  grantTypes: ["authorization_code", "refresh_token"],
+  responseTypes: ["code"],
+  accessTokenType: "bearer",
+  devMode: false,
+};
+
+/**
+ * Every field Zitadel's oidc_config update accepts. The update replaces all of
+ * them, so an existing app's body starts from its current values for these.
+ */
+const OIDC_UPDATE_FIELDS = [
+  "redirectUris",
+  "responseTypes",
+  "grantTypes",
+  "appType",
+  "authMethodType",
+  "postLogoutRedirectUris",
+  "devMode",
+  "accessTokenType",
+  "accessTokenRoleAssertion",
+  "idTokenRoleAssertion",
+  "idTokenUserinfoAssertion",
+  "clockSkew",
+  "additionalOrigins",
+  "skipNativeAppSuccessPage",
+  "backChannelLogoutUri",
+  "loginVersion",
+  "ios",
+  "android",
+];
+
+/** Map the config fields that were passed onto Zitadel's wire names. */
+function oidcWireConfig(
+  a: Partial<typeof OIDC_APP_DEFAULTS>,
+): Json {
+  const cfg: Json = {};
+  if (a.redirectUris !== undefined) cfg.redirectUris = a.redirectUris;
+  if (a.postLogoutUris !== undefined) {
+    cfg.postLogoutRedirectUris = a.postLogoutUris;
+  }
+  if (a.responseTypes !== undefined) {
+    cfg.responseTypes = a.responseTypes.map((t) =>
+      mapEnum(RESPONSE_TYPE, t, "responseType")
+    );
+  }
+  if (a.grantTypes !== undefined) {
+    cfg.grantTypes = a.grantTypes.map((t) =>
+      mapEnum(GRANT_TYPE, t, "grantType")
+    );
+  }
+  if (a.appType !== undefined) {
+    cfg.appType = mapEnum(APP_TYPE, a.appType, "appType");
+  }
+  if (a.authMethod !== undefined) {
+    cfg.authMethodType = mapEnum(AUTH_METHOD, a.authMethod, "authMethod");
+  }
+  if (a.accessTokenType !== undefined) {
+    cfg.accessTokenType = mapEnum(
+      ACCESS_TOKEN_TYPE,
+      a.accessTokenType,
+      "accessTokenType",
+    );
+  }
+  if (a.devMode !== undefined) cfg.devMode = a.devMode;
+  return cfg;
+}
 
 const ApiAppEnsureArgs = z.object({
   project: z.string(),
@@ -1530,29 +1597,19 @@ export const model = {
         const a = OidcAppEnsureArgs.parse(rawArgs);
         const g = context.globalArgs;
         const projectId = await ensureProjectId(g, a.project);
-        const cfg = {
-          redirectUris: a.redirectUris,
-          postLogoutRedirectUris: a.postLogoutUris,
-          responseTypes: a.responseTypes.map((t) =>
-            mapEnum(RESPONSE_TYPE, t, "responseType")
-          ),
-          grantTypes: a.grantTypes.map((t) =>
-            mapEnum(GRANT_TYPE, t, "grantType")
-          ),
-          appType: mapEnum(APP_TYPE, a.appType, "appType"),
-          authMethodType: mapEnum(AUTH_METHOD, a.authMethod, "authMethod"),
-          accessTokenType: mapEnum(
-            ACCESS_TOKEN_TYPE,
-            a.accessTokenType,
-            "accessTokenType",
-          ),
-          devMode: a.devMode,
-        };
         const existing = await findAppByName(g, projectId, a.name);
         const ts = nowIso();
         if (existing && typeof existing.id === "string") {
-          // Converge config in place. Zitadel returns 400 "No changes" when the
-          // config already matches — that's an idempotent no-op, not a failure.
+          // Converge only the fields that were passed. The update replaces
+          // every field, so the rest are carried over from the current config.
+          const current = (existing.oidcConfig ?? {}) as Json;
+          const cfg: Json = {};
+          for (const f of OIDC_UPDATE_FIELDS) {
+            if (current[f] !== undefined) cfg[f] = current[f];
+          }
+          Object.assign(cfg, oidcWireConfig(a));
+          // Zitadel returns 400 "No changes" when the config already matches —
+          // that's an idempotent no-op, not a failure.
           let action: z.infer<typeof Action> = "updated";
           try {
             await call(g, {
@@ -1571,7 +1628,6 @@ export const model = {
               throw e;
             }
           }
-          const oidc = (existing.oidcConfig ?? {}) as Json;
           logInfo(context, "Converged OIDC app", {
             name: a.name,
             appId: existing.id,
@@ -1584,8 +1640,8 @@ export const model = {
               projectId,
               appId: existing.id,
               name: a.name,
-              clientId: typeof oidc.clientId === "string"
-                ? oidc.clientId
+              clientId: typeof current.clientId === "string"
+                ? current.clientId
                 : undefined,
               kind: "oidc",
               action,
@@ -1597,7 +1653,10 @@ export const model = {
         const r = await call(g, {
           method: "POST",
           path: mgmt(`/projects/${encodeURIComponent(projectId)}/apps/oidc`),
-          body: { name: a.name, ...cfg },
+          body: {
+            name: a.name,
+            ...oidcWireConfig({ ...OIDC_APP_DEFAULTS, ...a }),
+          },
         });
         logInfo(context, "Created OIDC app", {
           name: a.name,

@@ -660,20 +660,24 @@ async function upsertSecret(
     method: "GET",
     path: `${collectionPath}/${encodeURIComponent(args.name)}`,
   }, [404]);
-  const payload: Json = {
-    name: args.name,
-    value: args.value,
-    events: args.events,
-    images: args.images,
-  };
   if (probe.status === 404) {
     const r = await call(g, {
       method: "POST",
       path: collectionPath,
-      body: payload,
+      body: {
+        name: args.name,
+        value: args.value,
+        events: args.events ?? ["push", "tag"],
+        images: args.images ?? [],
+      },
     });
     return { raw: r.body, action: "created" };
   }
+  // Woodpecker's PATCH keeps any field the body leaves out, so send only what
+  // the caller passed.
+  const payload: Json = { name: args.name, value: args.value };
+  if (args.events !== undefined) payload.events = args.events;
+  if (args.images !== undefined) payload.images = args.images;
   const r = await call(g, {
     method: "PATCH",
     path: `${collectionPath}/${encodeURIComponent(args.name)}`,
@@ -942,11 +946,15 @@ const SecretSetShape = {
     "Secret value (write-only; never read back). Supply via vault: " +
       "${{ vault.get(<vault>, <item>/<field>) }}",
   ),
-  events: z.array(z.string()).default(["push", "tag"]).describe(
-    "Pipeline events the secret is available to.",
+  // No schema defaults: they would read as explicit values and widen an
+  // existing secret. upsertSecret applies them on create.
+  events: z.array(z.string()).optional().describe(
+    "Pipeline events the secret is available to. A new secret defaults to " +
+      '["push", "tag"]; when omitted, an existing secret keeps its events.',
   ),
-  images: z.array(z.string()).default([]).describe(
-    "Restrict the secret to these step images (empty = all).",
+  images: z.array(z.string()).optional().describe(
+    "Restrict the secret to these step images (empty = all). A new secret " +
+      "defaults to all; when omitted, an existing secret keeps its images.",
   ),
 };
 

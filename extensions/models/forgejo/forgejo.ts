@@ -990,8 +990,11 @@ const CollaboratorEnsureArgs = z.object({
   owner: z.string().describe("Owning org or user login."),
   name: z.string().describe("Repository name."),
   user: z.string().describe("Login of the user to grant access to."),
-  permission: z.enum(["read", "write", "admin"]).default("write").describe(
-    "Access level to converge.",
+  // No schema default: it would read as an explicit value and reset an
+  // existing collaborator. A new grant gets "write" in the method.
+  permission: z.enum(["read", "write", "admin"]).optional().describe(
+    'Access level to converge. A new grant defaults to "write"; when ' +
+      "omitted, an existing collaborator keeps their level.",
   ),
 });
 
@@ -1768,25 +1771,27 @@ export const model = {
         const current = probe.status === 404
           ? "none"
           : String(probe.body.permission ?? "none");
-        let action: z.infer<typeof Action>;
         if (current === "owner") {
           throw new Error(
             `${a.user} owns ${full} — a collaborator grant cannot apply to ` +
               "the repo owner.",
           );
-        } else if (current === a.permission) {
+        }
+        const want = a.permission ?? (current === "none" ? "write" : current);
+        let action: z.infer<typeof Action>;
+        if (current === want) {
           action = "unchanged";
         } else {
           logInfo(context, "Setting collaborator permission", {
             repo: full,
             user: a.user,
             from: current,
-            to: a.permission,
+            to: want,
           });
           await call(g, {
             method: "PUT",
             path: `${repoPath(a.owner, a.name)}/collaborators/${enc(a.user)}`,
-            body: { permission: a.permission },
+            body: { permission: want },
           });
           action = current === "none" ? "created" : "updated";
         }
@@ -1796,7 +1801,7 @@ export const model = {
           {
             repo: full,
             user: a.user,
-            permission: a.permission,
+            permission: want,
             action,
             timestamp: nowIso(),
           },

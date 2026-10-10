@@ -1368,6 +1368,39 @@ Deno.test("collaborator_ensure reports an existing grant as updated", async () =
   }
 });
 
+Deno.test("collaborator_ensure grants write to a new collaborator when no permission is passed", async () => {
+  const { caller, calls } = makeFakeApi((c) =>
+    c.method === "GET" ? undefined : {}
+  );
+  __setCaller(caller);
+  try {
+    const { context } = makeContext();
+    const { permission: _, ...args } = COLLAB_ARGS;
+    await method("collaborator_ensure").execute(args, context);
+    const put = calls.find((c) => c.method === "PUT");
+    assertEquals(put?.body, { permission: "write" });
+  } finally {
+    __setCaller(null);
+  }
+});
+
+// Same bug class as issue #4: an omitted permission must not reset an
+// existing collaborator's level to the default.
+Deno.test("collaborator_ensure keeps an existing level when no permission is passed", async () => {
+  const { caller, calls } = makeFakeApi(() => ({ permission: "admin" }));
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    const { permission: _, ...args } = COLLAB_ARGS;
+    await method("collaborator_ensure").execute(args, context);
+    assert(!calls.some((c) => c.method !== "GET"), "no mutation expected");
+    assertEquals(written[0].data.action, "unchanged");
+    assertEquals(written[0].data.permission, "admin");
+  } finally {
+    __setCaller(null);
+  }
+});
+
 Deno.test("collaborator_ensure refuses to touch the repo owner", async () => {
   const { caller, calls } = makeFakeApi(() => ({ permission: "owner" }));
   __setCaller(caller);
