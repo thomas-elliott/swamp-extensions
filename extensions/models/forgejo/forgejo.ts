@@ -1066,12 +1066,18 @@ const MirrorEnsureArgs = z.object({
       "/repos/migrate, never read back). Supply via vault: " +
       "${{ vault.get(<vault>, <item>/<field>) }}",
   ),
-  mirrorInterval: z.string().default("8h0m0s").describe(
+  // No schema defaults: they would read as explicit values and reset an
+  // existing mirror. The create branch applies them.
+  mirrorInterval: z.string().optional().describe(
     'Periodic sync interval as a Go duration (e.g. "8h0m0s"; "0s" disables ' +
-      "periodic sync).",
+      'periodic sync). Defaults to "8h0m0s" on create; when omitted, an ' +
+      "existing mirror keeps its interval.",
   ),
   lfs: z.coerce.boolean().default(true).describe("Mirror LFS objects too."),
-  private: z.coerce.boolean().default(true).describe("Mirror visibility."),
+  private: z.coerce.boolean().optional().describe(
+    "Mirror visibility. Defaults to private on create; when omitted, an " +
+      "existing mirror keeps its visibility.",
+  ),
   description: z.string().optional().describe("Mirror repo description."),
 });
 
@@ -1921,9 +1927,9 @@ export const model = {
             repo_name: a.name,
             mirror: true,
             service: a.service,
-            mirror_interval: a.mirrorInterval,
+            mirror_interval: a.mirrorInterval ?? "8h0m0s",
             lfs: a.lfs,
-            private: a.private,
+            private: a.private ?? true,
             description: a.description,
           };
           if (a.authToken !== undefined) body.auth_token = a.authToken;
@@ -1962,16 +1968,21 @@ export const model = {
                 "or use a different repo name.",
             );
           }
+          // Converge only the settings the caller passed.
           const body: Json = {};
-          const curSec = goDurationSeconds(
-            String(existing.mirror_interval ?? ""),
-          );
-          const wantSec = goDurationSeconds(a.mirrorInterval);
-          const intervalDiffers = curSec !== null && wantSec !== null
-            ? curSec !== wantSec
-            : String(existing.mirror_interval ?? "") !== a.mirrorInterval;
-          if (intervalDiffers) body.mirror_interval = a.mirrorInterval;
-          if (a.private !== Boolean(existing.private)) body.private = a.private;
+          if (a.mirrorInterval !== undefined) {
+            const curSec = goDurationSeconds(
+              String(existing.mirror_interval ?? ""),
+            );
+            const wantSec = goDurationSeconds(a.mirrorInterval);
+            const intervalDiffers = curSec !== null && wantSec !== null
+              ? curSec !== wantSec
+              : String(existing.mirror_interval ?? "") !== a.mirrorInterval;
+            if (intervalDiffers) body.mirror_interval = a.mirrorInterval;
+          }
+          if (
+            a.private !== undefined && a.private !== Boolean(existing.private)
+          ) body.private = a.private;
           if (
             a.description !== undefined &&
             a.description !== String(existing.description ?? "")

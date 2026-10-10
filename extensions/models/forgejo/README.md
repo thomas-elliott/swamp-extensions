@@ -144,9 +144,10 @@ swamp model method run forgejo mirror_sync_now \
   --input owner=mirrors --input name=scrappy
 ```
 
-`mirror_ensure` defaults: `service=github`, `mirrorInterval=8h0m0s`, `lfs=true`,
-`private=true`. On an existing mirror it reconciles
-interval/visibility/description only (interval compare is semantic — `8h` equals
+`mirror_ensure` creates with `service=github`, `mirrorInterval=8h0m0s`, `lfs=true`,
+`private=true` unless told otherwise. On an existing mirror it reconciles
+interval/visibility/description, and only those it was passed: leaving one out
+keeps the mirror's current value (interval compare is semantic — `8h` equals
 `8h0m0s`).
 
 **Reversible lifecycle:** `repo_archive` / `repo_unarchive`.
