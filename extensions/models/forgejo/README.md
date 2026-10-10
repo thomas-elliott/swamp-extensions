@@ -241,3 +241,9 @@ Data instance names replace `/` with `:` (swamp rejects slashes), so
   endpoints are out of scope; file an issue when there is a real use-case.
   Webhook _creation_ is excluded by design (see the scope guarantee), not for
   lack of a use-case.
+
+## Breaking changes
+
+- **Boolean arguments accept only `true`/`false`** (or the strings `"true"` /
+  `"false"`). Earlier versions read `"0"`, `"False"` and any other non-empty
+  string as true.
