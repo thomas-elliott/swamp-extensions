@@ -34,7 +34,9 @@ exception (`pr_merge`):
   repo is likewise refused.
 - ✅ **Webhooks are read and repointed, never created, and no credential is ever
   emitted.** `webhook_audit` reports where every hook posts; `webhook_retarget`
-  writes `config.url` alone. Neither sends a `secret` key — doing so would
+  changes `config.url` alone, sending the hook's own events, branch filter and
+  authorization header back with it because Forgejo resets all three on any
+  edit that leaves them out. Neither sends a `secret` key — doing so would
   overwrite the shared secret the CI server relies on. Creating a hook is left
   to the CI server that owns that secret (Woodpecker: `repo_repair`).
 - ✅ **A hook URL's query string is treated as a credential.** Woodpecker
