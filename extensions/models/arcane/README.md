@@ -194,3 +194,11 @@ rotation); the per-type prunes above cover the rest.
 - **`authType` accepts `none`, `http` or `ssh`, and `targetType` `project` or
   `swarm_stack`**, the values Arcane uses. The old `token` and `swarm` were
   never accepted by Arcane.
+
+## Fixes
+
+- **`project_create`, and `project_deploy` on a first deploy, send a multipart
+  form.** Arcane's project-create endpoint takes its fields as
+  `multipart/form-data` (a `project` field holding the JSON, and a `manifest`
+  field listing extra files to upload, here none). It rejects a JSON body with
+  422, so creating a project through the API failed before this change.

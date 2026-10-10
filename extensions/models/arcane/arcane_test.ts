@@ -309,6 +309,44 @@ Deno.test("project_deploy direct mode: validate → update → redeploy → heal
   }
 });
 
+Deno.test("project_create sends the project and an empty manifest as multipart fields", async () => {
+  const calls: Call[] = [];
+  __setComposeValidator(() => Promise.resolve({ version: "v2.test" }));
+  __setArcaneTransport(
+    (_g: unknown, m: string, p: string, b?: unknown): Promise<unknown> => {
+      calls.push({ method: m, path: p, body: b });
+      if (m === "POST" && p === "/environments/0/projects") {
+        return Promise.resolve({
+          success: true,
+          data: { id: "p1", status: "stopped" },
+        });
+      }
+      return Promise.reject(new Error(`unexpected ${m} ${p}`));
+    },
+  );
+  try {
+    const { context } = makeContext(TEST_GLOBALS);
+    await method("project_create").execute(
+      { name: "web", composeContent: "services: {}", envContent: "A=1\n" },
+      context,
+    );
+    const body = calls[0].body;
+    assert(body instanceof FormData, "body is multipart, not JSON");
+    const form = body as FormData;
+    assertEquals(JSON.parse(String(form.get("project"))), {
+      name: "web",
+      composeContent: "services: {}",
+      envContent: "A=1\n",
+    });
+    assertEquals(JSON.parse(String(form.get("manifest"))), {
+      fileChanges: [],
+    });
+  } finally {
+    __setArcaneTransport(null);
+    __setComposeValidator(null);
+  }
+});
+
 Deno.test("project_deploy direct mode: unhealthy deploy rolls back to prior content and throws", async () => {
   const calls: Call[] = [];
   let putCount = 0;

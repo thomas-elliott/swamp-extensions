@@ -425,13 +425,22 @@ async function arcaneReal(
 ): Promise<unknown> {
   const u = new URL(g.baseUrl.replace(/\/+$/, "") + API + path);
   const secure = u.protocol === "https:";
-  const payload = body !== undefined ? JSON.stringify(body) : undefined;
+  let payload: string | undefined;
+  let contentType = "application/json";
+  if (body instanceof FormData) {
+    // Response serialises the form and picks the boundary for the header.
+    const form = new Response(body);
+    payload = await form.text();
+    contentType = form.headers.get("content-type") ?? "";
+  } else if (body !== undefined) {
+    payload = JSON.stringify(body);
+  }
   const headers: Record<string, string> = {
     "X-API-Key": g.apiKey,
     "Accept": "application/json",
   };
   if (payload) {
-    headers["Content-Type"] = "application/json";
+    headers["Content-Type"] = contentType;
     headers["Content-Length"] = String(Buffer.byteLength(payload));
   }
   const res = await httpRequest(
@@ -453,6 +462,19 @@ async function arcaneReal(
     );
   }
   return safeJson(res.body);
+}
+
+/**
+ * Create a direct-mode project. `body` is `{name, composeContent, envContent?}`.
+ * Arcane's project-create endpoint reads its JSON from multipart form fields (it
+ * shares the workspace-upload form) and rejects a JSON body with 422. The empty
+ * `manifest` says there are no extra workspace files to upload.
+ */
+async function createProject(g: GlobalArgsT, body: Json): Promise<Json> {
+  const form = new FormData();
+  form.append("project", JSON.stringify(body));
+  form.append("manifest", JSON.stringify({ fileChanges: [] }));
+  return unwrap(await arcane(g, "POST", `${ENV(g)}/projects`, form));
 }
 
 /** DELETE that treats 404 (already gone) as success, for idempotent pruning. */
@@ -2040,9 +2062,7 @@ export const model = {
         const body: Json = { name: args.name, composeContent };
         if (envContent !== undefined) body.envContent = envContent;
         logInfo(context, "Creating Arcane project", { name: args.name });
-        const created = unwrap(
-          await arcane(g, "POST", `${ENV(g)}/projects`, body),
-        );
+        const created = await createProject(g, body);
         const id = asString(pick(created, "id")) ?? "";
         const handle = await context.writeResource("project", args.name, {
           id,
@@ -2238,9 +2258,7 @@ export const model = {
           if (isFirstDeploy) {
             const body: Json = { name, composeContent };
             if (envContent !== undefined) body.envContent = envContent;
-            const created = unwrap(
-              await arcane(g, "POST", `${ENV(g)}/projects`, body),
-            );
+            const created = await createProject(g, body);
             id = asString(pick(created, "id")) ?? "";
             await record("create", true, 200, `created project ${id}`);
           } else {
