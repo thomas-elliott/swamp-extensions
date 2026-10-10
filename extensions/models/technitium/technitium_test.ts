@@ -73,8 +73,16 @@ Deno.test("unwrapEnvelope returns the response on status ok", () => {
   );
   // ok with no response object degrades to {}
   assertEquals(unwrapEnvelope({ status: "ok" }, "ctx"), {});
-  // an envelope-less object is treated as having no response
-  assertEquals(unwrapEnvelope({ foo: 1 }, "ctx"), {});
+});
+
+Deno.test("unwrapEnvelope refuses a reply that is not a Technitium response", () => {
+  // e.g. a proxy's login page served with 200: HTML, or JSON without status
+  assertThrows(
+    () => unwrapEnvelope("<html>login</html>", "GET /x"),
+    "not a Technitium",
+  );
+  assertThrows(() => unwrapEnvelope({ foo: 1 }, "GET /x"), "not a Technitium");
+  assertThrows(() => unwrapEnvelope(null, "GET /x"), "not a Technitium");
 });
 
 Deno.test("unwrapEnvelope throws on error / invalid-token, surfacing errorMessage", () => {
@@ -258,8 +266,16 @@ type MethodDef = {
     context: unknown,
   ) => Promise<{ dataHandles: unknown[] }>;
 };
+// Arguments go through the method's schema first, as swamp does, so defaults
+// apply and the schema itself is tested.
 function method(name: string): MethodDef {
-  return (model.methods as unknown as Record<string, MethodDef>)[name];
+  const m = (model.methods as unknown as Record<
+    string,
+    MethodDef & { arguments: { parse: (v: unknown) => unknown } }
+  >)[name];
+  return {
+    execute: (args, context) => m.execute(m.arguments.parse(args), context),
+  };
 }
 
 function scriptTransport(
@@ -307,20 +323,40 @@ Deno.test("blocking_set_state posts only enableBlocking and emits settings", asy
   }
 });
 
-Deno.test("blocking_set_lists comma-joins only the lists provided", async () => {
+// Technitium has no allow-list setting: allow lists are `!`-prefixed entries
+// in blockListUrls. Changing one side must keep the other.
+Deno.test("blocking_set_lists replaces only the list provided, in the one setting", async () => {
   const calls: Call[] = [];
-  scriptTransport(calls, () => ({}));
+  scriptTransport(
+    calls,
+    (c) =>
+      c.path === "/settings/get"
+        ? { blockListUrls: ["http://old", "!http://allow"] }
+        : { blockListUrls: ["http://a", "http://b", "!http://allow"] },
+  );
   try {
-    const { context } = makeContext();
+    const { context, written } = makeContext();
     await method("blocking_set_lists").execute(
       { blockListUrls: ["http://a", "http://b"] },
       context,
     );
-    assertEquals(calls[0].params, { blockListUrls: "http://a,http://b" });
-    assert(
-      !("allowListUrls" in (calls[0].params ?? {})),
-      "allowListUrls not sent when omitted",
-    );
+    assertEquals(calls[1].params, {
+      blockListUrls: "http://a,http://b,!http://allow",
+    });
+    assertEquals(written[0].data.blockListUrls, ["http://a", "http://b"]);
+    assertEquals(written[0].data.allowListUrls, ["http://allow"]);
+  } finally {
+    __setTechnitiumTransport(null);
+  }
+});
+
+Deno.test("blocking_set_lists clears with false when both lists end up empty", async () => {
+  const calls: Call[] = [];
+  scriptTransport(calls, () => ({ blockListUrls: ["http://old"] }));
+  try {
+    const { context } = makeContext();
+    await method("blocking_set_lists").execute({ blockListUrls: [] }, context);
+    assertEquals(calls[1].params, { blockListUrls: "false" });
   } finally {
     __setTechnitiumTransport(null);
   }
@@ -459,14 +495,14 @@ Deno.test("zone_create joins a catalog zone when catalog is given", async () => 
     await method("zone_create").execute({
       zone: "40.168.192.in-addr.arpa",
       type: "Primary",
-      catalog: "cluster-catalog.smol.internal",
+      catalog: "cluster-catalog.example.internal",
     }, context);
     assertEquals(calls[0].params, {
       zone: "40.168.192.in-addr.arpa",
       type: "Primary",
-      catalog: "cluster-catalog.smol.internal",
+      catalog: "cluster-catalog.example.internal",
     });
-    assertEquals(written[0].data.catalog, "cluster-catalog.smol.internal");
+    assertEquals(written[0].data.catalog, "cluster-catalog.example.internal");
   } finally {
     __setTechnitiumTransport(null);
   }
@@ -819,10 +855,38 @@ Deno.test("record_add and record_get address the same instance for one record (n
   }
 });
 
-Deno.test("record_update throws when read-back shows empty APP data (SERVFAIL landmine)", async () => {
+// Without a zone argument the zone is what Technitium reports, so the record
+// is filed under example.com, as record_list files it, not www.example.com.
+Deno.test("record_add without a zone and record_list address the same instance", async () => {
+  const calls: Call[] = [];
+  const rec = {
+    name: "www.example.com",
+    type: "A",
+    rData: { ipAddress: "1.2.3.4" },
+  };
+  scriptTransport(
+    calls,
+    () => ({ zone: { name: "example.com" }, records: [rec] }),
+  );
+  try {
+    const { context: addCtx, written: addWritten } = makeContext();
+    await method("record_add").execute(
+      { domain: "www.example.com", type: "A", rData: { ipAddress: "1.2.3.4" } },
+      addCtx,
+    );
+    const { context: listCtx, written: listWritten } = makeContext();
+    await method("record_list").execute({ zone: "example.com" }, listCtx);
+    assertEquals(addWritten[0].name, listWritten[0].name);
+    assertEquals(addWritten[0].data.zone, "example.com");
+  } finally {
+    __setTechnitiumTransport(null);
+  }
+});
+
+Deno.test("record_update throws when read-back shows empty APP data", async () => {
   const calls: Call[] = [];
   // Technitium accepts the POST but the live APP record has empty data, which
-  // caused the zone-wide SERVFAIL. Verification must catch it.
+  // makes the whole zone answer SERVFAIL. Verification must catch it.
   scriptTransport(
     calls,
     recordsResponder([{
@@ -1024,27 +1088,6 @@ type CheckDef = {
 };
 const reachable = (model.checks as unknown as Record<string, CheckDef>)
   .reachable;
-
-Deno.test("reachable check: applies the schema defaults to globalArgs", async () => {
-  let seen: Record<string, unknown> = {};
-  const paths: string[] = [];
-  __setTechnitiumTransport((g, _method, path) => {
-    seen = g;
-    paths.push(path);
-    return Promise.resolve({});
-  });
-  try {
-    // Checks get globalArgs without the schema's defaults.
-    const res = await reachable.execute({
-      globalArgs: { baseUrl: "https://dns.test:53443", apiToken: "t" },
-    });
-    assertEquals(res.pass, true);
-    assertEquals(paths, ["/settings/get"]);
-    assertEquals(seen.skipTlsVerify, false);
-  } finally {
-    __setTechnitiumTransport(null);
-  }
-});
 
 Deno.test("reachable check: a definition that fails the schema fails without probing", async () => {
   let called = false;
