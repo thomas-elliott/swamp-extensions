@@ -230,20 +230,27 @@ function safeJson(body: string): unknown {
  * the server's `errorMessage`. Returns the inner `response` object.
  */
 export function unwrapEnvelope(parsed: unknown, context: string): Json {
-  if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-    const o = parsed as Json;
-    const status = o.status;
-    if (status !== undefined && status !== "ok") {
-      const msg = typeof o.errorMessage === "string" && o.errorMessage
-        ? o.errorMessage
-        : String(status);
-      throw new Error(`Technitium ${context}: ${msg}`);
-    }
-    const resp = o.response;
-    if (resp && typeof resp === "object" && !Array.isArray(resp)) {
-      return resp as Json;
-    }
-    return {};
+  const o = parsed && typeof parsed === "object" && !Array.isArray(parsed)
+    ? parsed as Json
+    : undefined;
+  // Every Technitium API reply carries `status`. A 200 without one is
+  // something else answering, such as a proxy's login page, and must not
+  // count as success.
+  if (o?.status === undefined) {
+    throw new Error(
+      `Technitium ${context}: the reply is not a Technitium API response ` +
+        "(no status field); check baseUrl and anything proxying it",
+    );
+  }
+  if (o.status !== "ok") {
+    const msg = typeof o.errorMessage === "string" && o.errorMessage
+      ? o.errorMessage
+      : String(o.status);
+    throw new Error(`Technitium ${context}: ${msg}`);
+  }
+  const resp = o.response;
+  if (resp && typeof resp === "object" && !Array.isArray(resp)) {
+    return resp as Json;
   }
   return {};
 }
@@ -370,6 +377,15 @@ async function apiDownload(
     throw new Error(
       `Technitium GET ${path} -> HTTP ${res.status}: ${
         res.body.toString("utf8")
+      }`,
+    );
+  }
+  // A zip starts with "PK". Anything else (a JSON error, a proxy's login page)
+  // is not a backup, however it was served.
+  if (res.body[0] !== 0x50 || res.body[1] !== 0x4b) {
+    throw new Error(
+      `Technitium GET ${path}: the reply is not a zip file: ${
+        res.body.subarray(0, 200).toString("utf8")
       }`,
     );
   }
@@ -534,7 +550,9 @@ export function joinListUrls(
   urls: string[],
 ): { joined: string; tooLong: string[] } {
   return {
-    joined: urls.join(","),
+    // settings/set removes every URL when sent `false`; an empty value is
+    // not how the API clears a list.
+    joined: urls.length === 0 ? "false" : urls.join(","),
     tooLong: urls.filter((u) => u.length > 255),
   };
 }
@@ -602,28 +620,32 @@ type LiveRecord = {
 };
 
 /**
- * Fetch the live records at a single domain (not the whole zone) straight from
- * Technitium. Used by `record_get` and post-write verification: `record_list`'s
- * persisted data can go stale, so anything needing the current server state reads here.
+ * The live records at one domain, and the zone that holds them as Technitium
+ * reports it. Without an explicit `zone` that is the only way to know it: the
+ * domain `www.example.com` lives in zone `example.com`.
  */
 async function getDomainRecords(
   g: GlobalArgsT,
   domain: string,
   zone?: string,
-): Promise<LiveRecord[]> {
+): Promise<{ zone: string; records: LiveRecord[] }> {
   const params: Params = { domain, listZone: false };
   if (zone) params.zone = zone;
   const r = await apiCall(g, "GET", "/zones/records/get", params);
-  return coerceArray(r, "records").map((rec) => ({
-    name: asString(pick(rec, "name")) ?? domain,
-    type: asString(pick(rec, "type")) ?? "UNKNOWN",
-    ttl: asNumber(pick(rec, "ttl")),
-    disabled: pick(rec, "disabled") as boolean | undefined,
-    comments: asString(pick(rec, "comments")),
-    expiryTtl: asNumber(pick(rec, "expiryTtl")),
-    rData: (pick(rec, "rData") as Record<string, unknown> | undefined) ??
-      undefined,
-  }));
+  const zoneInfo = (r.zone ?? {}) as Json;
+  return {
+    zone: asString(pick(zoneInfo, "name")) ?? zone ?? domain,
+    records: coerceArray(r, "records").map((rec) => ({
+      name: asString(pick(rec, "name")) ?? domain,
+      type: asString(pick(rec, "type")) ?? "UNKNOWN",
+      ttl: asNumber(pick(rec, "ttl")),
+      disabled: pick(rec, "disabled") as boolean | undefined,
+      comments: asString(pick(rec, "comments")),
+      expiryTtl: asNumber(pick(rec, "expiryTtl")),
+      rData: (pick(rec, "rData") as Record<string, unknown> | undefined) ??
+        undefined,
+    })),
+  };
 }
 
 /**
@@ -654,8 +676,8 @@ function rDataMatches(
 
 /**
  * Read the record back after a mutation and assert it reflects the intended
- * state. Technitium can return `ok` while silently writing empty data (the APP
- * bug that caused a zone-wide SERVFAIL): for add/update assert a `type` record
+ * state. Technitium can return `ok` while writing empty data, and an APP record
+ * with empty data makes the whole zone answer SERVFAIL: for add/update assert a `type` record
  * matching `want` now exists at `domain`; for delete assert none remains. Throws
  * on mismatch so the method reports an error instead of success.
  */
@@ -666,9 +688,10 @@ async function verifyRecordWrite(
   type: string,
   want: Record<string, unknown> | undefined,
   zone?: string,
-): Promise<void> {
+): Promise<string> {
   const isApp = type.toUpperCase() === "APP";
-  const matched = (await getDomainRecords(g, domain, zone))
+  const live = await getDomainRecords(g, domain, zone);
+  const matched = live.records
     .filter((r) => r.type.toUpperCase() === type.toUpperCase())
     .some((r) => rDataMatches(want, r.rData, isApp));
   if (op === "deleted") {
@@ -678,7 +701,7 @@ async function verifyRecordWrite(
           `matches the deleted data — Technitium reported success but the record persists.`,
       );
     }
-    return;
+    return live.zone;
   }
   if (!matched) {
     throw new Error(
@@ -687,6 +710,7 @@ async function verifyRecordWrite(
         `or has different/empty data (e.g. an APP record written with empty recordData).`,
     );
   }
+  return live.zone;
 }
 
 /** Build a multipart/form-data body for a single file part. */
@@ -715,18 +739,32 @@ export function buildMultipart(
   };
 }
 
+/**
+ * Split Technitium's single `blockListUrls` setting into block and allow lists.
+ * Technitium has no separate allow-list setting: an allow list is an entry in
+ * `blockListUrls` with a `!` in front.
+ */
+function splitListUrls(r: Json): { block: string[]; allow: string[] } {
+  const all = toStringArray(pick(r, "blockListUrls")) ?? [];
+  return {
+    block: all.filter((u) => !u.startsWith("!")),
+    allow: all.filter((u) => u.startsWith("!")).map((u) => u.slice(1)),
+  };
+}
+
 /** Extract the blocking-relevant subset of a Technitium settings response. */
 function extractSettings(
   r: Json,
   observedAt: string,
 ): z.infer<typeof SettingsResource> {
+  const lists = splitListUrls(r);
   return {
     enableBlocking: pick(r, "enableBlocking") as boolean | undefined,
     temporaryDisableBlockingTill: asString(
       pick(r, "temporaryDisableBlockingTill"),
     ),
-    blockListUrls: toStringArray(pick(r, "blockListUrls")),
-    allowListUrls: toStringArray(pick(r, "allowListUrls")),
+    blockListUrls: lists.block,
+    allowListUrls: lists.allow,
     blockListUrlUpdateIntervalHours: asNumber(
       pick(r, "blockListUrlUpdateIntervalHours"),
     ),
@@ -774,15 +812,10 @@ function logInfo(
   context.logger?.info?.(message, props ?? {});
 }
 
-const ZoneType = z.enum([
-  "Primary",
-  "Secondary",
-  "Stub",
-  "Forwarder",
-  "SecondaryForwarder",
-  "Catalog",
-  "SecondaryCatalog",
-]);
+// Only the types zone_create can make with the arguments it takes. Secondary,
+// Stub and the forwarder and secondary catalog types need a primary server or
+// a forwarder address.
+const ZoneType = z.enum(["Primary", "Catalog"]);
 
 const StatsRange = z.enum([
   "LastHour",
@@ -855,8 +888,7 @@ const ZoneCreateArgs = z.object({
   type: ZoneType.default("Primary"),
   catalog: z.string().optional().describe(
     "Name of an existing catalog zone to join as a member zone, so secondaries " +
-      "provision it automatically. Valid only for Primary, Secondary, Stub and " +
-      "Forwarder zones.",
+      "provision it automatically. Valid only for a Primary zone.",
   ),
 });
 
@@ -934,6 +966,7 @@ const LogsQueryArgs = z.object({
   clientIpAddress: z.string().optional(),
   protocol: z.string().optional(),
   responseType: z.string().optional(),
+  rcode: z.string().optional().describe("DNS response code, e.g. NxDomain"),
   qname: z.string().optional(),
   qtype: z.string().optional(),
   qclass: z.string().optional(),
@@ -1241,7 +1274,8 @@ export const model = {
 
     blocking_set_lists: {
       description:
-        "Set the block-list and/or allow-list URLs (comma-joined; only the lists you provide are changed).",
+        "Set the block-list and/or allow-list URLs; only the lists you provide are changed, and an " +
+        "empty list clears it. Technitium keeps both in one setting, allow entries prefixed with `!`.",
       arguments: BlockingSetListsArgs,
       execute: async (
         args: z.infer<typeof BlockingSetListsArgs>,
@@ -1253,33 +1287,23 @@ export const model = {
             "Provide at least one of blockListUrls / allowListUrls",
           );
         }
-        const params: Params = {};
-        if (args.blockListUrls) {
-          const { joined, tooLong } = joinListUrls(args.blockListUrls);
-          if (tooLong.length) {
-            logInfo(
-              context,
-              "Block-list URL(s) exceed Technitium's 255-char limit",
-              {
-                count: tooLong.length,
-              },
-            );
-          }
-          params.blockListUrls = joined;
+        // Both lists live in the one blockListUrls setting, so keep the side
+        // that was not passed as it is now.
+        const current = splitListUrls(
+          await apiCall(g, "GET", "/settings/get"),
+        );
+        const block = args.blockListUrls ?? current.block;
+        const allow = args.allowListUrls ?? current.allow;
+        const { joined, tooLong } = joinListUrls([
+          ...block,
+          ...allow.map((u) => `!${u}`),
+        ]);
+        if (tooLong.length) {
+          logInfo(context, "List URL(s) exceed Technitium's 255-char limit", {
+            count: tooLong.length,
+          });
         }
-        if (args.allowListUrls) {
-          const { joined, tooLong } = joinListUrls(args.allowListUrls);
-          if (tooLong.length) {
-            logInfo(
-              context,
-              "Allow-list URL(s) exceed Technitium's 255-char limit",
-              {
-                count: tooLong.length,
-              },
-            );
-          }
-          params.allowListUrls = joined;
-        }
+        const params: Params = { blockListUrls: joined };
         const r = await apiCall(g, "POST", "/settings/set", params);
         const handle = await context.writeResource(
           "settings",
@@ -1583,7 +1607,11 @@ export const model = {
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const g: GlobalArgsT = context.globalArgs;
-        const records = await getDomainRecords(g, args.domain, args.zone);
+        const { zone, records } = await getDomainRecords(
+          g,
+          args.domain,
+          args.zone,
+        );
         const observedAt = new Date().toISOString();
         const handles: DataHandle[] = [];
         for (const rec of records) {
@@ -1591,13 +1619,13 @@ export const model = {
             await context.writeResource(
               "zoneRecord",
               recordInstanceName(
-                args.zone ?? rec.name,
+                zone,
                 rec.name,
                 rec.type,
                 rec.rData,
               ),
               {
-                zone: args.zone ?? rec.name,
+                zone,
                 name: rec.name,
                 type: rec.type,
                 ttl: rec.ttl,
@@ -1639,7 +1667,8 @@ export const model = {
           type: args.type,
         });
         await apiCall(g, "POST", "/zones/records/add", params);
-        await verifyRecordWrite(
+        // The zone Technitium reports, so the name matches record_list's.
+        const zone = await verifyRecordWrite(
           g,
           "added",
           args.domain,
@@ -1647,7 +1676,6 @@ export const model = {
           args.rData,
           args.zone,
         );
-        const zone = args.zone ?? args.domain;
         const handle = await context.writeResource(
           "zoneRecord",
           recordInstanceName(zone, args.domain, args.type, args.rData),
@@ -1680,7 +1708,9 @@ export const model = {
         // record first so changing one field leaves the others as they were.
         // APP records are matched by domain+type alone (only one exists per name).
         const existing = (await getDomainRecords(g, args.domain, args.zone))
-          .filter((r) => r.type.toUpperCase() === args.type.toUpperCase())
+          .records.filter((r) =>
+            r.type.toUpperCase() === args.type.toUpperCase()
+          )
           .find((r) => isApp || rDataMatches(args.rData, r.rData, false));
         if (!existing) {
           throw new Error(
@@ -1710,7 +1740,7 @@ export const model = {
           type: args.type,
         });
         await apiCall(g, "POST", "/zones/records/update", params);
-        await verifyRecordWrite(
+        const zone = await verifyRecordWrite(
           g,
           "updated",
           args.newDomain ?? args.domain,
@@ -1718,7 +1748,6 @@ export const model = {
           args.newRData ?? args.rData,
           args.zone,
         );
-        const zone = args.zone ?? args.domain;
         const handle = await context.writeResource(
           "zoneRecord",
           recordInstanceName(
@@ -1759,7 +1788,7 @@ export const model = {
           type: args.type,
         });
         await apiCall(g, "POST", "/zones/records/delete", params);
-        await verifyRecordWrite(
+        const zone = await verifyRecordWrite(
           g,
           "deleted",
           args.domain,
@@ -1767,7 +1796,6 @@ export const model = {
           args.rData,
           args.zone,
         );
-        const zone = args.zone ?? args.domain;
         const handle = await context.writeResource(
           "zoneRecord",
           recordInstanceName(zone, args.domain, args.type, args.rData),
@@ -2030,6 +2058,7 @@ export const model = {
           clientIpAddress: args.clientIpAddress,
           protocol: args.protocol,
           responseType: args.responseType,
+          rcode: args.rcode,
           qname: args.qname,
           qtype: args.qtype,
           qclass: args.qclass,

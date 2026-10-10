@@ -74,8 +74,8 @@ swamp model method run dns-home cache_flush
 - **`zone_*`** — `zone_list`, `zone_create`, `zone_delete`, `zone_enable`,
   `zone_disable`. `zone_create` takes an optional `catalog`: the name of an
   existing catalog zone to join, so secondaries provision the new zone
-  automatically instead of it existing only on the primary. Valid for Primary,
-  Secondary, Stub and Forwarder zones; `zone_list` reports membership.
+  automatically instead of it existing only on the primary. It creates Primary
+  and Catalog zones; `zone_list` reports membership.
 - **`record_*`** — `record_list`, `record_get`, `record_add`, `record_update`,
   `record_delete`. Type-specific fields go in `rData` (e.g. `{ipAddress}` for A,
   `{cname}` for CNAME, `{exchange, preference}` for MX). Updates carry the new
@@ -128,14 +128,32 @@ read**. The Technitium server holds the authoritative state. Every record method
 — `record_add`, `record_update`, `record_delete`, `record_list`, `record_get` —
 addresses a record by a deterministic identity name derived from
 `(zone, name, type, rData)`, so the same record is one instance regardless of
-which method wrote it, and two records at one name (e.g. two A records) stay
-distinct. A re-`record_list` writes a **new version** of an unchanged record
-rather than a duplicate. Because swamp does not auto-prune instances,
+which method wrote it (without a `zone` argument, the zone is the one Technitium
+reports as holding the record), and two records at one name (e.g. two A records)
+stay distinct. A re-`record_list` writes a **new version** of an unchanged
+record rather than a duplicate. Because swamp does not auto-prune instances,
 `zoneRecord` carries a finite **30-day lifetime**: records that still exist
 refresh their timer on each list/get, while records that were deleted or had
 their value changed stop being refreshed and expire. For the current state of a
 single name, use `record_get` (a live read); `swamp data gc` /
 `swamp data delete` clean up persisted entries on demand.
+
+## Breaking changes
+
+- **`settings_restore` no longer restores users and tokens, web service settings
+  or cluster settings by default.** Set `authConfig`, `webServiceSettings` or
+  `clusterConfig` to true in `options` to include them. `settings_backup` now
+  includes every section.
+- **`zone_create` creates Primary and Catalog zones only.** The other types need
+  arguments it does not take.
+- **`blocking_set_lists` now changes allow lists.** Technitium keeps allow lists
+  in `blockListUrls` with a `!` prefix; earlier versions sent a parameter it
+  ignores. An empty list clears that side.
+- **A record written without `zone` is filed under the zone Technitium reports**
+  (`example.com`), not under the record's own name, so it matches what
+  `record_list` writes.
+- **A reply without a Technitium `status`, such as a proxy's login page, is an
+  error**, and so is a backup download that is not a zip file.
 
 ## License
 
