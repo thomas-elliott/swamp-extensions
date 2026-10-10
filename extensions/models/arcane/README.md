@@ -53,9 +53,8 @@ swamp model method run arcane-prod swarm_stack_remove --input '{"name":"unifi"}'
 
 ## Method sections
 
-- **`version`** — read Arcane's version (current + newest available; the
-  endpoint is identical on v1.19.x and v2.0.x). Use it before and after an
-  upgrade.
+- **`version`** — read Arcane's version (current + newest available). Use it
+  before and after an upgrade.
 - **`gitops_*`** — drive Arcane Git Sync: `gitops_repo_list` /
   `gitops_repo_ensure`, `gitops_sync_list` / `gitops_sync_ensure`,
   `gitops_sync_trigger`, and `gitops_sync_status` (fan-out health view: per-sync
@@ -133,8 +132,8 @@ Arcane's `/swarm/stacks` API:
    the stack's services to reach their target replica counts.
 
 A stack that deploys but **does not converge is left in place** and the method
-throws. It is **not** force-removed and **not** auto-rolled-back (guardrail #5).
-Inspect with `swarm_stack_tasks` / `swarm_service_list`, then re-deploy or
+throws. It is **not** force-removed and **not** auto-rolled-back. Inspect with
+`swarm_stack_tasks` / `swarm_service_list`, then re-deploy or
 `swarm_stack_remove`. Each step records an `operation-result`; the stack itself
 is recorded as a `swarm-stack` resource.
 
@@ -168,11 +167,11 @@ is recorded as a `swarm-stack` resource.
 Docker-level housekeeping via Arcane (works on any environment, not swarm-only):
 
 - `volume_list` includes an `inUse` flag so orphaned volumes are visible.
-- `volume_remove` is **idempotent** (a 404 is treated as already-gone). An
-  in-use volume is **reported and left in place**. Arcane reports in-use as
-  **HTTP 500** (not the 409 the Docker API uses), so the method matches on the
-  message text as well as the status. `force:true` bypasses the in-use guard but
-  is discouraged (risks data loss, guardrail #5).
+- `volume_remove` is **idempotent**: a volume that is already gone counts as
+  removed. An in-use volume is **reported and left in place**. Arcane returns
+  every delete failure as **HTTP 500** with Docker's message, so the method
+  matches on the message text. `force:true` bypasses Docker's in-use check but
+  risks data loss.
 - `volume_prune` removes only **unused anonymous** volumes (Docker's default; it
   does **not** touch named volumes). To remove a specific named volume use
   `volume_remove`.
