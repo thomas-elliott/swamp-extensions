@@ -162,8 +162,20 @@ Deno.test("bucket_create: localAlias requires localAliasAccessKeyId", async () =
 
 // ─────────────────────────── bucket_update ───────────────────────────
 
+// A bucket with a quota and a website already configured, as GetBucketInfo
+// reports it. The update tests check that whatever is not passed survives.
+const BUCKET_B1 = {
+  id: "b1",
+  globalAliases: ["site"],
+  quotas: { maxObjects: 100, maxSize: 5000 },
+  websiteAccess: true,
+  websiteConfig: { indexDocument: "index.html", errorDocument: "404.html" },
+};
+
 Deno.test("bucket_update: builds quotas + websiteAccess body, query carries id", async () => {
-  const fake = makeFakeApi(() => undefined);
+  const fake = makeFakeApi((op) =>
+    op === "GetBucketInfo" ? { id: "b1", globalAliases: [], quotas: {}, websiteAccess: false } : undefined
+  );
   __setGarageApi(fake.fn);
   try {
     const { context } = makeContext();
@@ -171,12 +183,56 @@ Deno.test("bucket_update: builds quotas + websiteAccess body, query carries id",
       { id: "b1", maxObjects: 100, maxSize: 5000, websiteEnabled: true, indexDocument: "index.html" },
       context,
     );
+    assertEquals(fake.ops(), ["GetBucketInfo", "UpdateBucket"], "reads current state first");
     const c = call(fake.calls, "UpdateBucket")!;
     assertEquals(c.query, { id: "b1" });
     assertEquals(c.body, {
       quotas: { maxObjects: 100, maxSize: 5000 },
       websiteAccess: { enabled: true, indexDocument: "index.html", errorDocument: null },
     });
+  } finally {
+    __setGarageApi(null);
+  }
+});
+
+// Garage replaces the whole quotas object, so a one-quota change used to clear
+// the other quota; the website object must not be sent at all.
+Deno.test("bucket_update: changing one quota keeps the other and leaves the website alone", async () => {
+  const fake = makeFakeApi((op) => (op === "GetBucketInfo" ? BUCKET_B1 : undefined));
+  __setGarageApi(fake.fn);
+  try {
+    const { context } = makeContext();
+    await method("bucket_update").execute({ id: "b1", maxSize: 9000 }, context);
+    assertEquals(call(fake.calls, "UpdateBucket")?.body, {
+      quotas: { maxObjects: 100, maxSize: 9000 },
+    });
+  } finally {
+    __setGarageApi(null);
+  }
+});
+
+Deno.test("bucket_update: changing the index document keeps the error document and quotas", async () => {
+  const fake = makeFakeApi((op) => (op === "GetBucketInfo" ? BUCKET_B1 : undefined));
+  __setGarageApi(fake.fn);
+  try {
+    const { context } = makeContext();
+    await method("bucket_update").execute({ id: "b1", indexDocument: "home.html" }, context);
+    assertEquals(call(fake.calls, "UpdateBucket")?.body, {
+      websiteAccess: { enabled: true, indexDocument: "home.html", errorDocument: "404.html" },
+    });
+  } finally {
+    __setGarageApi(null);
+  }
+});
+
+// Garage rejects indexDocument/errorDocument alongside enabled:false.
+Deno.test("bucket_update: disabling the website sends no documents", async () => {
+  const fake = makeFakeApi((op) => (op === "GetBucketInfo" ? BUCKET_B1 : undefined));
+  __setGarageApi(fake.fn);
+  try {
+    const { context } = makeContext();
+    await method("bucket_update").execute({ id: "b1", websiteEnabled: false }, context);
+    assertEquals(call(fake.calls, "UpdateBucket")?.body, { websiteAccess: { enabled: false } });
   } finally {
     __setGarageApi(null);
   }
@@ -528,23 +584,28 @@ Deno.test("reachable check: fails with errors when the probe throws", async () =
 
 // ─────────────────────────── cluster_status / layout_get ───────────────────────────
 
+// GetNodeInfo?node=self as Garage answers it: a per-node map keyed by node id.
+const SELF_N1 = { success: { n1: { nodeId: "n1", garageVersion: "v2.3.0" } }, error: {} };
+
 Deno.test("cluster_status: shapes node id, version, and per-node role", async () => {
-  const fake = makeFakeApi((op) =>
-    op === "GetClusterStatus"
-      ? {
-        node: "n1",
-        garageVersion: "v2.3.0",
+  const fake = makeFakeApi((op) => {
+    if (op === "GetNodeInfo") return SELF_N1;
+    if (op === "GetClusterStatus") {
+      // GetClusterStatusResponse has layoutVersion and nodes only; no self id.
+      return {
         layoutVersion: 1,
         nodes: [
           { id: "n1", hostname: "garage-ci", isUp: true, draining: false, role: { zone: "dc1", capacity: 1000000000, tags: [] } },
         ],
-      }
-      : undefined
-  );
+      };
+    }
+    return undefined;
+  });
   __setGarageApi(fake.fn);
   try {
     const { context, written } = makeContext();
     await method("cluster_status").execute({}, context);
+    assertEquals(call(fake.calls, "GetNodeInfo")?.query, { node: "self" });
     const d = written[0].data as Record<string, unknown>;
     assertEquals(d.node, "n1");
     assertEquals(d.layoutVersion, 1);
@@ -585,8 +646,15 @@ Deno.test("layout_get: shapes roles + staged changes + zoneRedundancy", async ()
 
 // ─────────────────────────── layout_assign ───────────────────────────
 
-Deno.test("layout_assign: storage node body (capacity int), action staged", async () => {
-  const fake = makeFakeApi(() => undefined);
+const EMPTY_LAYOUT = { version: 0, roles: [], stagedRoleChanges: [] };
+const LAYOUT_N1 = {
+  version: 2,
+  roles: [{ id: "n1", zone: "rack-a", capacity: 1000000000, tags: ["ssd"] }],
+  stagedRoleChanges: [],
+};
+
+Deno.test("layout_assign: new node — storage body (capacity int), no tags, action staged", async () => {
+  const fake = makeFakeApi((op) => (op === "GetClusterLayout" ? EMPTY_LAYOUT : undefined));
   __setGarageApi(fake.fn);
   try {
     const { context, written } = makeContext();
@@ -604,8 +672,53 @@ Deno.test("layout_assign: storage node body (capacity int), action staged", asyn
   }
 });
 
+// A role change is whole-role, so a capacity-only call used to restage the
+// node into zone dc1 with no tags.
+Deno.test("layout_assign: capacity-only change keeps the node's current zone and tags", async () => {
+  const fake = makeFakeApi((op) => (op === "GetClusterLayout" ? LAYOUT_N1 : undefined));
+  __setGarageApi(fake.fn);
+  try {
+    const { context } = makeContext();
+    await method("layout_assign").execute({ nodeId: "n1", capacity: 2000000000 }, context);
+    assertEquals(call(fake.calls, "UpdateClusterLayout")?.body, {
+      roles: [{ id: "n1", zone: "rack-a", capacity: 2000000000, tags: ["ssd"] }],
+      parameters: null,
+    });
+  } finally {
+    __setGarageApi(null);
+  }
+});
+
+Deno.test("layout_assign: zone-only change keeps the node's current capacity", async () => {
+  const fake = makeFakeApi((op) => (op === "GetClusterLayout" ? LAYOUT_N1 : undefined));
+  __setGarageApi(fake.fn);
+  try {
+    const { context } = makeContext();
+    await method("layout_assign").execute({ nodeId: "n1", zone: "rack-b" }, context);
+    const body = call(fake.calls, "UpdateClusterLayout")?.body as Record<string, unknown>;
+    assertEquals(body.roles, [{ id: "n1", zone: "rack-b", capacity: 1000000000, tags: ["ssd"] }]);
+  } finally {
+    __setGarageApi(null);
+  }
+});
+
+Deno.test("layout_assign: new node without a zone is rejected before staging", async () => {
+  const fake = makeFakeApi((op) => (op === "GetClusterLayout" ? EMPTY_LAYOUT : undefined));
+  __setGarageApi(fake.fn);
+  try {
+    const { context } = makeContext();
+    await rejects(
+      () => method("layout_assign").execute({ nodeId: "n9", capacity: 1 }, context),
+      /no role in the current layout; pass zone/,
+    );
+    assert(!call(fake.calls, "UpdateClusterLayout"), "must not stage without a zone");
+  } finally {
+    __setGarageApi(null);
+  }
+});
+
 Deno.test("layout_assign: gateway (no capacity) sends capacity:null; zoneRedundancy parsed", async () => {
-  const fake = makeFakeApi(() => undefined);
+  const fake = makeFakeApi((op) => (op === "GetClusterLayout" ? EMPTY_LAYOUT : undefined));
   __setGarageApi(fake.fn);
   try {
     const { context } = makeContext();
@@ -672,7 +785,7 @@ Deno.test("layout_revert: calls RevertClusterLayout, action reverted", async () 
 
 Deno.test("cluster_init: fresh cluster — assigns responding node + applies version+1", async () => {
   const fake = makeFakeApi((op) => {
-    if (op === "GetClusterStatus") return { node: "n1", layoutVersion: 0, nodes: [{ id: "n1", isUp: true }] };
+    if (op === "GetNodeInfo") return SELF_N1;
     if (op === "GetClusterLayout") return { version: 0, roles: [], stagedRoleChanges: [] };
     if (op === "ApplyClusterLayout") return { message: ["initialized"], layout: {} };
     return undefined;
@@ -681,6 +794,7 @@ Deno.test("cluster_init: fresh cluster — assigns responding node + applies ver
   try {
     const { context, written } = makeContext();
     await method("cluster_init").execute({ capacity: 1000000000 }, context);
+    assertEquals(call(fake.calls, "GetNodeInfo")?.query, { node: "self" });
     assertEquals((call(fake.calls, "UpdateClusterLayout")?.body as Record<string, unknown>).roles, [
       { id: "n1", zone: "dc1", capacity: 1000000000, tags: [] },
     ]);
@@ -695,7 +809,7 @@ Deno.test("cluster_init: fresh cluster — assigns responding node + applies ver
 
 Deno.test("cluster_init: idempotent — already-initialised layout is unchanged, no writes", async () => {
   const fake = makeFakeApi((op) => {
-    if (op === "GetClusterStatus") return { node: "n1", nodes: [] };
+    if (op === "GetNodeInfo") return SELF_N1;
     if (op === "GetClusterLayout") return { version: 5, roles: [{ id: "n1", zone: "dc1", capacity: 1 }], stagedRoleChanges: [] };
     return undefined;
   });
@@ -706,6 +820,37 @@ Deno.test("cluster_init: idempotent — already-initialised layout is unchanged,
     assert(!call(fake.calls, "UpdateClusterLayout"), "must not stage when already initialised");
     assert(!call(fake.calls, "ApplyClusterLayout"), "must not apply when already initialised");
     assertEquals(written[0].data.action, "unchanged");
+  } finally {
+    __setGarageApi(null);
+  }
+});
+
+Deno.test("cluster_init: explicit nodeId skips the self lookup", async () => {
+  const fake = makeFakeApi((op) => {
+    if (op === "GetClusterLayout") return { version: 0, roles: [], stagedRoleChanges: [] };
+    if (op === "ApplyClusterLayout") return { message: [], layout: {} };
+    return undefined;
+  });
+  __setGarageApi(fake.fn);
+  try {
+    const { context, written } = makeContext();
+    await method("cluster_init").execute({ nodeId: "n2", capacity: 1 }, context);
+    assert(!call(fake.calls, "GetNodeInfo"), "must not ask which node is self");
+    assertEquals(written[0].data.nodeId, "n2");
+  } finally {
+    __setGarageApi(null);
+  }
+});
+
+Deno.test("cluster_init: self lookup with no answering node throws before any write", async () => {
+  const fake = makeFakeApi((op) =>
+    op === "GetNodeInfo" ? { success: {}, error: { n1: "timeout" } } : undefined
+  );
+  __setGarageApi(fake.fn);
+  try {
+    const { context } = makeContext();
+    await rejects(() => method("cluster_init").execute({ capacity: 1 }, context), /returned no node/);
+    assert(!call(fake.calls, "UpdateClusterLayout"));
   } finally {
     __setGarageApi(null);
   }

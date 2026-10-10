@@ -84,7 +84,7 @@ confusion — the namespaces don't actually collide.
 | `cluster_status` | This node's id, Garage version, layout version, and every node's role/up-state. Read-only — use it to find node ids. |
 | `layout_get` | Current layout: assigned roles + staged (un-applied) changes. Read-only. |
 | `cluster_init` | **First boot in one call:** assign a storage role to the node (defaults to the responding node — correct for single-node) and apply it, making a fresh cluster usable without the CLI. Idempotent (skips if already initialised unless `force`). |
-| `layout_assign` | Stage a node role (zone + `capacity` in bytes, or gateway when capacity omitted). |
+| `layout_assign` | Stage a node role (zone, `capacity` in bytes or `null` for gateway, tags). Anything omitted keeps the node's current value; a node with no role yet needs a zone and defaults to gateway. |
 | `layout_apply` | Commit staged changes (defaults to current version + 1). |
 | `layout_revert` | Discard staged changes. |
 
