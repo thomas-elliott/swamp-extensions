@@ -57,8 +57,10 @@ import type {
 // ─────────────────────────── global arguments ───────────────────────────
 
 const GlobalArgs = z.object({
-  endpoint: z.string().default("wss://nas.example.com/api/current").describe(
-    "TrueNAS host or wss:// base URL, e.g. nas.example.com or " +
+  // Required: a placeholder default would send a real API key to a host that
+  // is not the user's NAS.
+  endpoint: z.string().min(1).describe(
+    "TrueNAS host or wss:// base URL (required), e.g. nas.example.com or " +
       "wss://nas.example.com/api/current. A bare host becomes " +
       "wss://<host>/api/current. NON-TLS (ws://, http://) is REJECTED — TrueNAS " +
       "revokes an API key sent over cleartext.",
@@ -1132,13 +1134,15 @@ export const model = {
         "Verify the TrueNAS API authenticates (wss login + system.info)",
       labels: ["live"],
       execute: async (context: Pick<Ctx, "globalArgs">) => {
-        const g = context.globalArgs;
-        // `swamp model validate` does NOT resolve vault expressions before checks, so
-        // the key is still a literal `${{ … }}` and a probe can't auth. Skip then —
-        // real reachability is exercised at method-run time.
-        if (/\$\{\{/.test(String(g.apiKey))) return { pass: true };
         let session: RpcSession | undefined;
         try {
+          // Checks get globalArgs without the schema's defaults; parse to apply
+          // them. Inside the try so a definition that fails the schema reports
+          // as a failed check rather than an unhandled throw.
+          const g = GlobalArgs.parse(context.globalArgs);
+          // Older swamp left the key as an unresolved `${{ … }}` here. Skip then;
+          // the method run checks it.
+          if (/\$\{\{/.test(g.apiKey)) return { pass: true };
           session = await openSession(g);
           await session.call("system.info", []);
           return { pass: true };
@@ -1146,7 +1150,9 @@ export const model = {
           return {
             pass: false,
             errors: [
-              `Cannot reach TrueNAS at ${g.endpoint}: ${(e as Error).message}`,
+              `Cannot reach TrueNAS at ${
+                String(context.globalArgs?.endpoint)
+              }: ${(e as Error).message}`,
             ],
           };
         } finally {
@@ -2125,9 +2131,11 @@ export const model = {
             // protects against deleting the WRONG existing share, so it doesn't
             // apply when there's nothing to delete.
             const ats = new Date().toISOString();
+            // No share, so no id to name the instance after; a path contains
+            // slashes, which an instance name cannot.
             const handle = await context.writeResource(
               "nfs-share-result",
-              String(a.id ?? a.path),
+              a.id !== undefined ? String(a.id) : pathKey(a.path ?? ""),
               {
                 id: a.id ?? 0,
                 path: a.path ?? "",
@@ -2239,13 +2247,12 @@ export const model = {
             name: share.name,
             releaseLock,
           });
-          // Echo name+path: sharing.smb.update marks them required in its schema, so
-          // include the verified values to be safe even though the update is partial.
-          // Include purpose only when releasing a host-locking preset, so non-locked
-          // shares keep their existing preset untouched.
+          // sharing.smb.update has PATCH semantics (SmbShareUpdate uses
+          // ForUpdateMetaclass upstream, so every field is optional and omitted
+          // ones keep their stored value). Send only what changes. Include purpose
+          // only when releasing a host-locking preset, so non-locked shares keep
+          // their existing preset untouched.
           const payload: Record<string, unknown> = {
-            name: String(share.name ?? ""),
-            path: String(share.path ?? ""),
             hostsallow: newAllow,
             hostsdeny: newDeny,
           };
@@ -2297,9 +2304,11 @@ export const model = {
             // protects against deleting the WRONG existing share, so it doesn't
             // apply when there's nothing to delete.
             const ats = new Date().toISOString();
+            // No share, so no id to name the instance after; a share name may
+            // hold characters an instance name cannot.
             const handle = await context.writeResource(
               "smb-share-result",
-              String(a.id ?? a.name),
+              a.id !== undefined ? String(a.id) : pathKey(a.name ?? ""),
               {
                 id: a.id ?? 0,
                 name: a.name ?? "",

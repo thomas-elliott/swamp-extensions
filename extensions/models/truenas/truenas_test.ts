@@ -923,6 +923,21 @@ Deno.test("nfs_share_delete: already-absent share succeeds with action=absent (i
     const r = written[0].data;
     assertEquals(r.action, "absent");
     assertEquals(r.id, 9);
+    assertEquals(written[0].name, "9", "by id: named after the id, as a real delete is");
+  } finally {
+    __setTruenasSession(null);
+  }
+});
+
+Deno.test("nfs_share_delete: absent share selected by path gets a slash-free instance name", async () => {
+  const fake = makeFakeSession((m) => (m === "sharing.nfs.query" ? [] : undefined));
+  __setTruenasSession(fake.factory);
+  try {
+    const { context, written } = makeContext();
+    await method("nfs_share_delete").execute({ path: "/mnt/tank/old" }, context);
+    assertEquals(written[0].name, "mnt-tank-old");
+    assertEquals(written[0].data.path, "/mnt/tank/old");
+    assertEquals(written[0].data.action, "absent");
   } finally {
     __setTruenasSession(null);
   }
@@ -1014,9 +1029,27 @@ Deno.test("smb_share_delete: already-absent share succeeds with action=absent (i
   }
 });
 
+Deno.test("smb_share_delete: absent share selected by name gets a safe instance name", async () => {
+  const fake = makeFakeSession((m) => (m === "sharing.smb.query" ? [] : undefined));
+  __setTruenasSession(fake.factory);
+  try {
+    const { context, written } = makeContext();
+    await method("smb_share_delete").execute({ name: "Old Media/2019" }, context);
+    assertEquals(written[0].name, "Old-Media-2019");
+    assertEquals(written[0].data.name, "Old Media/2019");
+    assertEquals(written[0].data.action, "absent");
+
+    const byId = makeContext();
+    await method("smb_share_delete").execute({ id: 6 }, byId.context);
+    assertEquals(byId.written[0].name, "6", "by id: named after the id, as a real delete is");
+  } finally {
+    __setTruenasSession(null);
+  }
+});
+
 // ─────────────────────────── smb_share_set_access ───────────────────────────
 
-Deno.test("smb_share_set_access: echoes name+path and sets hostsallow", async () => {
+Deno.test("smb_share_set_access: sends only the access fields (update is a PATCH)", async () => {
   const before = {
     id: 3,
     name: "Media",
@@ -1033,8 +1066,11 @@ Deno.test("smb_share_set_access: echoes name+path and sets hostsallow", async ()
     if (m === "sharing.smb.update") {
       done = true;
       const body = params[1] as Record<string, unknown>;
-      assertEquals(body.name, "Media", "must echo name (schema-required)");
-      assertEquals(body.path, "/mnt/m", "must echo path");
+      // sharing.smb.update keeps omitted fields, so echoing name/path only
+      // risks re-validating values that are not changing.
+      assertEquals(body.name, undefined, "must not echo name");
+      assertEquals(body.path, undefined, "must not echo path");
+      assertEquals(body.purpose, undefined, "must not touch purpose");
       assertEquals(body.hostsallow, ["192.0.2.50"]);
       return after;
     }
@@ -1154,6 +1190,56 @@ Deno.test("no method logs the API key", async () => {
     await method("app_list").execute({}, context);
     const blob = JSON.stringify(logs);
     assert(!blob.includes(GLOBALS.apiKey), "API key must never appear in logs");
+  } finally {
+    __setTruenasSession(null);
+  }
+});
+
+// ─────────────────────────── reachable check ───────────────────────────
+
+type CheckDef = {
+  execute: (
+    context: { globalArgs: Record<string, unknown> },
+  ) => Promise<{ pass: boolean; errors?: string[] }>;
+};
+const check = (name: string): CheckDef =>
+  (model.checks as unknown as Record<string, CheckDef>)[name];
+
+// A check receives globalArgs without the schema's defaults, so the fixture
+// omits every defaulted setting to prove the check applies them itself.
+Deno.test("reachable check applies the schema defaults to globalArgs", async () => {
+  let seen: Record<string, unknown> | undefined;
+  const fake = makeFakeSession((m) => (m === "system.info" ? {} : undefined));
+  __setTruenasSession((g) => {
+    seen = g;
+    return fake.factory(g);
+  });
+  try {
+    const r = await check("reachable").execute({
+      globalArgs: { endpoint: GLOBALS.endpoint, apiKey: GLOBALS.apiKey },
+    });
+    assertEquals(r.pass, true);
+    assertEquals(seen?.timeoutMs, 30000);
+    assertEquals(seen?.insecureSkipTlsVerify, false);
+    assert(fake.isClosed(), "the probe session must be closed");
+  } finally {
+    __setTruenasSession(null);
+  }
+});
+
+Deno.test("reachable check fails, not throws, when endpoint is omitted", async () => {
+  let opened = false;
+  __setTruenasSession((g) => {
+    opened = true;
+    return makeFakeSession(() => ({})).factory(g);
+  });
+  try {
+    const r = await check("reachable").execute({
+      globalArgs: { apiKey: GLOBALS.apiKey },
+    });
+    assertEquals(r.pass, false);
+    assert(/endpoint/.test((r.errors ?? []).join(" ")), "must name the field");
+    assertEquals(opened, false, "must not open a session without an endpoint");
   } finally {
     __setTruenasSession(null);
   }
