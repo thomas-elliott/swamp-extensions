@@ -93,9 +93,10 @@ tables the owner creates). Those table and default privileges are what the role
 gets when `tablePrivs` / `includeFuture` are not passed and the role does not
 yet hold the schema grant, which is also how a re-run after a failed first
 attempt finishes provisioning (it returns `granted`). Once the role holds the
-schema grant, re-running returns `unchanged` and re-issues only the grants it is
-given, so it never widens a role that was provisioned with less. The grants run
-in one transaction.
+schema grant, re-running returns `unchanged` and issues only the table and
+default privileges it is given. CONNECT and the schema grants are not issued
+again, so a privilege revoked by hand stays revoked. The grants run in one
+transaction.
 
 `grant`/`revoke` with `includeFuture` need `defaultForRole`: the role that will
 create the future objects. PostgreSQL applies default privileges per creating
@@ -110,6 +111,14 @@ role, and without `FOR ROLE` it would alter the admin login's own defaults.
   description wrongly said it defaulted to the schema owner. If your admin login
   does create the tables, pass `defaultForRole: <adminUser>` to keep the old
   behaviour.
+- **Boolean arguments accept only `true`/`false`** (or the strings `"true"` /
+  `"false"`). Earlier versions read anything else, including `"True"`, `"1"` and
+  `"yes"`, as false.
+- **Re-running `app_provision` on a provisioned role no longer grants CONNECT,
+  schema USAGE/CREATE or sequence access again.** It issues only the table and
+  default privileges it is given, and sequence access only alongside table
+  privileges. A privilege revoked by hand stays revoked; grant it back with
+  `grant` if that was not intended.
 
 ## Safety notes
 

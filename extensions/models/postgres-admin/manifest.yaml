@@ -27,5 +27,4 @@ labels:
   - database
   - admin
   - rbac
-  - pgvector
 dependencies: []
