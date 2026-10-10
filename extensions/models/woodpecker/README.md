@@ -139,8 +139,10 @@ swamp model method run woodpecker org_secret_set \
 ```
 
 - `org_secret_set` / `repo_secret_set` — create-or-update a secret (value
-  write-only). `events` defaults to `["push","tag"]`; `images` restricts the
-  secret to named step images.
+  write-only). `images` restricts the secret to named step images. A new
+  secret gets `events: ["push","tag"]` and all images unless told otherwise;
+  an existing secret keeps whichever of the two you leave out, so rotating a
+  value never widens it.
 
 **Reversible lifecycle:** `repo_disable`, `org_secret_delete`,
 `repo_secret_delete`.

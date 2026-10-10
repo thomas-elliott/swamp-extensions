@@ -573,17 +573,22 @@ const AppProvisionArgs = z.object({
   schema: z.string().default("public"),
   createSchema: z.preprocess((v) => v === true || v === "true", z.boolean())
     .default(false),
-  tablePrivs: z.array(TablePrivilege).default([
-    "SELECT",
-    "INSERT",
-    "UPDATE",
-    "DELETE",
-  ]),
+  // No schema defaults: GRANT only adds, so a default re-applied on a re-run
+  // would widen a role provisioned with less. The method applies them on a
+  // fresh provision.
+  tablePrivs: z.array(TablePrivilege).optional().describe(
+    "Table privileges to grant. A fresh provision defaults to SELECT, " +
+      "INSERT, UPDATE, DELETE; when omitted on a re-run, table grants are " +
+      "left as they are.",
+  ),
   includeFuture: z.preprocess(
-    (v) => v === undefined ? true : v === true || v === "true",
-    z.boolean(),
-  )
-    .default(true),
+    (v) => v === undefined ? undefined : v === true || v === "true",
+    z.boolean().optional(),
+  ).describe(
+    "Also grant on future tables and sequences. A fresh provision defaults " +
+      "to true; when omitted on a re-run, default privileges are left as " +
+      "they are.",
+  ),
   connLimit: z.coerce.number().int().default(-1),
 });
 
@@ -1260,7 +1265,8 @@ export const model = {
       description:
         "Composite, idempotent 'new application' setup: create database + login role (vault password) + " +
         "grant CONNECT, schema USAGE/CREATE, table/sequence privileges, and (default) future-object " +
-        "privileges. Re-running converges. The headline method. Never drops.",
+        "privileges. Re-running re-issues the grants it is given and never " +
+        "widens a role with defaults. The headline method. Never drops.",
       arguments: AppProvisionArgs,
       execute: async (
         rawArgs,
@@ -1307,6 +1313,14 @@ export const model = {
           return { roleAction, dbAction };
         });
 
+        // Defaults are safe only when nothing was granted before: the role or
+        // the database is new in this run.
+        const fresh = phaseA.roleAction === "created" ||
+          phaseA.dbAction === "created";
+        const tablePrivs = a.tablePrivs ??
+          (fresh ? ["SELECT", "INSERT", "UPDATE", "DELETE"] : []);
+        const includeFuture = a.includeFuture ?? fresh;
+
         // Phase B — schema + object + default privileges, on the target DB.
         const privsGranted = await withConn(g, a.database, false, async (q) => {
           const sc = ident(g, q, a.schema, "schema");
@@ -1319,16 +1333,20 @@ export const model = {
             );
           }
           await q.query(`GRANT USAGE, CREATE ON SCHEMA ${sc} TO ${ro}`);
-          const tp = privList(a.tablePrivs);
-          await q.query(`GRANT ${tp} ON ALL TABLES IN SCHEMA ${sc} TO ${ro}`);
+          const tp = privList(tablePrivs);
+          if (tablePrivs.length > 0) {
+            await q.query(`GRANT ${tp} ON ALL TABLES IN SCHEMA ${sc} TO ${ro}`);
+          }
           await q.query(
             `GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA ${sc} TO ${ro}`,
           );
-          if (a.includeFuture) {
+          if (includeFuture) {
             const fr = ident(g, q, owner, "owner");
-            await q.query(
-              `ALTER DEFAULT PRIVILEGES FOR ROLE ${fr} IN SCHEMA ${sc} GRANT ${tp} ON TABLES TO ${ro}`,
-            );
+            if (tablePrivs.length > 0) {
+              await q.query(
+                `ALTER DEFAULT PRIVILEGES FOR ROLE ${fr} IN SCHEMA ${sc} GRANT ${tp} ON TABLES TO ${ro}`,
+              );
+            }
             await q.query(
               `ALTER DEFAULT PRIVILEGES FOR ROLE ${fr} IN SCHEMA ${sc} GRANT USAGE, SELECT ON SEQUENCES TO ${ro}`,
             );
@@ -1337,7 +1355,7 @@ export const model = {
             "CONNECT",
             "USAGE",
             "CREATE",
-            ...a.tablePrivs.map((p) => String(p)),
+            ...tablePrivs.map((p) => String(p)),
           ];
         });
 
@@ -1354,7 +1372,7 @@ export const model = {
             schema: a.schema,
             owner,
             privilegesGranted: Array.from(new Set(privsGranted)),
-            defaultPrivileges: a.includeFuture,
+            defaultPrivileges: includeFuture,
             databaseAction: phaseA.dbAction,
             roleAction: phaseA.roleAction,
             action: overall,

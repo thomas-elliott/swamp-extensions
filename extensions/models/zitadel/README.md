@@ -76,7 +76,9 @@ swamp model method run zitadel oidc_app_ensure \
 - `project_ensure` — find-or-create a project by name.
 - `oidc_app_ensure` — ensure an OIDC client (redirect/post-logout URIs, appType
   `web|spa|native`, authMethod `basic|post|none|jwt`, grant/response types,
-  devMode). Re-running converges config (`action: unchanged|updated`).
+  devMode). Re-running converges only the fields it is given
+  (`action: unchanged|updated`); everything else, including settings this
+  method doesn't model, keeps its current value.
 - `api_app_ensure` — ensure an API app (M2M resource server).
 - `oidc_app_redirect_set` — add/remove redirect URIs on an existing OIDC app
   (set-based, idempotent), preserving every other field of its OIDC config

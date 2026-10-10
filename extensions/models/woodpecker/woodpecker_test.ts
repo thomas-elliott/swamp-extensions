@@ -287,6 +287,8 @@ Deno.test("org_secret_set: 404 probe -> POST create; sends value but never store
       context,
     );
     assertEquals(postBody?.value, "SUPER_SECRET", "value sent on the wire");
+    assertEquals(postBody?.events, ["push", "tag"], "default events on create");
+    assertEquals(postBody?.images, [], "default images on create");
     assertEquals(written[0].data.action, "created");
     assert(
       !("value" in (written[0].data as Record<string, unknown>)),
@@ -327,6 +329,46 @@ Deno.test("org_secret_set: existing secret -> PATCH update", async () => {
       "updates via PATCH when it already exists",
     );
     assertEquals(written[0].data.action, "updated");
+  } finally {
+    __setCaller(null);
+  }
+});
+
+// Same bug class as forgejo issue #4: rotating a value must not reset the
+// secret's events or widen it to every image.
+Deno.test("org_secret_set: PATCH sends only the fields that were passed", async () => {
+  const patches: unknown[] = [];
+  const caller: CallerFn = (_g, c) => {
+    if (c.path === "/api/orgs/lookup/thomas-elliott") {
+      return Promise.resolve({ status: 200, body: { id: 1 } });
+    }
+    if (c.method === "PATCH") patches.push(c.body);
+    return Promise.resolve({ status: 200, body: { id: 9, name: "ghcr_token" } });
+  };
+  __setCaller(caller);
+  try {
+    const { context } = makeContext();
+    await method("org_secret_set").execute(
+      { owner: "thomas-elliott", name: "ghcr_token", value: "v" },
+      context,
+    );
+    await method("org_secret_set").execute(
+      {
+        owner: "thomas-elliott",
+        name: "ghcr_token",
+        value: "v",
+        images: ["woodpeckerci/plugin-docker-buildx"],
+      },
+      context,
+    );
+    assertEquals(patches, [
+      { name: "ghcr_token", value: "v" },
+      {
+        name: "ghcr_token",
+        value: "v",
+        images: ["woodpeckerci/plugin-docker-buildx"],
+      },
+    ]);
   } finally {
     __setCaller(null);
   }
