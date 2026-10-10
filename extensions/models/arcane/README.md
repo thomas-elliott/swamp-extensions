@@ -1,12 +1,12 @@
 # @thomas/arcane
 
-Management of an [Arcane](https://getarcane.app) Docker instance, fronted entirely
-by Arcane's REST API (`X-API-Key` auth). This is an Arcane **management** extension —
-GitOps is one supported deployment mode, not the extension's identity.
+Manages an [Arcane](https://getarcane.app) Docker instance entirely through
+Arcane's REST API (`X-API-Key` auth). GitOps is one of two supported deployment
+modes; direct API mode is the other.
 
 Every mutation goes through Arcane's API. The only local action is **read-only compose
 validation** (`docker compose config`); the extension never SSHes to a host or touches
-the Arcane container — it only consumes an API key.
+the Arcane container; it only uses an API key.
 
 ## Installation
 
@@ -26,8 +26,8 @@ swamp extension pull @thomas/arcane
 
 ## Usage
 
-Define a model instance pointing at your Arcane (the API key comes from a vault —
-never inline it):
+Define a model instance pointing at your Arcane (read the API key from a vault; never
+inline it):
 
 ```yaml
 type: '@thomas/arcane'
@@ -40,7 +40,7 @@ globalArguments:
   syncs: []
 ```
 
-Then drive it through the CLI:
+Then run methods through the CLI:
 
 ```sh
 # Validate a swarm stack (fail-closed render), deploy it, and poll convergence
@@ -54,12 +54,12 @@ swamp model method run arcane-prod swarm_stack_remove --input '{"name":"unifi"}'
 ## Method sections
 
 - **`version`** — read Arcane's version (current + newest available; the endpoint is
-  identical on v1.19.x and v2.0.x) — upgrade preflight/post-check.
+  identical on v1.19.x and v2.0.x). Use it before and after an upgrade.
 - **`gitops_*`** — drive Arcane Git Sync: `gitops_repo_list` / `gitops_repo_ensure`,
   `gitops_sync_list` / `gitops_sync_ensure`, `gitops_sync_trigger`, and
   `gitops_sync_status` (fan-out health view: per-sync `lastSyncStatus` /
-  `lastSyncError` / `lastSyncCommit` / `nextSyncAt` — how you find a sync that has
-  been failing silently on the scheduler).
+  `lastSyncError` / `lastSyncCommit` / `nextSyncAt`; use it to find a sync whose
+  scheduled runs are failing without anyone noticing).
 - **`project_*`** — compose projects. Lifecycle: `project_list`, `project_get`,
   `project_up` / `project_down` / `project_redeploy` / `project_pull` / `project_destroy`.
   Direct (API) authoring: `project_validate`, `project_create`, `project_update`.
@@ -68,17 +68,17 @@ swamp model method run arcane-prod swarm_stack_remove --input '{"name":"unifi"}'
   `config_rotate` (create-v2 → re-point services → wait converged → remove-v1).
 - **`swarm_service_*`** — `swarm_service_list` / `swarm_service_get` /
   `swarm_service_rollback` / `swarm_service_force_update` (bump
-  `spec.TaskTemplate.ForceUpdate` to recreate tasks without a config change — e.g.
+  `spec.TaskTemplate.ForceUpdate` to recreate tasks without a config change, e.g. to
   restart a service once its DB dependency is ready).
 - **`swarm_stack_*`** — full swarm-stack lifecycle: `swarm_stack_list` /
   `swarm_stack_get`, `swarm_stack_validate` (render gate, fail-closed),
   `swarm_stack_deploy` (validate → deploy → poll convergence), `swarm_stack_remove`
   (DELETE then poll `GET → 404`, re-issuing DELETE until Arcane's stored record is
-  actually cleared — a single DELETE leaves the record behind),
+  cleared, because a single DELETE leaves the record behind),
   and `swarm_stack_tasks` (the deploy **debug view** — per-task `currentState` +
   error, with `onlyProblems` to show just the rejected/failed ones).
 - **`volume_*` / `*_prune`** — cleanup: `volume_list`, `volume_remove` (idempotent,
-  refuses in-use), `volume_prune`, `network_prune`, `image_prune`. Docker-level —
+  refuses in-use), `volume_prune`, `network_prune`, `image_prune`. Docker-level, so they
   work on any environment, not swarm-only.
 
 ### Two deploy modes (chosen per project)
@@ -87,9 +87,10 @@ swamp model method run arcane-prod swarm_stack_remove --input '{"name":"unifi"}'
   Arcane; `project_deploy` validates locally, updates, redeploys, polls health, and
   re-applies the prior content on failure (or tears down a failed first deploy).
 - **GitOps mode** — content lives in a git repo pulled by Arcane Git Sync.
-  `project_deploy` triggers the sync and redeploys; it refuses inline content (so it
-  doesn't fight the sync). Auto git rollback is **not** implemented — on failure it
-  reports and leaves the `git revert` to you.
+  `project_deploy` triggers the sync and redeploys; it refuses inline content, because
+  in this mode the content comes from git through the sync. Auto git rollback is
+  **not** implemented; on failure it reports the error and leaves the `git revert` to
+  you.
 
 `project_deploy` detects the mode from Arcane's `gitOpsManagedBy` field.
 
@@ -109,11 +110,11 @@ Any non-zero exit aborts the operation — validation never silently passes.
 - **Compose-version skew (accepted risk):** the local `docker compose` version may
   differ from Arcane's deployer, so a file that validates locally could still behave
   differently when Arcane deploys it. The local version is surfaced in the validation
-  output; the post-deploy health check + rollback is the backstop.
+  output, and the post-deploy health check and rollback are the remaining safeguard.
 
 ## Swarm stack deploy
 
-`swarm_stack_deploy` is the swarm analogue of `project_deploy`, against Arcane's
+`swarm_stack_deploy` is the swarm equivalent of `project_deploy`, against Arcane's
 `/swarm/stacks` API:
 
 1. **Validate (fail-closed)** — `POST /swarm/stacks/config/render`. Any render
@@ -126,7 +127,7 @@ Any non-zero exit aborts the operation — validation never silently passes.
    stack's services to reach their target replica counts.
 
 A stack that deploys but **does not converge is left in place** and the method
-throws — it is **not** force-removed and **not** auto-rolled-back (guardrail #5).
+throws. It is **not** force-removed and **not** auto-rolled-back (guardrail #5).
 Inspect with `swarm_stack_tasks` / `swarm_service_list`, then re-deploy or
 `swarm_stack_remove`. Each step records an `operation-result`; the stack itself is
 recorded as a `swarm-stack` resource.
@@ -134,14 +135,14 @@ recorded as a `swarm-stack` resource.
 **Two Arcane API limitations to know when deploying a stack:**
 
 - **No log endpoint exists.** Arcane exposes task *state* + error (which
-  `swarm_stack_tasks` surfaces — enough for missing-bind-path, non-zero-exit, and
-  placement failures), but **not** a container's stderr. A crash-looping container's
+  `swarm_stack_tasks` returns; that is enough to diagnose missing-bind-path,
+  non-zero-exit, and placement failures), but **not** a container's stderr. A crash-looping container's
   logs must come from the host (`docker service logs` / a log viewer). The extension
   will not SSH to get them.
 - **Stack deploy does not add compose service-name network aliases.** Unlike
   `docker stack deploy`, Arcane-deployed services come up with `aliases=[]`, so
   resolving another service by its short name fails. Declare aliases **explicitly**
-  in the compose (`networks.<net>.aliases: [<service-name>]`) — Arcane honors those.
+  in the compose (`networks.<net>.aliases: [<service-name>]`); Arcane applies those.
 
 ## Swarm rotation notes
 
@@ -161,17 +162,17 @@ Docker-level housekeeping via Arcane (works on any environment, not swarm-only):
 
 - `volume_list` includes an `inUse` flag so orphaned volumes are visible.
 - `volume_remove` is **idempotent** (a 404 is treated as already-gone). An in-use
-  volume is **surfaced, not forced** — Arcane reports in-use as **HTTP 500** (not the
+  volume is **reported and left in place**. Arcane reports in-use as **HTTP 500** (not the
   409 the Docker API uses), so the method matches on the message text as well as the
   status. `force:true` bypasses the in-use guard but is discouraged (risks data loss,
   guardrail #5).
-- `volume_prune` removes only **unused anonymous** volumes (Docker's default — it does
+- `volume_prune` removes only **unused anonymous** volumes (Docker's default; it does
   **not** touch named volumes). To remove a specific named volume use `volume_remove`.
 - `network_prune` removes networks with no attached containers; `image_prune` removes
   dangling layers by default (`dangling:false` removes all unreferenced images).
 
-**Known gap:** there is no `container_prune` / all-in-one `system_prune` method —
+**Known gap:** there is no `container_prune` / all-in-one `system_prune` method.
 Arcane's `system/prune` requires an undocumented bare-string `mode` field (no enum),
-so it isn't wrapped rather than guess into a destructive call. A named volume held by
+and the extension does not call a destructive endpoint with a guessed value. A named volume held by
 a *stopped* (not removed) container therefore can't be cleared until that container is
-reaped (e.g. swarm task-history rotation); the per-type prunes above cover the rest.
+removed (e.g. swarm task-history rotation); the per-type prunes above cover the rest.

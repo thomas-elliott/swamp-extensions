@@ -5,15 +5,15 @@ Control-plane administration of a [Garage](https://garagehq.deuxfleurs.fr/)
 bearer-token auth). Audit permissions, manage buckets, and create / rotate /
 revoke access keys from swamp.
 
-This model holds the cluster's `admin_token`, so its surface is the **control
-plane only** — buckets, access keys, and key↔bucket permissions. It never reads
+This model holds the cluster's `admin_token`, so it covers the **control
+plane only**: buckets, access keys, and key↔bucket permissions. It never reads
 or writes S3 object data, and the destructive verbs (`bucket_delete`,
 `key_delete`) verify the target by id first. Garage itself refuses to delete a
 non-empty bucket.
 
-It has **no object-level visibility** (an Admin-API limitation, not a model one):
-you get per-bucket object counts and byte totals, but listing or verifying
-individual objects goes through the S3 data API, not this model.
+It has **no object-level visibility**, because the Admin API does not provide it.
+You get per-bucket object counts and byte totals; listing or verifying individual
+objects needs the S3 data API.
 
 ## Configuration
 
@@ -27,20 +27,20 @@ globalArguments:
 ```
 
 The Admin API must be reachable from where swamp runs. Garage binds it per
-`garage.toml` `[admin] api_bind_addr` — set it to `0.0.0.0:3903` (or publish the
+`garage.toml` `[admin] api_bind_addr`. Set it to `0.0.0.0:3903` (or publish the
 container port) so swamp can reach it, and keep it **token-gated and private**
 (don't expose the admin API publicly). Plain HTTP on a trusted/encrypted network
-is fine, and **an HTTPS reverse proxy works too** — point `endpoint` at the front
-door and `/v2/…` is appended per call.
+is fine, and **an HTTPS reverse proxy works too**: point `endpoint` at the proxy
+and `/v2/…` is appended per call.
 
 **Instance naming:** if a compose/stack project shares the cluster's name, give the
 swamp model instance a distinct name (e.g. `garage-<env>-admin`) to avoid
-confusion — the namespaces don't actually collide.
+confusion. The names do not actually conflict.
 
 > **Version note.** Targets Garage **v2.1+**, where bucket/key selectors are
 > query parameters (`?id=`, `?globalAlias=`, `?search=`). Garage v2.0 used path
-> parameters (`/v2/DeleteBucket/{id}`) for a handful of verbs — on v2.0 the
-> mutating-by-id calls would 404. Check `cluster_health` works, then upgrade the
+> parameters (`/v2/DeleteBucket/{id}`) for some verbs, so on v2.0 the
+> mutating-by-id calls would return 404. Check `cluster_health` works, then upgrade the
 > cluster if needed.
 
 ## Methods
@@ -81,15 +81,15 @@ confusion — the namespaces don't actually collide.
 ### Cluster / first-boot lifecycle
 | Method | Purpose |
 | --- | --- |
-| `cluster_status` | This node's id, Garage version, layout version, and every node's role/up-state. Read-only — use it to find node ids. |
+| `cluster_status` | This node's id, Garage version, layout version, and every node's role/up-state. Read-only; use it to find node ids. |
 | `layout_get` | Current layout: assigned roles + staged (un-applied) changes. Read-only. |
-| `cluster_init` | **First boot in one call:** assign a storage role to the node (defaults to the responding node — correct for single-node) and apply it, making a fresh cluster usable without the CLI. Idempotent (skips if already initialised unless `force`). |
+| `cluster_init` | **First boot in one call:** assign a storage role to the node (defaults to the responding node, which is correct for single-node) and apply it, making a fresh cluster usable without the CLI. Idempotent (skips if already initialised unless `force`). |
 | `layout_assign` | Stage a node role (zone, `capacity` in bytes or `null` for gateway, tags). Anything omitted keeps the node's current value; a node with no role yet needs a zone and defaults to gateway. |
 | `layout_apply` | Commit staged changes (defaults to current version + 1). |
 | `layout_revert` | Discard staged changes. |
 
-`cluster_init` removes the last manual `garage layout` CLI step — a brand-new
-single-node cluster goes from "running but unusable" to "ready" with:
+`cluster_init` replaces the manual `garage layout` CLI step. A new single-node
+cluster that is running but has no layout becomes usable with:
 
 ```bash
 # capacity is in BYTES (1000000000 = 1 GB)
@@ -97,20 +97,20 @@ swamp model method run garage cluster_init --arg capacity=1000000000
 swamp model method run garage cluster_status   # confirm the node is up + assigned
 ```
 
-For multi-node, drive it granularly: `cluster_status` → `layout_assign` per node →
+For multi-node, run the steps separately: `cluster_status` → `layout_assign` per node →
 `layout_get` to review → `layout_apply`.
 
 ## Secret handling
 
 Garage returns a new key's `secretAccessKey` **once**. `key_create` and
-`key_rotate` surface it on the `key-result` resource (`secretAccessKey`, marked
-sensitive). It is persisted to swamp's data store — capture it, store it in your
-secret manager, and garbage-collect the artifact. The admin token and key secrets
-are never written to logs.
+`key_rotate` return it on the `key-result` resource (`secretAccessKey`, marked
+sensitive). It is persisted to swamp's data store, so capture it, store it in your
+secret manager, and delete the artifact. The admin token and key secrets are never
+written to logs.
 
-**Capture → vault pattern.** The model can't write a vault itself (that's outside
-a model's scope), so onboarding a new consumer is two steps — create the key, then
-stash the result:
+**Capture → vault pattern.** The model can't write to a vault (that's outside a
+model's scope), so onboarding a new consumer takes two steps: create the key, then
+store the result in the vault:
 
 ```bash
 # 1. create the key and read its one-time secret out of the artifact
@@ -125,7 +125,7 @@ swamp data delete garage key-result --json
 ```
 
 A small swamp **workflow** (key_create → vault put → grant) would make this a
-one-shot per consumer; not built yet.
+single command per consumer. It is not built yet.
 
 ## Credential rotation
 

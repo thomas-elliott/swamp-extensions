@@ -151,7 +151,7 @@ Deno.test("recordInstanceName is identity-stable, case-normalized, and collision
     recordInstanceName("ex.com", "nas.ex.com", "A", { ipAddress: "10.0.0.5" }),
     recordInstanceName("ex.com", "nas.ex.com", "A", { ipAddress: "10.0.0.5" }),
   );
-  // DNS is case-insensitive: name case and type case don't fork the identity
+  // DNS is case-insensitive: name case and type case don't change the instance name
   assertEquals(
     recordInstanceName("ex.com", "NAS.ex.com", "app", {
       appName: "S",
@@ -164,7 +164,7 @@ Deno.test("recordInstanceName is identity-stable, case-normalized, and collision
       data: "{}",
     }),
   );
-  // two A records at one name stay distinct — no positional index to collide on
+  // two A records at one name stay distinct; names use no positional index
   assert(
     recordInstanceName("ex.com", "nas.ex.com", "A", {
       ipAddress: "10.0.0.5",
@@ -183,7 +183,7 @@ Deno.test("recordInstanceName is identity-stable, case-normalized, and collision
     ),
     "unexpected instance-name shape",
   );
-  // a wildcard record and its bare sibling — identical rData — stay distinct
+  // a wildcard record and its bare name, with identical rData, stay distinct
   // (the bug that aborted record_list on a zone holding both s3 + *.s3)
   const appData = { appName: "Split Horizon", classPath: "S.A", data: "{}" };
   assert(
@@ -808,8 +808,8 @@ Deno.test("record_add and record_get address the same instance for one record (n
       { zone: "example.com", domain: "www.example.com" },
       getCtx,
     );
-    // the whole point of identity-based naming: one record → one instance name,
-    // whether it was added or later read back
+    // identity-based naming gives one record one instance name, whether it was
+    // added or later read back
     assertEquals(addWritten[0].name, getWritten[0].name);
   } finally {
     __setTechnitiumTransport(null);
@@ -818,8 +818,8 @@ Deno.test("record_add and record_get address the same instance for one record (n
 
 Deno.test("record_update throws when read-back shows empty APP data (SERVFAIL landmine)", async () => {
   const calls: Call[] = [];
-  // Technitium accepts the POST but the live APP record has empty data — the
-  // exact silent-corruption that took the zone down. Verification must catch it.
+  // Technitium accepts the POST but the live APP record has empty data, which
+  // caused the zone-wide SERVFAIL. Verification must catch it.
   scriptTransport(
     calls,
     recordsResponder([{

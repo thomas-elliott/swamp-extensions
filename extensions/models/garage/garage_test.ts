@@ -1,9 +1,9 @@
 /**
- * Unit tests for the load-bearing logic of `@thomas/garage` — the bits where a
- * silent bug would be costly: idempotent create, delete gating (verify-first),
- * the key_rotate copy-grants composite, the permissions_audit matrix + flags,
- * request-body shaping for allow/deny/alias/update, and secret non-leakage. No
- * live cluster — the Admin API transport is faked via the __setGarageApi seam.
+ * Unit tests for the parts of `@thomas/garage` where an unnoticed bug would be
+ * costly: idempotent create, delete gating (verify-first), the key_rotate
+ * copy-grants composite, the permissions_audit matrix + flags, request-body
+ * shaping for allow/deny/alias/update, and keeping secrets out of logs. No live
+ * cluster; the Admin API transport is faked via the __setGarageApi seam.
  */
 import {
   __setGarageApi,

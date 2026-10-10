@@ -3,10 +3,11 @@ name: "@thomas/postgres-admin"
 version: 2026.06.01.1
 description: >-
   Non-destructive PostgreSQL administration over a direct TCP connection
-  (node-postgres). Read/audit of databases, roles, permissions, tables,
-  connections, and extensions; plus data-safe admin DDL — create database/role,
-  grant/revoke, rotate passwords, and an idempotent app_provision composite.
-  Never reads or writes table rows; never DROP/TRUNCATE; no arbitrary-SQL passthrough.
+  (node-postgres). Reads databases, roles, permissions, tables, connections, and
+  extensions. Runs admin DDL that does not touch data: create database/role,
+  grant/revoke, rotate passwords, and an idempotent app_provision method that
+  combines them. Never reads or writes table rows, never runs DROP or TRUNCATE,
+  and does not accept arbitrary SQL.
 repository: https://github.com/thomas-elliott/swamp-extensions
 paths:
   base: manifest

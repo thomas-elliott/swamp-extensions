@@ -1,12 +1,9 @@
 /**
- * Unit tests for the spike-independent layer of `@thomas/stalwart`: the
- * Prometheus parser, the `reachable` skip-on-unresolved-secret guard, the
- * REST-only `health_status` method, and the no-destroy guarantee (no method
- * source references the JMAP `destroy` verb). No live server — the JMAP/REST
- * callers are faked via the __setJmap / __setRest seams.
- *
- * JMAP-envelope-shape and idempotency tests are added alongside the Phase 1
- * methods once the discovery spike pins the management type names.
+ * Unit tests for `@thomas/stalwart`: the Prometheus parser, the `reachable`
+ * check, the JMAP request envelopes, idempotency and verify-before-mutate for
+ * each method, and the no-destroy guarantee (no method source references the
+ * JMAP `destroy` verb). No live server: the JMAP/REST callers are faked via the
+ * __setJmap / __setRest seams.
  */
 import {
   __setJmap,
@@ -107,7 +104,7 @@ function jmapOk(name: string, args: Json): Json {
 
 /**
  * A JMAP fake driven by a `type → objects[]` table: `<type>/query` returns the
- * objects' ids (+ total); `<type>/get` returns the objects as `list`. Also wires
+ * objects' ids (+ total); `<type>/get` returns the objects as `list`. Also sets
  * the REST seam so resolveAccountId() finds accountId `l`.
  */
 function makeTypedJmap(table: Record<string, Json[]>) {
@@ -196,7 +193,7 @@ Deno.test("parsePrometheus: labels collapse, comments skipped, non-numeric dropp
 });
 
 Deno.test("reachable: skips when apiKey is an unresolved vault expression", async () => {
-  // No caller set — if it tried to hit the network it would use realRest.
+  // No caller set; a network call here would use realRest.
   __setRest(null);
   const check = (model.checks as unknown as Record<string, {
     execute: (c: unknown) => Promise<{ pass: boolean }>;
@@ -284,7 +281,7 @@ Deno.test("health_status: survives gated/absent metrics endpoint", async () => {
 });
 
 Deno.test("jmap_probe: query→get envelope shape, accountId resolved from session", async () => {
-  // REST seam answers the session discovery for resolveAccountId.
+  // The REST seam returns the session discovery for resolveAccountId.
   const fakeRest = makeFakeRest((c) => {
     if (c.path === "/.well-known/jmap") {
       return {
@@ -531,8 +528,8 @@ Deno.test("alias_list: filters to one account by name or full address", async ()
 });
 
 Deno.test("resolveAccountId: two credentials on one URL do not share a cached account", async () => {
-  // The fake session answers with whichever account the bearer token names, so
-  // a shared cache would hand the second credential the first one's account.
+  // The fake session returns the account the bearer token names, so a shared
+  // cache would give the second credential the first one's account.
   const seen: string[] = [];
   const caller: RestFn = (g, c) => {
     seen.push(String(g.apiKey));
@@ -807,7 +804,7 @@ Deno.test("account_ensure: creates with resolved domain, aliases, role, password
       "0": { "@type": "Password", secret: "secret" },
     });
     assertEquals(written[0].data.action, "created");
-    // Secret-once: the written resource must NOT echo the password.
+    // Secret-once: the written resource must NOT contain the password.
     assert(
       !JSON.stringify(written[0].data).includes("secret"),
       "no password in output",
@@ -1031,8 +1028,8 @@ Deno.test("account_ensure: refuses an address that belongs to a group, writes no
   });
   try {
     const { context } = makeContext();
-    // With and without `role`: both paths used to reach the group, one erroring
-    // at the server and the other silently patching it.
+    // With and without `role`: both paths must refuse a group address rather
+    // than send individual fields to it.
     for (const extra of [{}, { role: "admin" }]) {
       await rejects(
         () =>
@@ -1280,8 +1277,8 @@ Deno.test("group_ensure: creates a Group account with Default roles", async () =
 });
 
 Deno.test("no-destroy guarantee: no method execute body references the destroy verb", async () => {
-  // The transport's jmapSet plumbs `destroy` for completeness, but NO method may
-  // pass it. Scan each method's source for a `destroy` reference.
+  // NO method may send `destroy`. Scan each method's source for a `destroy`
+  // reference.
   const methods = model.methods as unknown as Record<
     string,
     { execute: (...a: unknown[]) => unknown }
@@ -1293,12 +1290,12 @@ Deno.test("no-destroy guarantee: no method execute body references the destroy v
       `method ${name} must not reference destroy`,
     );
   }
-  // Keep the JMAP seam import live so an unused-import doesn't mask a regression.
+  // Use the JMAP seam import so an unused-import error doesn't hide a regression.
   __setJmap(null);
 });
 
 // A check receives globalArgs without the schema's defaults, so an unset
-// httpTimeoutMs used to reach fetch as undefined and abort at once.
+// httpTimeoutMs must be defaulted before it reaches fetch (undefined aborts at once).
 Deno.test("reachable: applies the schema defaults to globalArgs", async () => {
   let seenTimeout: unknown;
   __setRest((g) => {

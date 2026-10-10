@@ -1,5 +1,5 @@
 import { z } from "npm:zod@4";
-// Type-only imports — erased at compile time, never bundled. They anchor the
+// Type-only imports, erased at compile time and never bundled. They type the
 // `satisfies ModelDefinition<typeof GlobalArgs>` clause on `model` so every
 // method's `execute` is contextually typed without an explicit `any`.
 import type {
@@ -13,8 +13,8 @@ import { Buffer } from "node:buffer";
 import { readFile } from "node:fs/promises";
 
 /**
- * `@thomas/technitium` — management of a Technitium DNS Server, fronted entirely
- * by its HTTP API. A permanent API token (sent both as `Authorization: Bearer`
+ * `@thomas/technitium` manages a Technitium DNS Server entirely through its
+ * HTTP API. A permanent API token (sent both as `Authorization: Bearer`
  * and as the legacy `?token=` query param) is the only credential; the extension
  * never touches the server host directly. Every mutation goes through the API.
  *
@@ -29,8 +29,8 @@ import { readFile } from "node:fs/promises";
  *   - `dashboard_*` — query statistics.
  *   - `settings_*` — full settings backup (zip) and restore (multipart upload).
  *
- * Only blocking-relevant fields of the server settings are surfaced as data —
- * the full settings blob is intentionally NOT passed through, to avoid leaking
+ * Only blocking-relevant fields of the server settings are stored as data. The
+ * full settings object is NOT passed through, so it cannot leak
  * secrets (e.g. TLS certificate passwords) into the data model.
  */
 
@@ -95,8 +95,8 @@ const SettingsResource = z.object({
   blockListUrls: z.array(z.string()).optional(),
   allowListUrls: z.array(z.string()).optional(),
   blockListUrlUpdateIntervalHours: z.number().optional(),
-  // Web-service TLS + resolver-security posture (read-only projection; the
-  // cert password is never surfaced here).
+  // Web-service TLS and resolver security settings (read-only copy; the
+  // cert password is never included).
   webServiceEnableTls: z.boolean().optional().describe(
     "Whether the admin web service serves HTTPS (on webServiceTlsPort)",
   ),
@@ -301,7 +301,7 @@ function buildRequest(
 /**
  * Call a Technitium API path (relative to `/api`) that returns the JSON
  * envelope. GET params go in the query string; POST params go in an
- * `application/x-www-form-urlencoded` body (so long block-list URLs don't blow
+ * `application/x-www-form-urlencoded` body (so long block-list URLs don't exceed
  * the URL length limit). Routes through the test seam when one is installed.
  */
 function apiCall(
@@ -462,8 +462,8 @@ function toStringArray(v: unknown): string[] | undefined {
 export function slug(s: string): string {
   // Map `*` to a literal token BEFORE the alnum strip so a wildcard label slugs
   // distinctly from its bare form. Otherwise `*.s3.x` and `s3.x` both flatten to
-  // `s3-x`, colliding instance names — which aborts `record_list` (swamp rejects
-  // duplicate data-instance names) for any zone holding both a name and its wildcard.
+  // `s3-x`. The duplicate instance names abort `record_list` (swamp rejects
+  // duplicate data-instance names) for any zone containing both a name and its wildcard.
   const out = s.replace(/\*/g, "star").replace(/[^A-Za-z0-9_-]+/g, "-").replace(
     /^-+|-+$/g,
     "",
@@ -489,10 +489,10 @@ function rDataHash(rData?: Record<string, unknown>): string {
 
 /**
  * Deterministic, identity-stable instance name for a zone record, shared by
- * EVERY record method. Keyed on (zone, name, type, rData) — never on a list
- * position. This is what lets a record have one instance regardless of which
- * method wrote it, lets a re-list produce a new version instead of a duplicate,
- * and keeps two records at one name (e.g. two A records) distinct. DNS names are
+ * EVERY record method. Keyed on (zone, name, type, rData), never on a list
+ * position, so a record has one instance regardless of which method wrote it,
+ * a re-list produces a new version instead of a duplicate, and two records at
+ * one name (e.g. two A records) stay distinct. DNS names are
  * case-insensitive, so name/zone are lowercased and type upper-cased.
  */
 export function recordInstanceName(
@@ -515,7 +515,7 @@ export function coerceArray(resp: Json, ...keys: string[]): Json[] {
 }
 
 /**
- * Collect distinct domain names from a Technitium list response — entries may be
+ * Collect distinct domain names from a Technitium list response. Entries may be
  * bare strings (subdomain names) or objects with a `name`/`domain` field, under
  * `zones` and/or `records` arrays. Deduplicated, since a domain can appear in
  * both arrays and the names are used as unique data instance keys.
@@ -579,7 +579,7 @@ function spreadRData(into: Params, rData?: Record<string, unknown>): Params {
 /**
  * Map an APP record's rData to Technitium's APP write params for add/update.
  * APP content is carried under the `data` key (that's how `record_list` returns
- * it), but Technitium's write endpoints read it from `recordData` — and the app
+ * it), but Technitium's write endpoints read it from `recordData`, and the app
  * is identified by `appName` + `classPath`. APP records use NO `new*` scheme:
  * the new content goes in `recordData` and the record is matched by domain+type.
  * Spreading the keys verbatim (as `spreadRData` does) sends an unrecognized
@@ -614,8 +614,8 @@ type LiveRecord = {
 
 /**
  * Fetch the live records at a single domain (not the whole zone) straight from
- * Technitium. Backs `record_get` and post-write verification — `record_list`'s
- * persisted data can go stale, so anything needing ground truth reads here.
+ * Technitium. Used by `record_get` and post-write verification: `record_list`'s
+ * persisted data can go stale, so anything needing the current server state reads here.
  */
 async function getDomainRecords(
   g: GlobalArgsT,
@@ -668,7 +668,7 @@ function rDataMatches(
  * state. Technitium can return `ok` while silently writing empty data (the APP
  * bug that caused a zone-wide SERVFAIL): for add/update assert a `type` record
  * matching `want` now exists at `domain`; for delete assert none remains. Throws
- * on mismatch so the method surfaces a loud error instead of a false success.
+ * on mismatch so the method reports an error instead of success.
  */
 async function verifyRecordWrite(
   g: GlobalArgsT,
@@ -1110,10 +1110,10 @@ export const model = {
     "zoneRecord": {
       description: "A resource record within a zone",
       schema: ZoneRecordResource,
-      // A refreshable projection of live server state, not the source of truth:
-      // re-listing a record refreshes its timer; records that are deleted or
-      // change value stop being refreshed and age out (swamp has no auto-prune
-      // for orphaned instances, so a finite lifetime is what reaps stale entries).
+      // A copy of live server state that expires. Re-listing a record resets its
+      // timer; records that are deleted or change value stop being refreshed and
+      // expire (swamp does not auto-prune orphaned instances, so a finite lifetime
+      // is what removes stale entries).
       lifetime: "30d",
       garbageCollection: 10,
     },

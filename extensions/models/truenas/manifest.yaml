@@ -2,14 +2,14 @@ manifestVersion: 1
 name: "@thomas/truenas"
 version: 2026.06.24.1
 description: >-
-  Administration of a TrueNAS SCALE host (25.04+) via its JSON-RPC 2.0 WebSocket
-  API (wss://, API-key auth). Read/audit of apps + their port bindings, NFS/SMB
-  shares + their host allowlists, services, network interfaces, and a service-
-  exposure roll-up; plus a narrow, reversible mutating surface — flip an app
-  port between published/exposed, and set NFS networks/hosts and SMB
-  hostsallow/hostsdeny. Refuses any non-TLS endpoint by construction (TrueNAS
-  revokes an API key sent over cleartext). Verify-first; no pool/dataset/user or
-  service start/stop.
+  Administration of a TrueNAS SCALE host (25.04+) through its JSON-RPC 2.0
+  WebSocket API (wss://, API-key auth). Reads apps and their port bindings,
+  NFS/SMB shares and their host allowlists, services, network interfaces, and a
+  summary of exposed services. Makes a small set of reversible changes: switch
+  an app port between published and exposed, and set NFS networks/hosts and SMB
+  hostsallow/hostsdeny. Rejects any non-TLS endpoint, because TrueNAS revokes an
+  API key sent in cleartext. Verifies each target first. Does not manage pools,
+  datasets, users, or service start/stop.
 repository: https://github.com/thomas-elliott/swamp-extensions
 paths:
   base: manifest

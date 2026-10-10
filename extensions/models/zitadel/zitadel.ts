@@ -1,39 +1,39 @@
 import { z } from "npm:zod@4";
-// Type-only imports — erased at compile time, never bundled. They anchor the
-// `satisfies ModelDefinition<typeof GlobalArgs>` clause so each method's
+// Type-only imports, erased at compile time and never bundled. The
+// `satisfies ModelDefinition<typeof GlobalArgs>` clause uses them so each method's
 // `execute` is contextually typed without an explicit `any`.
 import type {
   DataHandle,
   MethodContext,
   ModelDefinition,
 } from "jsr:@systeminit/swamp-testing@0.20260521.16";
-// Signing uses the Web Crypto API (the `crypto.subtle` global) — NO node: import,
-// so the extension has zero dependencies AND resolves no `@types/node` at doc-lint
-// time (a `node:` import makes some `deno doc` sandboxes fetch the floating
+// Signing uses the Web Crypto API (the `crypto.subtle` global) with no `node:`
+// import, so the extension has no dependencies and resolves no `@types/node` at
+// doc-lint time (a `node:` import makes some `deno doc` sandboxes fetch the floating
 // @types/node → undici-types, which can break scoring). Zitadel issues PKCS#1
 // ("RSA PRIVATE KEY") keys and Web Crypto imports only PKCS#8, so `signAssertion`
 // wraps PKCS#1 → PKCS#8 (a fixed DER envelope) before importing the key.
 
 /**
- * `@thomas/zitadel` — careful, non-destructive administration of a Zitadel
- * instance over its Management API (v1 REST).
+ * `@thomas/zitadel`: non-destructive administration of a Zitadel instance over
+ * its Management API (v1 REST).
  *
- * SCOPE GUARANTEE (the whole point): this holds a powerful IAM admin credential,
- * so its surface is deliberately narrow and reversible. It NEVER hard-deletes a
- * project, application, or user — the only "off switch" is the reversible
- * deactivate/reactivate pair. The SINGLE exception is `role_remove`: a project
- * role has no deactivate state in Zitadel, so retiring one is a `DELETE` — bounded,
- * verify-first, and effectively reversible (re-create the same key), but it does
- * cascade-revoke grants that reference the role. It manages MACHINE identities only
- * (service users + their PATs / keys / secrets); it does NOT create human users or
- * touch human passwords/MFA. Every secret it mints (client secret, PAT, machine key)
- * is emitted EXACTLY ONCE in the method output and marked sensitive — never logged.
+ * SCOPE GUARANTEE: this holds an IAM admin credential, so its methods are limited
+ * and reversible. It NEVER hard-deletes a project, application, or user; the only
+ * way to disable one is the reversible deactivate/reactivate pair. The SINGLE
+ * exception is `role_remove`: a project role has no deactivate state in Zitadel,
+ * so removing one is a `DELETE`. It is verify-first and can be undone by
+ * re-creating the same key, but it also revokes every grant that references the
+ * role. It manages MACHINE identities only (service users + their PATs / keys /
+ * secrets); it does NOT create human users or touch human passwords/MFA. Every
+ * secret it mints (client secret, PAT, machine key) is emitted EXACTLY ONCE in the
+ * method output, marked sensitive, and never logged.
  *
  * Auth: a JWT private-key service account. The model holds a machine-user key
  * JSON (`keyJson`); per run it signs a short-lived RS256 assertion and exchanges
  * it at `/oauth/v2/token` (jwt-bearer grant, `urn:zitadel:iam:org:project:id:zitadel:aud`
- * scope) for an access token, then Bearers that on the Management API. No
- * long-lived bearer token is stored.
+ * scope) for an access token, then sends that as a Bearer token to the Management
+ * API. No long-lived bearer token is stored.
  *
  * Method sections (by prefix):
  *   - read/audit: `org_get`, `project_list`, `app_list`, `app_get`, `user_list`,
@@ -76,8 +76,8 @@ const GlobalArgs = z.object({
 });
 
 // Resolved global-argument shape. Kept internal: `z.infer` is a "slow type", so
-// it must not leak onto the public API (the exported `CallerFn` seam uses the
-// loose `Json` instead — see below).
+// it must not appear on the public API (the exported `CallerFn` seam uses the
+// loose `Json` instead; see below).
 type GlobalArgsT = z.infer<typeof GlobalArgs>;
 
 /** The set of outcomes a method reports in its `action` field. */
@@ -191,8 +191,8 @@ const ProjectInfo = z.object({
   id: z.string(),
   name: z.string(),
   state: z.string(),
-  // Authorization flags. `roleAssertion` is the one that matters most: without
-  // it, granted project roles do NOT appear in the user's tokens/userinfo.
+  // Authorization flags. Without `roleAssertion`, granted project roles do NOT
+  // appear in the user's tokens/userinfo.
   roleAssertion: z.boolean().optional().describe(
     "Assert the user's project roles into their tokens/userinfo",
   ),
@@ -288,10 +288,10 @@ const MachineCredential = z.object({
   clientId: z.string().optional(),
   clientSecret: z.string().meta({ sensitive: true }).optional(),
   tokenId: z.string().optional(),
-  // A PAT — returned exactly once.
+  // A PAT, returned exactly once.
   token: z.string().meta({ sensitive: true }).optional(),
   keyId: z.string().optional(),
-  // The downloadable machine-key JSON — returned exactly once.
+  // The downloadable machine-key JSON, returned exactly once.
   keyDetails: z.string().meta({ sensitive: true }).optional(),
   expirationDate: z.string().optional(),
   action: Action,
@@ -316,7 +316,7 @@ const StateResult = z.object({
 
 // ─────────────────────────── HTTP / auth seam ───────────────────────────
 
-/** A JSON-ish bag — structurally the resolved global args or an API body. */
+/** A JSON object: the resolved global args or an API body. */
 export type Json = Record<string, unknown>;
 
 /** One Management-API request: method + path (relative to `apiUrl`) + optional JSON body. */
@@ -338,10 +338,10 @@ export interface ApiResult {
 }
 
 /**
- * The authenticated-call seam the methods use — swappable for unit tests. The
- * global args are typed loosely as {@link Json} so this EXPORTED type stays
- * "fast-check" clean (referencing the zod-inferred `GlobalArgsT` would drag a
- * slow type onto the public API). The real implementation re-narrows.
+ * The authenticated-call seam the methods use, swappable for unit tests. The
+ * global args are typed loosely as {@link Json} so this EXPORTED type passes
+ * "fast-check" (referencing the zod-inferred `GlobalArgsT` would put a slow type
+ * on the public API). The real implementation re-narrows.
  */
 export type CallerFn = (g: Json, call: ApiCall) => Promise<ApiResult>;
 
@@ -433,7 +433,7 @@ function derLen(n: number): number[] {
  * Wrap a PKCS#1 `RSAPrivateKey` DER in the PKCS#8 `PrivateKeyInfo` envelope
  * (`SEQUENCE { version 0, AlgorithmIdentifier rsaEncryption, OCTET STRING pkcs1 }`),
  * so Web Crypto's `importKey("pkcs8", …)` accepts a Zitadel-issued PKCS#1 key.
- * Pure byte-surgery, deterministic, no dependencies.
+ * Pure byte manipulation, deterministic, no dependencies.
  */
 function pkcs1ToPkcs8(pkcs1: Uint8Array): Uint8Array {
   // AlgorithmIdentifier: SEQUENCE { OID 1.2.840.113549.1.1.1 (rsaEncryption), NULL }
@@ -467,7 +467,7 @@ function pkcs1ToPkcs8(pkcs1: Uint8Array): Uint8Array {
 export async function importSigningKey(pemKey: string): Promise<CryptoKey> {
   const { der, isPkcs8 } = pemToDer(pemKey);
   const pkcs8 = isPkcs8 ? der : pkcs1ToPkcs8(der);
-  // Back the key bytes with a plain ArrayBuffer — a Uint8Array<ArrayBufferLike>
+  // Back the key bytes with a plain ArrayBuffer: a Uint8Array<ArrayBufferLike>
   // is not accepted as BufferSource (it could be SharedArrayBuffer-backed).
   const buf = new ArrayBuffer(pkcs8.byteLength);
   new Uint8Array(buf).set(pkcs8);
@@ -635,7 +635,7 @@ async function searchAll(
   const limit = 100;
   let offset = 0;
   const all: Json[] = [];
-  // Bounded by Zitadel's 1000-agent-style sanity: stop on a short page or total.
+  // Capped at 1000 pages; normally stops on a short page or once the total is reached.
   for (let guard = 0; guard < 1000; guard++) {
     const body: Json = { query: { offset, limit, asc: true } };
     if (queries && queries.length) body.queries = queries;
@@ -1596,8 +1596,8 @@ export const model = {
             if (current[f] !== undefined) cfg[f] = current[f];
           }
           Object.assign(cfg, oidcWireConfig(a));
-          // Zitadel returns 400 "No changes" when the config already matches —
-          // that's an idempotent no-op, not a failure.
+          // Zitadel returns 400 "No changes" when the config already matches;
+          // report that as unchanged.
           let action: z.infer<typeof Action> = "updated";
           try {
             await call(g, {
@@ -2506,7 +2506,7 @@ async function ensureProjectId(
 }
 
 /**
- * Resolve a project reference (name or id) to an id WITHOUT creating it — throws
+ * Resolve a project reference (name or id) to an id WITHOUT creating it. Throws
  * if a supplied name doesn't resolve. Used by methods that configure an existing
  * project (e.g. `project_authz_set`), where auto-creating on a typo would be a
  * surprising side effect.

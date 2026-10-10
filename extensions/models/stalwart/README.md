@@ -1,38 +1,36 @@
 # @thomas/stalwart
 
-Careful, **non-destructive** administration of a [Stalwart](https://stalw.art)
-mail server (v0.16+) for swamp, over its **JMAP-over-HTTP management API** — for
-standing up mailboxes and aliases, configuring groups/lists/roles, checking
-server health and DMARC/TLS reports, and running maintenance actions (reload
-settings, install/reload certificates, tune the spam filter) without the web-UI
-click-through.
+**Non-destructive** administration of a [Stalwart](https://stalw.art) mail
+server (v0.16+) for swamp, over its **JMAP-over-HTTP management API**. Use it to
+create mailboxes and aliases, configure groups/lists/roles, check server health
+and DMARC/TLS reports, and run maintenance actions (reload settings,
+install/reload certificates, adjust the spam filter) without using the web UI.
 
 ## Scope guarantee (read this first)
 
-This extension holds a powerful mail-admin credential, so its surface is
-deliberately narrow and **reversible**:
+This extension holds a mail-admin credential, so it has few methods and every
+change it makes is **reversible**:
 
 - ❌ **No hard deletes.** It never deletes an account, domain, group, or list.
-  The JMAP `destroy` verb is plumbed through the transport for completeness but
-  is reachable from **no** method. The only "off switch" is the reversible
-  `*_set_state` (deactivate ⇄ reactivate) pair.
+  **No** method sends the JMAP `destroy` verb, and the transport has no way to
+  send one. The only way to disable something is the reversible `*_set_state`
+  (deactivate ⇄ reactivate) pair.
 - ✅ **Secrets once.** Account passwords and certificate private keys are write-
-  only method arguments — sent to Stalwart exactly once, never read back into a
+  only method arguments: sent to Stalwart exactly once, never read back into a
   resource, never logged.
-- ✅ **Idempotent.** `*_ensure` methods find-or-create by name and converge
+- ✅ **Idempotent.** `*_ensure` methods find or create by name and update
   config in place, reporting `action: created | updated | unchanged`.
 - ✅ **Verify-before-mutate.** Every mutating method resolves the target first.
 
 > **Stalwart 0.16 note.** 0.16 removed the legacy REST `/api/*` management tree;
-> all management is now JMAP (`POST /jmap`). A small `/api/*` set survives for
+> all management is now JMAP (`POST /jmap`). A small `/api/*` set remains for
 > introspection (`/api/account`, `/api/schema`) and metrics
 > (`/metrics/prometheus`), which this extension uses for `health_status`.
 
 ## Authentication — scoped API key
 
-Stalwart 0.16 supports API keys scoped to specific management permissions. Mint
-one (bootstrapped via the fallback admin), store it in a vault, and never inline
-it:
+Stalwart 0.16 supports API keys scoped to specific management permissions. Create
+one with the fallback admin account, store it in a vault, and never inline it:
 
 ```bash
 swamp model create @thomas/stalwart stalwart \
@@ -49,37 +47,56 @@ swamp model create @thomas/stalwart stalwart \
 
 ## Methods
 
-**Read / health (available now):**
+**Read-only:**
 
-- `health_status` — edition / version / permissions (`/api/account`) plus curated
-  gauges (`/metrics/prometheus`). Read-only.
-- `jmap_probe` — the Phase 0 discovery tool: runs `<type>/query` then
-  `<type>/get` for one JMAP object type and captures the wire shape (ids + a
-  sample object), so the management type names can be pinned before the Phase 1
-  methods are built. Read-only.
+- `domain_list`, `account_list`, `alias_list`, `role_list`, `group_list`,
+  `mailing_list_list`: one resource per object. Group membership is stored on
+  each member's account, not on the group.
+- `queue_list`: queued outbound messages.
+- `report_query`: received DMARC/TLS aggregate reports.
+- `settings_get`: one server settings singleton (http, system,
+  spam-classifier, …).
+- `health_status`: edition / version / permissions (`/api/account`) plus selected
+  gauges (`/metrics/prometheus`).
+- `session_dump` and `jmap_probe`: discovery tools. `session_dump` records the
+  JMAP session's capabilities and accounts; `jmap_probe` runs `<type>/query`
+  then `<type>/get` for one JMAP object type and records the response shape
+  (ids + a sample object). Use them to check the `USING` / `JMAP_TYPES`
+  constants against a new Stalwart version.
+
+**Create or update (idempotent, never delete):**
+
+- `account_ensure`: an individual mailbox with its `aliases`, role,
+  group membership (`memberOf`) and description. An optional password is
+  set once, on create.
+- `group_ensure`, `mailing_list_ensure`: by address.
+- `role_ensure`: by name, from a `preset` (`swamp-admin` | `automated-mailbox`)
+  or an explicit permission list.
+- `role_assign`: assign `admin`, `user` or a custom role to an account. Re-run
+  with the previous role to revert.
+- `settings_set`: merge `patch` into a settings singleton, then reload.
+- `certificate_install`: install a PEM certificate and key, then reload
+  certificates. Your ACME tooling issues the certificate; this method only
+  installs it.
+
+**Reversible state changes:** `domain_set_state`, `account_set_state`.
+
+**Maintenance:** `reload`, `reload_certificates`.
 
 ```bash
 # Check the server is healthy and see what the API key can do.
 swamp model method run stalwart health_status
 
-# Probe the wire shape of the Principal type (drives Phase 0 discovery).
+# Record the response shape of the Principal type.
 swamp model method run stalwart jmap_probe --input type=Principal --input limit=5
 ```
 
-**Phase 1 (pending the live JMAP discovery spike):** `domain_list`,
-`account_list`, `alias_list`, `group_list`, `report_query`, `queue_list`,
-`reload`, `reload_certificates`, `account_ensure` (aliases via `emails[]`),
-`account_set_state` (reversible).
+**Not built yet:** `group_set_state`, `spam_config_ensure`, and `spam_train`
+(only if Stalwart has a JMAP train method).
 
-**Phase 2:** `group_ensure`, `group_set_state`, `mailing_list_ensure`,
-`role_assign`, `spam_config_ensure`, `spam_train` (only if the JMAP train method
-exists), `certificate_install` (writes the certificate object + reloads;
-issuance stays with cert-orchestrator — this is the install+reload tool).
-
-> The JMAP management method/type names are not published by Stalwart and are
-> pinned against the live server during a one-time discovery spike (see the
-> `USING` / `JMAP_TYPES` constants in `stalwart.ts`). The transport layer,
-> resource schemas, and `health_status` are independent of that.
+> Stalwart does not publish its JMAP management method and type names. They were
+> confirmed against a live 0.16 server and are pinned in the `USING` /
+> `JMAP_TYPES` constants in `stalwart.ts`.
 
 ## License
 

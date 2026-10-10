@@ -1,7 +1,7 @@
 /**
- * Unit tests for the pure logic of `@thomas/arcane`. These cover the bits where a
- * silent bug would be costly: the `{success,data}` envelope unwrap, the swarm
- * service-spec re-point (the heart of secret/config rotation), base64 encoding,
+ * Unit tests for the pure logic of `@thomas/arcane`. These cover the code where an
+ * unnoticed bug would be costly: the `{success,data}` envelope unwrap, the swarm
+ * service-spec re-point (the core step of secret/config rotation), base64 encoding,
  * and the deploy/rotation health & convergence predicates. No network I/O.
  */
 import {
@@ -170,8 +170,8 @@ Deno.test("serviceConvergence classifies rolling-update states", () => {
 //
 // These exercise the branching of project_deploy and secret_rotate against scripted
 // API responses, using the __setArcaneTransport / __setComposeValidator test seams.
-// A minimal fake context stands in for swamp's runtime (only globalArgs, logger, and
-// writeResource are used by these methods). Note: calling execute() directly bypasses
+// A minimal fake context replaces swamp's runtime (only globalArgs, logger, and
+// writeResource are used by these methods). Calling execute() directly bypasses
 // the zod argument parsing swamp does at runtime, so defaults (rollback, removeOld,
 // timeouts) are passed explicitly here.
 
@@ -966,8 +966,8 @@ Deno.test("swarm_stack_remove throws if the record never clears within the deadl
       if (m === "GET" && p === "/environments/0/swarm/status") {
         return Promise.resolve({ success: true, data: { enabled: true } });
       }
-      // DELETE "succeeds" but the record never disappears — must not loop forever
-      // and must not report a phantom success.
+      // DELETE succeeds but the record never disappears: must not loop forever
+      // and must not report success.
       if (m === "DELETE" && p === "/environments/0/swarm/stacks/stuck") {
         return Promise.resolve({ success: true });
       }

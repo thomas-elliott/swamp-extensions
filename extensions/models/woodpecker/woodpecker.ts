@@ -1,5 +1,5 @@
 import { z } from "npm:zod@4";
-// Type-only imports — erased at compile time, never bundled. They anchor the
+// Type-only imports: erased at compile time and never bundled. They type the
 // `satisfies ModelDefinition<typeof GlobalArgs>` clause so each method's
 // `execute` is contextually typed without an explicit `any`.
 import type {
@@ -9,20 +9,20 @@ import type {
 } from "jsr:@systeminit/swamp-testing@0.20260521.16";
 
 /**
- * `@thomas/woodpecker` — careful administration of a Woodpecker CI server over
- * its REST API, authenticated with a personal access token.
+ * `@thomas/woodpecker`: administration of a Woodpecker CI server over its REST
+ * API, authenticated with a personal access token.
  *
- * PURPOSE (the repeatable kit): onboarding and configuring repositories on a
- * self-hosted Woodpecker instance without clicking through the UI per repo —
- * enable a repo, mark it trusted, set its timeout, and promote shared CI
- * credentials to org-level secrets, all idempotently from swamp.
+ * Purpose: onboard and configure repositories on a self-hosted Woodpecker
+ * instance without using the UI for each repo. It enables a repo, marks it
+ * trusted, sets its timeout, and promotes shared CI credentials to org-level
+ * secrets, all idempotently.
  *
- * SCOPE GUARANTEE: this holds an admin PAT, so its surface is deliberately
- * narrow and its mutations are additive or reversible. It enables/configures
- * repos and manages secrets; the only "off switches" are the reversible
- * `repo_disable` (re-enable to undo) and secret deletes (re-create to undo).
- * Secret VALUES are write-only — supplied via a vault reference, sent once, and
- * NEVER read back or emitted (Woodpecker's API does not return them either).
+ * Scope: the model holds an admin PAT, so it has few methods and its mutations
+ * are additive or reversible. It enables/configures repos and manages secrets;
+ * the only disabling operations are `repo_disable` (re-enable to undo) and
+ * secret deletes (re-create to undo). Secret VALUES are write-only: supplied via
+ * a vault reference, sent once, and NEVER read back or emitted (Woodpecker's API
+ * does not return them either).
  *
  * Auth: a Woodpecker personal access token (Settings → CLI and API). Per request
  * it is sent as `Authorization: Bearer <token>`. No token is minted or stored by
@@ -66,8 +66,8 @@ const GlobalArgs = z.object({
 });
 
 // Resolved global-argument shape. Kept internal: `z.infer` is a "slow type", so
-// it must not leak onto the public API (the exported `CallerFn` seam uses the
-// loose `Json` instead — see below).
+// it must not appear on the public API (the exported `CallerFn` uses `Json`
+// instead).
 type GlobalArgsT = z.infer<typeof GlobalArgs>;
 
 /** The set of outcomes a method reports in its `action` field. */
@@ -157,7 +157,7 @@ const SecretInfo = z.object({
   name: z.string(),
   events: z.array(z.string()),
   images: z.array(z.string()),
-  // The value is NEVER stored or returned — Woodpecker's API does not expose it.
+  // The value is NEVER stored or returned; Woodpecker's API does not expose it.
   action: Action,
   timestamp: z.string(),
 });
@@ -264,7 +264,7 @@ const CronInfo = z.object({
 
 // ─────────────────────────── HTTP / auth seam ───────────────────────────
 
-/** A JSON-ish bag — structurally the resolved global args or an API body. */
+/** A JSON object: the resolved global args or an API body. */
 export type Json = Record<string, unknown>;
 
 /** One REST request: method + path (relative to `apiUrl`) + optional JSON body. */
@@ -286,12 +286,12 @@ export interface ApiResult {
 }
 
 /**
- * The authenticated-call seam the methods use — swappable for unit tests. The
- * global args are typed loosely as {@link Json} so this EXPORTED type stays
- * "fast-check" clean (referencing the zod-inferred `GlobalArgsT` would drag a
- * slow type onto the public API). The real implementation re-narrows. It returns
- * the result for ALL HTTP statuses (it only throws on a network/transport
- * error); status-based control flow lives in {@link call}/{@link callTolerant}.
+ * The authenticated-call seam the methods use, swappable for unit tests. The
+ * global args are typed as {@link Json} so this EXPORTED type passes
+ * "fast-check" (referencing the zod-inferred `GlobalArgsT` would put a slow type
+ * on the public API). The real implementation re-narrows. It returns the result
+ * for ALL HTTP statuses and only throws on a network/transport error;
+ * {@link call}/{@link callTolerant} handle status codes.
  */
 export type CallerFn = (g: Json, call: ApiCall) => Promise<ApiResult>;
 
@@ -393,12 +393,12 @@ async function callTolerant(
 /**
  * The server clamps `perPage` to this (`session.Pagination`, `maxPageSize`),
  * and a request without `page` is silently page 1. So a bare GET on a list
- * endpoint returns at most 50 rows and nothing says there were more.
+ * endpoint returns at most 50 rows and does not indicate that more exist.
  */
 const PAGE_SIZE = 50;
 
 /**
- * Fetch every row of a paginated list endpoint, walking `page=1,2,...` until a
+ * Fetch every row of a paginated list endpoint, requesting `page=1,2,...` until a
  * page comes back short. `limit` stops early (and trims) when the caller only
  * wants the first N.
  */
@@ -450,9 +450,9 @@ function looksLikeId(s: string): boolean {
 }
 
 /**
- * Make a string safe as a swamp data instance name — swamp rejects names
- * containing `/`, `\`, `..`, or null bytes (path-traversal guard), but a repo
- * full name like `owner/name` naturally contains a slash.
+ * Make a string safe as a swamp data instance name. swamp rejects names
+ * containing `/`, `\`, `..`, or null bytes (path-traversal guard), and a repo
+ * full name like `owner/name` contains a slash.
  */
 function safeName(s: string): string {
   return s.replace(/[\\/]/g, ":").replace(/\.\./g, "_").replace(/\0/g, "");
@@ -578,10 +578,9 @@ function listForges(g: GlobalArgsT): Promise<Json[]> {
 }
 
 /**
- * Explain a `/api/user/*` miss in terms of the forge binding, because the bare
- * symptom ("not found") reads as "no such repo" and sends you looking in the
- * wrong place. Never throws: this runs on an error path, and a diagnostic that
- * fails must not replace the error it was meant to describe.
+ * Explain a `/api/user/*` miss in terms of the forge binding, because a bare
+ * "not found" suggests the repo does not exist. Never throws: this runs on an
+ * error path, and a failure here must not replace the original error.
  */
 async function forgeBindingHint(g: GlobalArgsT): Promise<string> {
   try {
@@ -608,7 +607,7 @@ async function forgeBindingHint(g: GlobalArgsT): Promise<string> {
 /**
  * Build the settings half of a repo PATCH body from the desired-config args,
  * merging `trusted` over the repo's current trust object so partial trust
- * changes don't clobber the untouched capabilities. Returns the body plus
+ * changes keep the capabilities they don't mention. Returns the body plus
  * whether it differs from `current` (so callers can report unchanged).
  */
 function buildRepoPatch(
@@ -656,7 +655,7 @@ function buildRepoPatch(
   return { body, changed: Object.keys(body).length > 0 };
 }
 
-/** Write one secret (metadata only — never a value) into the data model. */
+/** Write one secret (metadata only, never a value) into the data model. */
 async function writeSecret(
   context: Ctx,
   scope: "org" | "repo",
@@ -765,7 +764,7 @@ function sleep(ms: number): Promise<void> {
  * Statuses on which a wait loop stops. The full upstream set is in
  * `server/model/const.go`; a user cancel lands as `killed`, there is no
  * `canceled`. `blocked` is included because a pipeline awaiting approval
- * will not move without a human, so polling it only runs the clock down.
+ * needs a person to act, so polling it only uses up the timeout.
  */
 const TERMINAL = new Set([
   "success",
@@ -798,9 +797,9 @@ function unixToIso(v: unknown): string | undefined {
 
 /**
  * The most recent pipeline for a repo, of ANY event (returns null if the repo
- * has never run). NB: the dedicated `/pipelines/latest` endpoint only considers
- * the DEFAULT BRANCH and silently excludes tag pipelines, so a just-cut release
- * would be invisible — list-most-recent instead.
+ * has never run). Uses the pipeline list rather than `/pipelines/latest`, which
+ * only considers the DEFAULT BRANCH and excludes tag pipelines, so it would miss
+ * a new release.
  */
 async function latestPipeline(
   g: GlobalArgsT,
@@ -941,9 +940,9 @@ const RepoAvailableArgs = z.object({
 });
 
 /**
- * A boolean that refuses to guess. `z.coerce.boolean()` runs `Boolean(v)`, so
- * `"0"` and `"False"` come out true; on the trust flags that would hand a
- * pipeline the host network and docker socket by typo.
+ * A strict boolean. `z.coerce.boolean()` runs `Boolean(v)`, so `"0"` and
+ * `"False"` become true; on the trust flags a typo would then grant a pipeline
+ * the host network and docker socket.
  */
 const StrictBool = z.union(
   [z.boolean(), z.literal("true"), z.literal("false")],
@@ -989,7 +988,7 @@ const RepoUpdateArgs = z.object({
   ...RepoConfigShape,
 });
 
-// Internal config-arg shape shared by buildRepoPatch (kept unexported — slow type).
+// Internal config-arg shape shared by buildRepoPatch (unexported: slow type).
 type RepoConfigArgs = z.infer<typeof RepoEnableArgs>;
 
 const OrgRef = z.object({
@@ -1014,7 +1013,7 @@ const SecretSetShape = {
   ),
 };
 
-/** Just the create-or-update secret fields, shared by org + repo scopes. */
+/** The create-or-update secret fields, shared by org + repo scopes. */
 const SecretSetCore = z.object(SecretSetShape);
 
 const OrgSecretSetArgs = z.object({
@@ -1037,7 +1036,7 @@ const RepoSecretDeleteArgs = z.object({
   name: z.string().describe("Secret name to delete (reversible: re-create)."),
 });
 
-/** Internal secret-set arg shape (kept unexported — slow type). */
+/** Internal secret-set arg shape (unexported: slow type). */
 type SecretSetArgs = z.infer<typeof SecretSetCore>;
 
 const PipelineListArgs = z.object({
@@ -1119,8 +1118,8 @@ export const model = {
       execute: async (context: Pick<Ctx, "globalArgs">) => {
         // Checks get globalArgs without the schema's defaults; parse to apply them.
         const g = GlobalArgs.parse(context.globalArgs);
-        // Older swamp left the token as an unresolved `${{ … }}` here. Skip then;
-        // the method run checks it.
+        // Older swamp versions pass the token as an unresolved `${{ … }}` here.
+        // Skip the check then; the method run validates the token.
         if (/\$\{\{/.test(String(g.token))) return { pass: true };
         try {
           const r = await rawCall(g, { method: "GET", path: "/api/user" });
@@ -2148,8 +2147,8 @@ export const model = {
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const g = context.globalArgs;
-        // /version and /healthz live OUTSIDE the /api prefix — the /api/* forms
-        // are swallowed by the SPA catch-all and return HTML, not JSON.
+        // /version and /healthz are outside the /api prefix. The SPA catch-all
+        // serves the /api/* forms and returns HTML, not JSON.
         const ver = await call(g, { method: "GET", path: "/version" });
         const health = await callTolerant(g, {
           method: "GET",
