@@ -410,6 +410,7 @@ Deno.test("domain_list: isEnabled maps to state, one resource per domain", async
 
 Deno.test("account_list: extracts aliases, type, and disabled detection", async () => {
   makeTypedJmap({
+    "x:Domain": [{ id: "c", name: "example.com" }],
     "x:Account": [
       {
         id: "l",
@@ -417,8 +418,9 @@ Deno.test("account_list: extracts aliases, type, and disabled detection", async 
         emailAddress: "swamp-admin@example.com",
         domainId: "c",
         "@type": "User",
+        // The wire shape: a local part plus a domain id, never a full address.
         aliases: {
-          "0": { name: "ops@example.com", domainId: "c", enabled: true },
+          "0": { name: "ops", domainId: "c", enabled: true },
         },
         roles: { "@type": "Admin" },
         permissions: { "@type": "Inherit" },
@@ -443,7 +445,11 @@ Deno.test("account_list: extracts aliases, type, and disabled detection", async 
     assertEquals(written[0].data.name, "swamp-admin");
     assertEquals(written[0].data.email, "swamp-admin@example.com");
     assertEquals(written[0].data.type, "individual", "@type User → individual");
-    assertEquals(written[0].data.aliases, ["ops@example.com"]);
+    assertEquals(
+      written[0].data.aliases,
+      ["ops@example.com"],
+      "alias local part joined to its domain name",
+    );
     assertEquals(written[0].data.roles, "admin");
     assertEquals(written[0].data.enabled, true);
     assertEquals(
@@ -484,21 +490,25 @@ Deno.test("role_list: permission/role maps become arrays", async () => {
 
 Deno.test("alias_list: filters to one account by name or full address", async () => {
   makeTypedJmap({
+    "x:Domain": [
+      { id: "d1", name: "example.com" },
+      { id: "d2", name: "example.net" },
+    ],
     "x:Account": [
       {
         id: "l",
         name: "alice",
         emailAddress: "alice@example.com",
         aliases: {
-          "0": { name: "a@example.com" },
-          "1": { name: "alice.smith@example.com" },
+          "0": { name: "a", domainId: "d1" },
+          "1": { name: "alice.smith", domainId: "d2" },
         },
       },
       {
         id: "m",
         name: "bob",
         emailAddress: "bob@example.com",
-        aliases: { "0": { name: "b@example.com" } },
+        aliases: { "0": { name: "b", domainId: "d1" } },
       },
     ],
   });
@@ -511,9 +521,51 @@ Deno.test("alias_list: filters to one account by name or full address", async ()
     assertEquals(written.length, 2, "only alice's two aliases");
     assertEquals(written.map((w) => w.data.address).sort(), [
       "a@example.com",
-      "alice.smith@example.com",
-    ]);
+      "alice.smith@example.net",
+    ], "each alias carries its own domain, not the account's");
     assertEquals(written[0].data.account, "alice");
+  } finally {
+    __setJmap(null);
+    __setRest(null);
+  }
+});
+
+Deno.test("resolveAccountId: two credentials on one URL do not share a cached account", async () => {
+  // The fake session answers with whichever account the bearer token names, so
+  // a shared cache would hand the second credential the first one's account.
+  const seen: string[] = [];
+  const caller: RestFn = (g, c) => {
+    seen.push(String(g.apiKey));
+    return Promise.resolve({
+      status: 200,
+      body: c.path === "/.well-known/jmap"
+        ? { primaryAccounts: { "urn:stalwart:jmap": `acct-${g.apiKey}` } }
+        : {},
+    });
+  };
+  __setRest(caller);
+  const { caller: jmapCaller, calls } = makeFakeJmap((c) => {
+    const name = (c.methodCalls[0] as unknown[])[0] as string;
+    return jmapOk(name, name.endsWith("/query") ? { ids: [] } : { list: [] });
+  });
+  __setJmap(jmapCaller);
+  try {
+    for (const apiKey of ["key-one", "key-two"]) {
+      const { context } = makeContext({ ...GLOBALS, apiKey });
+      await method("jmap_probe").execute(
+        { type: "Principal", limit: 1 },
+        context,
+      );
+    }
+    assertEquals(
+      seen,
+      ["key-one", "key-two"],
+      "one session fetch per credential",
+    );
+    const accountIds = calls.map((c) =>
+      ((c.methodCalls[0] as unknown[])[1] as Json).accountId
+    );
+    assertEquals(accountIds, ["acct-key-one", "acct-key-two"]);
   } finally {
     __setJmap(null);
     __setRest(null);
@@ -774,6 +826,7 @@ Deno.test("account_ensure: idempotent when aliases/description already match", a
       name: "alice",
       emailAddress: "alice@example.com",
       domainId: "d1",
+      "@type": "User",
       aliases: { "0": { name: "a", domainId: "d1", enabled: true } },
       roles: { "@type": "User" },
       description: "Alice",
@@ -802,6 +855,7 @@ Deno.test("account_ensure: omitting aliases leaves existing aliases untouched", 
       name: "alice",
       emailAddress: "alice@example.com",
       domainId: "d1",
+      "@type": "User",
       aliases: { "0": { name: "a", domainId: "d1", enabled: true } },
       roles: { "@type": "User" },
       description: "Old",
@@ -955,6 +1009,41 @@ Deno.test("account_ensure: memberOf rejects a non-group / unknown address before
       /Group not found/,
     );
     assertEquals(setCalls.length, 0);
+  } finally {
+    __setJmap(null);
+    __setRest(null);
+  }
+});
+
+Deno.test("account_ensure: refuses an address that belongs to a group, writes nothing", async () => {
+  const { setCalls } = makeTypedJmap({
+    "x:Domain": [{ id: "d1", name: "example.com" }],
+    "x:Account": [
+      {
+        id: "g1",
+        "@type": "Group",
+        name: "team",
+        emailAddress: "team@example.com",
+        domainId: "d1",
+        description: "Team",
+      },
+    ],
+  });
+  try {
+    const { context } = makeContext();
+    // With and without `role`: both paths used to reach the group, one erroring
+    // at the server and the other silently patching it.
+    for (const extra of [{}, { role: "admin" }]) {
+      await rejects(
+        () =>
+          method("account_ensure").execute(
+            { email: "team@example.com", description: "Changed", ...extra },
+            context,
+          ),
+        /group account, not an individual/,
+      );
+    }
+    assertEquals(setCalls.length, 0, "the group must not be touched");
   } finally {
     __setJmap(null);
     __setRest(null);
