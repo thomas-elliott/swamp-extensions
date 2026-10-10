@@ -61,15 +61,15 @@ swamp model method run woodpecker status_all --input '{}'
 # Watch a run to completion (defaults to the repo's latest); writes the final
 # status plus every step, so the failed step is right there.
 swamp model method run woodpecker pipeline_wait \
-  --input '{"repo":"thomas-elliott/taskmanager"}'
+  --input '{"repo":"octo-org/api"}'
 
 # Per-step states for a pipeline (defaults to latest).
 swamp model method run woodpecker pipeline_steps \
-  --input '{"repo":"thomas-elliott/taskmanager"}'
+  --input '{"repo":"octo-org/api"}'
 
 # Decoded logs for one step (by name or id), last N lines — no curl + base64.
 swamp model method run woodpecker pipeline_logs \
-  --input '{"repo":"thomas-elliott/taskmanager","step":"dotnet","tailLines":50}'
+  --input '{"repo":"octo-org/api","step":"dotnet","tailLines":50}'
 ```
 
 - `status_all`: one `repo-status` per enabled repo (`status`, last number/event/
@@ -116,7 +116,7 @@ specific run.
 # and set a 30-minute hang backstop — all idempotently. Method arguments are
 # passed as one JSON object via --input (vault references resolve server-side).
 swamp model method run woodpecker repo_enable \
-  --input '{"repo":"thomas-elliott/damson","trusted":true,"timeout":30}'
+  --input '{"repo":"octo-org/web","trusted":true,"timeout":30}'
 ```
 
 - `repo_enable`: activate (if needed) and update settings. `trusted=true` sets
@@ -136,7 +136,7 @@ swamp model method run woodpecker repo_enable \
 # One ghcr push token inherited by every repo in the org. The value is a vault
 # reference — it resolves server-side and never appears on the command line.
 swamp model method run woodpecker org_secret_set \
-  --input '{"owner":"thomas-elliott","name":"ghcr_token","value":"${{ vault.get(<vault>, woodpecker/ghcr_token) }}","events":["push","tag"]}'
+  --input '{"owner":"octo-org","name":"ghcr_token","value":"${{ vault.get(<vault>, woodpecker/ghcr_token) }}","events":["push","tag"]}'
 ```
 
 - `org_secret_set` / `repo_secret_set`: create-or-update a secret (value
@@ -176,3 +176,14 @@ and a `timestamp`.
   object), not `--arg`. `${{ vault.get(...) }}` references inside an `--input`
   value resolve server-side, so secret values never reach the command line.
 - Targets the Woodpecker **v3** REST API.
+
+## Breaking changes
+
+- **The `trusted*` flags accept only `true`/`false`** (or the strings `"true"` /
+  `"false"`). Earlier versions read `"0"`, `"False"` and any other non-empty
+  string as true, which on these flags grants host network and Docker socket
+  access.
+- **`repo_list` and `status_all` cover enabled repos only**, as their
+  descriptions always said; disabled repos were included before.
+- **The `queue` resource has no `completed` field.** Woodpecker does not report
+  one; it was always 0.

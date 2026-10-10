@@ -109,9 +109,9 @@ const method = (name: string): MethodDef =>
 function repoObj(over: Record<string, unknown> = {}): Record<string, unknown> {
   return {
     id: 1,
-    full_name: "thomas-elliott/damson",
-    owner: "thomas-elliott",
-    name: "damson",
+    full_name: "octo-org/web",
+    owner: "octo-org",
+    name: "web",
     forge_remote_id: "586125582",
     active: true,
     trusted: { network: false, volumes: false, security: false },
@@ -137,7 +137,7 @@ Deno.test("repo_enable: not-yet-active repo is activated via forge_remote_id", a
       return Promise.resolve({
         status: 200,
         body: ([{
-          full_name: "thomas-elliott/damson",
+          full_name: "octo-org/web",
           forge_remote_id: "586125582",
           active: false,
         }] as unknown) as Record<string, unknown>,
@@ -154,7 +154,7 @@ Deno.test("repo_enable: not-yet-active repo is activated via forge_remote_id", a
   try {
     const { context, written } = makeContext();
     await method("repo_enable").execute(
-      { repo: "thomas-elliott/damson" },
+      { repo: "octo-org/web" },
       context,
     );
     const post = calls.find((c) =>
@@ -177,7 +177,7 @@ Deno.test("repo_enable: already-active + no settings -> unchanged, no PATCH", as
   try {
     const { context, written } = makeContext();
     await method("repo_enable").execute(
-      { repo: "thomas-elliott/damson" },
+      { repo: "octo-org/web" },
       context,
     );
     assert(
@@ -215,7 +215,7 @@ Deno.test("repo_enable: trusted=true sets all three; partial trust merges", asyn
     const { context } = makeContext();
     // Only flip volumes; network already true must be preserved in the merge.
     await method("repo_enable").execute(
-      { repo: "thomas-elliott/damson", trustedVolumes: true },
+      { repo: "octo-org/web", trustedVolumes: true },
       context,
     );
     assertEquals(
@@ -259,7 +259,7 @@ Deno.test("repo_update: timeout change issues a PATCH; same value is unchanged",
 Deno.test("org_secret_set: 404 probe -> POST create; sends value but never stores it", async () => {
   let postBody: Record<string, unknown> | undefined;
   const caller: CallerFn = (_g, c) => {
-    if (c.path === "/api/orgs/lookup/thomas-elliott") {
+    if (c.path === "/api/orgs/lookup/octo-org") {
       return Promise.resolve({ status: 200, body: { id: 1, is_user: true } });
     }
     if (c.method === "GET" && c.path.endsWith("/secrets/ghcr_token")) {
@@ -283,7 +283,7 @@ Deno.test("org_secret_set: 404 probe -> POST create; sends value but never store
   try {
     const { context, written } = makeContext();
     await method("org_secret_set").execute(
-      { owner: "thomas-elliott", name: "ghcr_token", value: "SUPER_SECRET" },
+      { owner: "octo-org", name: "ghcr_token", value: "SUPER_SECRET" },
       context,
     );
     assertEquals(postBody?.value, "SUPER_SECRET", "value sent on the wire");
@@ -303,7 +303,7 @@ Deno.test("org_secret_set: existing secret -> PATCH update", async () => {
   const calls: string[] = [];
   const caller: CallerFn = (_g, c) => {
     calls.push(`${c.method} ${c.path}`);
-    if (c.path === "/api/orgs/lookup/thomas-elliott") {
+    if (c.path === "/api/orgs/lookup/octo-org") {
       return Promise.resolve({ status: 200, body: { id: 1 } });
     }
     if (c.method === "GET" && c.path.endsWith("/secrets/ghcr_token")) {
@@ -321,7 +321,7 @@ Deno.test("org_secret_set: existing secret -> PATCH update", async () => {
   try {
     const { context, written } = makeContext();
     await method("org_secret_set").execute(
-      { owner: "thomas-elliott", name: "ghcr_token", value: "v" },
+      { owner: "octo-org", name: "ghcr_token", value: "v" },
       context,
     );
     assert(
@@ -339,7 +339,7 @@ Deno.test("org_secret_set: existing secret -> PATCH update", async () => {
 Deno.test("org_secret_set: PATCH sends only the fields that were passed", async () => {
   const patches: unknown[] = [];
   const caller: CallerFn = (_g, c) => {
-    if (c.path === "/api/orgs/lookup/thomas-elliott") {
+    if (c.path === "/api/orgs/lookup/octo-org") {
       return Promise.resolve({ status: 200, body: { id: 1 } });
     }
     if (c.method === "PATCH") patches.push(c.body);
@@ -352,12 +352,12 @@ Deno.test("org_secret_set: PATCH sends only the fields that were passed", async 
   try {
     const { context } = makeContext();
     await method("org_secret_set").execute(
-      { owner: "thomas-elliott", name: "ghcr_token", value: "v" },
+      { owner: "octo-org", name: "ghcr_token", value: "v" },
       context,
     );
     await method("org_secret_set").execute(
       {
-        owner: "thomas-elliott",
+        owner: "octo-org",
         name: "ghcr_token",
         value: "v",
         images: ["woodpeckerci/plugin-docker-buildx"],
@@ -412,7 +412,7 @@ Deno.test("resolveRepoId: bare name (no slash, non-numeric) is rejected", async 
   try {
     const { context } = makeContext();
     await rejects(
-      () => method("repo_get").execute({ repo: "damson" }, context),
+      () => method("repo_get").execute({ repo: "web" }, context),
       /numeric id or "owner\/name"/,
     );
   } finally {
@@ -426,7 +426,7 @@ Deno.test("repo_available: instance names sanitize the slash in owner/name", asy
       return Promise.resolve({
         status: 200,
         body: ([{
-          full_name: "thomas-elliott/damson",
+          full_name: "octo-org/web",
           forge_remote_id: "1",
           active: true,
         }] as unknown) as Record<string, unknown>,
@@ -444,7 +444,7 @@ Deno.test("repo_available: instance names sanitize the slash in owner/name", asy
       !written[0].name.includes("/"),
       `instance name must not contain '/': ${written[0].name}`,
     );
-    assertEquals(written[0].data.fullName, "thomas-elliott/damson");
+    assertEquals(written[0].data.fullName, "octo-org/web");
   } finally {
     __setCaller(null);
   }
@@ -476,7 +476,7 @@ Deno.test("repo_secret_list: secret instance name sanitizes the repo full name",
       !written[0].name.includes("/"),
       `secret instance name must not contain '/': ${written[0].name}`,
     );
-    assertEquals(written[0].data.owner, "thomas-elliott/damson");
+    assertEquals(written[0].data.owner, "octo-org/web");
   } finally {
     __setCaller(null);
   }
@@ -835,14 +835,14 @@ Deno.test("repo_enable: a cross-forge repo explains the forge binding", async ()
       return {
         status: 200,
         body: ([{
-          full_name: "thomas-elliott/damson",
+          full_name: "octo-org/web",
           forge_remote_id: "586125582",
           forge_id: 1,
           active: false,
         }] as unknown) as Record<string, unknown>,
       };
     }
-    if (c.path === "/api/user") return { login: "thomas-elliott", forge_id: 1 };
+    if (c.path === "/api/user") return { login: "octo-org", forge_id: 1 };
     if (c.path.startsWith("/api/forges?")) {
       return {
         status: 200,
@@ -858,8 +858,8 @@ Deno.test("repo_enable: a cross-forge repo explains the forge binding", async ()
   try {
     const { context } = makeContext();
     await rejects(
-      () => method("repo_enable").execute({ repo: "telliott/damson" }, context),
-      /bound to the forge it authenticated against.*thomas-elliott on forge 1 \(github/s,
+      () => method("repo_enable").execute({ repo: "telliott/web" }, context),
+      /bound to the forge it authenticated against.*octo-org on forge 1 \(github/s,
     );
   } finally {
     __setCaller(null);
@@ -879,7 +879,7 @@ Deno.test("repo_enable: a broken diagnostic never masks the real error", async (
   try {
     const { context } = makeContext();
     await rejects(
-      () => method("repo_enable").execute({ repo: "telliott/damson" }, context),
+      () => method("repo_enable").execute({ repo: "telliott/web" }, context),
       /not found among forge repos the token can access\.$/,
     );
   } finally {
@@ -918,7 +918,7 @@ Deno.test("repo_available: carries forge_id through to the resource", async () =
       return {
         status: 200,
         body: ([{
-          full_name: "telliott/damson",
+          full_name: "telliott/web",
           forge_remote_id: "42",
           forge_id: 2,
           active: false,
@@ -1106,6 +1106,66 @@ Deno.test("trusted flags: '0' and 'False' are rejected, not coerced to true", as
       { repo: "1", trusted: "false", trustedVolumes: true },
       ctx2,
     );
+  } finally {
+    __setCaller(null);
+  }
+});
+
+// ─────────────────────────── upstream behaviour ───────────────────────────
+
+Deno.test("pipeline_trigger without a branch uses the repo's default branch", async () => {
+  const { caller, calls } = makeFakeApi((c) => {
+    if (c.method === "GET" && c.path === "/api/repos/1") return repoObj();
+    if (c.method === "POST") return { number: 7, status: "pending" };
+    return undefined;
+  });
+  __setCaller(caller);
+  try {
+    const { context } = makeContext();
+    await method("pipeline_trigger").execute({ repo: "1" }, context);
+    const post = calls.find((c) => c.method === "POST");
+    assertEquals(post?.body, { branch: "main" });
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("cron_set without a branch is unchanged when the schedule matches", async () => {
+  const { caller, calls } = makeFakeApi((c) => {
+    if (c.path.startsWith("/api/repos/1/cron")) {
+      const crons = c.path.includes("page=1")
+        ? [{ id: 3, name: "nightly", schedule: "@daily", branch: "release" }]
+        : [];
+      return crons as unknown as Record<string, unknown>;
+    }
+    return undefined;
+  });
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("cron_set").execute(
+      { repo: "1", name: "nightly", schedule: "@daily" },
+      context,
+    );
+    assertEquals(written[0].data.action, "unchanged");
+    assertEquals(calls.some((c) => c.method === "PATCH"), false);
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("repo_list asks for enabled repos only", async () => {
+  const { caller, calls } = makeFakeApi((c) =>
+    (c.path.startsWith("/api/repos?active=true") && c.path.includes("page=1")
+      ? [repoObj()]
+      : []) as unknown as Record<string, unknown>
+  );
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("repo_list").execute({}, context);
+    assertEquals(written.length, 1);
+    assert(calls[0].path.startsWith("/api/repos?active=true&"));
   } finally {
     __setCaller(null);
   }
