@@ -221,7 +221,6 @@ const QueueStats = z.object({
   pending: z.number(),
   waitingOnDeps: z.number(),
   running: z.number(),
-  completed: z.number(),
   workerCount: z.number(),
   action: Action,
   timestamp: z.string(),
@@ -1220,7 +1219,7 @@ export const model = {
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const g = context.globalArgs;
         logInfo(context, "Listing enabled repos");
-        const repos = await pageAll(g, "/api/repos");
+        const repos = await pageAll(g, "/api/repos?active=true");
         const handles: DataHandle[] = [];
         for (const repo of repos) {
           handles.push(
@@ -1590,7 +1589,7 @@ export const model = {
         const a = StatusAllArgs.parse(rawArgs);
         const g = context.globalArgs;
         logInfo(context, "Collecting fleet pipeline status");
-        const repos = await pageAll(g, "/api/repos");
+        const repos = await pageAll(g, "/api/repos?active=true");
         const match = a.match?.toLowerCase();
         const ts = nowIso();
         const handles: DataHandle[] = [];
@@ -1929,12 +1928,18 @@ export const model = {
         const a = PipelineTriggerArgs.parse(rawArgs);
         const g = context.globalArgs;
         const id = await resolveRepoId(g, a.repo);
-        const body: Json = {};
-        if (a.branch) body.branch = a.branch;
-        logInfo(context, "Triggering pipeline", {
-          repo: a.repo,
-          branch: a.branch,
-        });
+        // Woodpecker has no fallback: an empty branch goes to the forge as is.
+        const branch = a.branch ?? String(
+          (await call(g, { method: "GET", path: `/api/repos/${id}` })).body
+            .default_branch ?? "",
+        );
+        if (!branch) {
+          throw new Error(
+            `Repo ${a.repo} reports no default branch; pass branch explicitly.`,
+          );
+        }
+        const body: Json = { branch };
+        logInfo(context, "Triggering pipeline", { repo: a.repo, branch });
         const r = await call(g, {
           method: "POST",
           path: `/api/repos/${id}/pipelines`,
@@ -2116,7 +2121,6 @@ export const model = {
             stats.waiting_on_deps_count ?? asArray(b.waiting_on_deps).length,
           ),
           running: Number(stats.running_count ?? asArray(b.running).length),
-          completed: Number(stats.completed_count ?? 0),
           workerCount: Number(stats.worker_count ?? 0),
           action: "observed",
           timestamp: nowIso(),
@@ -2133,8 +2137,7 @@ export const model = {
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const g = context.globalArgs;
-        // /version and /healthz are outside the /api prefix. The SPA catch-all
-        // serves the /api/* forms and returns HTML, not JSON.
+        // /version and /healthz sit outside the /api prefix.
         const ver = await call(g, { method: "GET", path: "/version" });
         const health = await callTolerant(g, {
           method: "GET",
@@ -2209,7 +2212,8 @@ export const model = {
           action = "created";
         } else if (
           String(existing.schedule ?? "") === a.schedule &&
-          String(existing.branch ?? "") === (a.branch ?? "")
+          // An omitted branch keeps the cron's own, as the PATCH does.
+          (a.branch === undefined || String(existing.branch ?? "") === a.branch)
         ) {
           raw = existing;
           action = "unchanged";
