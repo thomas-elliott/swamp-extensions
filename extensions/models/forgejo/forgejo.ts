@@ -38,9 +38,9 @@ import type {
  * `write:repository, write:organization, read:admin, read:misc, read:user`
  * (`read:admin` is only exercised by `user_list`; `read:misc` by `health`).
  * The token's user must be a site admin for `user_list` and for the listing
- * methods to see private repos across all owners. NB (confirmed 2026-06-13):
- * token CRUD (`/users/{u}/tokens`) is basic-auth-only, so this model never
- * creates or revokes tokens.
+ * methods to see private repos across all owners. Token CRUD
+ * (`/users/{u}/tokens`) needs basic auth, so this model never creates or
+ * revokes tokens.
  *
  * Idempotency: every `*_ensure` probes by name first (404 ⇒ create, else
  * converge the supplied settings in place via PATCH) and reports an `action`
@@ -242,12 +242,9 @@ const WebhookInfo = z.object({
   id: z.number().describe("Hook id, unique within the repo."),
   type: z.string().describe("Hook driver: gitea | forgejo | slack | ..."),
   url: z.string().describe(
-    "The target the hook POSTs to, with every query-string VALUE redacted. " +
-      "This is the field that silently rots — a CI server whose address " +
-      "changed leaves every repo pointing at the old one, and a hook that " +
-      "cannot be delivered fails quietly. Redacted because the query string " +
-      "is credential-bearing: Woodpecker authenticates its hooks with an " +
-      "`?access_token=<JWT>` on the URL itself, so the raw URL is a secret.",
+    "The target the hook POSTs to, with every query-string value redacted: " +
+      "Woodpecker authenticates its hooks with an `?access_token=<JWT>` on " +
+      "the URL itself, so the raw URL is a secret.",
   ),
   contentType: z.string().optional().describe("json | form."),
   events: z.array(z.string()).describe("Event names that trigger the hook."),
@@ -433,16 +430,10 @@ function hooksPath(owner: string, name: string): string {
 }
 
 /**
- * A webhook URL split into the part that identifies the target and the part
- * that must never be shown.
- *
- * Confirmed against Woodpecker (2026-09-04): it registers its hooks as
- * `<host>/api/hook?access_token=<JWT>`, so the query string is a CREDENTIAL.
- * Two consequences:
- *   - `redacted` is the only form safe to store or print.
- *   - `target` (scheme+host+path, no query) is the only sound thing to compare
- *     an expected URL against; comparing raw URLs reports every hook as
- *     drifted because no caller can supply the per-repo token.
+ * A webhook URL split into the part that identifies the target and the query
+ * string, which can hold a token. `redacted` is the form to store or print;
+ * `target` (scheme, host and path) is what an expected URL is compared with,
+ * since no caller can supply a per-repo token.
  */
 function splitHookUrl(raw: string): { target: string; redacted: string } {
   let u: URL;
@@ -470,13 +461,14 @@ function listItems(body: Json): Json[] {
   return asArray(body.data);
 }
 
-/** Page size used for every paginated listing (search caps at 50). */
+/** Page size asked for on every paginated listing. */
 const PAGE_LIMIT = 50;
 
 /**
  * Fetch every page of a paginated listing. `path` may already contain a query
- * string; `limit`/`page` are appended with the right separator. Stops when a
- * page comes back short.
+ * string; `limit`/`page` are appended with the right separator. Stops at the
+ * first empty page: the server caps `limit` at its MAX_RESPONSE_ITEMS, so a
+ * short page does not mean the last one.
  */
 async function pageAll(g: GlobalArgsT, path: string): Promise<Json[]> {
   const sep = path.includes("?") ? "&" : "?";
@@ -487,10 +479,45 @@ async function pageAll(g: GlobalArgsT, path: string): Promise<Json[]> {
       path: `${path}${sep}limit=${PAGE_LIMIT}&page=${page}`,
     });
     const items = listItems(r.body);
+    if (items.length === 0) break;
     out.push(...items);
-    if (items.length < PAGE_LIMIT) break;
   }
   return out;
+}
+
+/** Every repo of one owner, which may be an org or a user. */
+async function ownerRepos(g: GlobalArgsT, owner: string): Promise<Json[]> {
+  // Probe the org listing first.
+  const org = await callTolerant(g, {
+    method: "GET",
+    path: `/api/v1/orgs/${enc(owner)}`,
+  }, [403, 404]);
+  if (org.status < 400) {
+    return await pageAll(g, `/api/v1/orgs/${enc(owner)}/repos`);
+  }
+  const user = await callTolerant(g, {
+    method: "GET",
+    path: `/api/v1/users/${enc(owner)}/repos?limit=1&page=1`,
+  }, [403, 404]);
+  if (user.status === 403) {
+    throw new Error(
+      `Cannot list repositories for owner "${owner}": this token ` +
+        `holds neither read:organization nor read:user, and Forgejo ` +
+        `requires one of them to resolve an owner. Drop --owner to ` +
+        `list via /repos/search, which read:repository covers.`,
+    );
+  }
+  if (user.status === 404) {
+    throw new Error(
+      `No user "${owner}" on ${g.apiUrl}` +
+        (org.status === 403
+          ? `, and the org probe was refused for lack of ` +
+            `read:organization — an organization of that name could ` +
+            `not be ruled out.`
+          : `, and no organization of that name either.`),
+    );
+  }
+  return await pageAll(g, `/api/v1/users/${enc(owner)}/repos`);
 }
 
 /** Fetch a repo by `owner/name`, or null when it does not exist. */
@@ -625,9 +652,8 @@ function toProtectionInfo(
 
 /**
  * Build a branch-protection payload from the supplied fields only, mapping
- * camelCase args to the API's snake_case. `include` decides which keys are
- * emitted: a create needs every supplied field, an update only the differing
- * ones.
+ * camelCase args to the API's snake_case. With no `current` rule (a create)
+ * every supplied field is sent; otherwise only the ones that differ.
  */
 function protectionBody(
   desired: ProtectionDesired,
@@ -1321,38 +1347,7 @@ export const model = {
         if (a.owner === undefined) {
           repos = await pageAll(g, "/api/v1/repos/search");
         } else {
-          // An owner is an org or a user; probe the org listing first.
-          const org = await callTolerant(g, {
-            method: "GET",
-            path: `/api/v1/orgs/${enc(a.owner)}`,
-          }, [403, 404]);
-          if (org.status < 400) {
-            repos = await pageAll(g, `/api/v1/orgs/${enc(a.owner)}/repos`);
-          } else {
-            const user = await callTolerant(g, {
-              method: "GET",
-              path: `/api/v1/users/${enc(a.owner)}/repos?limit=1&page=1`,
-            }, [403, 404]);
-            if (user.status === 403) {
-              throw new Error(
-                `Cannot list repositories for owner "${a.owner}": this token ` +
-                  `holds neither read:organization nor read:user, and Forgejo ` +
-                  `requires one of them to resolve an owner. Drop --owner to ` +
-                  `list via /repos/search, which read:repository covers.`,
-              );
-            }
-            if (user.status === 404) {
-              throw new Error(
-                `No user "${a.owner}" on ${g.apiUrl}` +
-                  (org.status === 403
-                    ? `, and the org probe was refused for lack of ` +
-                      `read:organization — an organization of that name could ` +
-                      `not be ruled out.`
-                    : `, and no organization of that name either.`),
-              );
-            }
-            repos = await pageAll(g, `/api/v1/users/${enc(a.owner)}/repos`);
-          }
+          repos = await ownerRepos(g, a.owner);
         }
         const handles: DataHandle[] = [];
         for (const r of repos) {
@@ -1470,19 +1465,9 @@ export const model = {
           if (!r) throw new Error(`No such repo: ${a.owner}/${a.name}`);
           repos = [r];
         } else {
-          repos = await pageAll(
-            g,
-            a.owner
-              ? `/api/v1/repos/search?q=&uid=0&owner=${enc(a.owner)}`
-              : "/api/v1/repos/search?q=",
-          );
-          if (a.owner) {
-            // The search `owner` filter is a uid in some versions and ignored
-            // in others, so filter client-side too rather than rely on it.
-            repos = repos.filter((r) =>
-              String(((r.owner ?? {}) as Json).login ?? "") === a.owner
-            );
-          }
+          repos = a.owner
+            ? await ownerRepos(g, a.owner)
+            : await pageAll(g, "/api/v1/repos/search?q=");
         }
 
         logInfo(context, "Auditing webhooks", { repos: repos.length });
@@ -1584,10 +1569,8 @@ export const model = {
         let action: z.infer<typeof Action> = "unchanged";
         let updated = hook;
         if (currentTarget !== wantTarget) {
-          // Copy the existing query string unchanged. Woodpecker authenticates
-          // its hooks with an `?access_token=<JWT>` on the URL, so writing the
-          // caller's query-free URL would remove the token: the hook would
-          // still fire, and every delivery would be rejected.
+          // Keep the existing query string: it holds the hook's token, and
+          // without it every delivery would be rejected.
           const query = current.includes("?")
             ? current.slice(current.indexOf("?"))
             : "";
@@ -2260,9 +2243,10 @@ export const model = {
         }
         if (pr.mergeable === false) {
           throw new Error(
-            `${ref} is not mergeable (conflicts, or a branch protection is ` +
-              "unsatisfied). Resolve it on the branch — this model will not " +
-              "force past it.",
+            `${ref} is not mergeable. Forgejo reports this for conflicts, for ` +
+              "a work-in-progress title, and while it is still checking a " +
+              "branch that was just pushed; in that last case, retry in a few " +
+              "seconds.",
           );
         }
         const head = (pr.head ?? {}) as Json;
