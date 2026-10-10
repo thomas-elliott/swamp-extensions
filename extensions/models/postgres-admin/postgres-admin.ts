@@ -379,6 +379,19 @@ function logInfo(
   context.logger?.info?.(message, props ?? {});
 }
 
+/** Validate an identifier against the configured pattern. Separate from `ident`
+ * so a method can reject every identifier it was given before it runs any DDL,
+ * rather than failing part-way through a multi-statement change. */
+function checkIdent(g: GlobalArgsT, name: string, label: string): void {
+  if (!new RegExp(g.identifierPattern).test(name)) {
+    throw new Error(
+      `Invalid ${label} identifier ${
+        JSON.stringify(name)
+      }: must match ${g.identifierPattern}`,
+    );
+  }
+}
+
 /** Validate an identifier against the configured pattern (defence-in-depth on top
  * of escaping), then return its safely-escaped form. Throws on a bad identifier. */
 function ident(
@@ -387,14 +400,26 @@ function ident(
   name: string,
   label: string,
 ): string {
-  if (!new RegExp(g.identifierPattern).test(name)) {
-    throw new Error(
-      `Invalid ${label} identifier ${
-        JSON.stringify(name)
-      }: must match ${g.identifierPattern}`,
-    );
-  }
+  checkIdent(g, name, label);
   return q.escapeIdentifier(name);
+}
+
+/** Run `fn` inside one transaction so a multi-statement change lands whole or
+ * not at all. A half-applied change is worse than a failed one here: the next
+ * run sees the role (or the schema grant) already present and skips the rest. */
+async function inTransaction<T>(
+  q: Querier,
+  fn: () => Promise<T>,
+): Promise<T> {
+  await q.query("BEGIN");
+  try {
+    const result = await fn();
+    await q.query("COMMIT");
+    return result;
+  } catch (e) {
+    await q.query("ROLLBACK");
+    throw e;
+  }
 }
 
 function asBool(v: unknown): boolean {
@@ -455,6 +480,25 @@ async function databaseExists(q: Querier, name: string): Promise<boolean> {
   const r = await q.query("SELECT 1 FROM pg_database WHERE datname = $1", [
     name,
   ]);
+  return r.rows.length > 0;
+}
+
+/** Whether `role` holds USAGE on `schema` by a direct grant (not via PUBLIC).
+ * app_provision uses this as its "provisioned before" marker: it is the first
+ * grant of Phase B, and Phase B runs in one transaction, so it is present only
+ * after a completed provision. Effective-privilege checks would not do, because
+ * `public` grants USAGE to PUBLIC on every role. */
+async function holdsSchemaUsage(
+  q: Querier,
+  schema: string,
+  role: string,
+): Promise<boolean> {
+  const r = await q.query(
+    `SELECT 1 FROM pg_namespace n, aclexplode(n.nspacl) a
+      WHERE n.nspname = $1 AND a.privilege_type = 'USAGE'
+        AND a.grantee = (SELECT oid FROM pg_roles WHERE rolname = $2)`,
+    [schema, role],
+  );
   return r.rows.length > 0;
 }
 
@@ -552,7 +596,10 @@ const GrantArgs = z.object({
     .default(false)
     .describe("Also ALTER DEFAULT PRIVILEGES for future objects in the schema"),
   defaultForRole: z.string().optional().describe(
-    "FOR ROLE in ALTER DEFAULT PRIVILEGES (the object-creating role); defaults to the schema owner's future objects",
+    "FOR ROLE in ALTER DEFAULT PRIVILEGES: the role whose future objects the " +
+      "grant covers (the one that will create the tables). Required when " +
+      "includeFuture is set: PostgreSQL would otherwise alter the connecting " +
+      "admin role's own defaults, which only affect objects the admin creates.",
   ),
 });
 
@@ -574,20 +621,20 @@ const AppProvisionArgs = z.object({
   createSchema: z.preprocess((v) => v === true || v === "true", z.boolean())
     .default(false),
   // No schema defaults: GRANT only adds, so a default re-applied on a re-run
-  // would widen a role provisioned with less. The method applies them on a
-  // fresh provision.
+  // would widen a role provisioned with less. The method applies them only
+  // when the role has not been provisioned in the schema before.
   tablePrivs: z.array(TablePrivilege).optional().describe(
-    "Table privileges to grant. A fresh provision defaults to SELECT, " +
-      "INSERT, UPDATE, DELETE; when omitted on a re-run, table grants are " +
-      "left as they are.",
+    "Table privileges to grant. Defaults to SELECT, INSERT, UPDATE, DELETE " +
+      "until the role holds the schema grant; omitted on a later run, table " +
+      "grants are left as they are.",
   ),
   includeFuture: z.preprocess(
     (v) => v === undefined ? undefined : v === true || v === "true",
     z.boolean().optional(),
   ).describe(
-    "Also grant on future tables and sequences. A fresh provision defaults " +
-      "to true; when omitted on a re-run, default privileges are left as " +
-      "they are.",
+    "Also grant on future tables and sequences. Defaults to true until the " +
+      "role holds the schema grant; omitted on a later run, default " +
+      "privileges are left as they are.",
   ),
   connLimit: z.coerce.number().int().default(-1),
 });
@@ -1160,6 +1207,11 @@ export const model = {
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const a = RoleCreateArgs.parse(rawArgs);
         const g = context.globalArgs;
+        // Reject every identifier before any statement runs: a bad second
+        // parent found after CREATE ROLE would leave a half-granted role that
+        // the next run reports as unchanged.
+        checkIdent(g, a.name, "role");
+        for (const parent of a.memberOf) checkIdent(g, parent, "parent role");
         return await withConn(g, g.maintenanceDb, false, async (q) => {
           const ts = new Date().toISOString();
           if (await roleExists(q, a.name)) {
@@ -1184,14 +1236,18 @@ export const model = {
             parts.push(`VALID UNTIL ${q.escapeLiteral(a.validUntil)}`);
           }
           logInfo(context, "Creating role", { name: a.name, login: a.login }); // never logs password
-          await q.query(parts.join(" "));
-          for (const parent of a.memberOf) {
-            await q.query(
-              `GRANT ${ident(g, q, parent, "parent role")} TO ${
-                ident(g, q, a.name, "role")
-              }`,
-            );
-          }
+          // One transaction: a parent that does not exist must not leave the
+          // role created without its memberships.
+          await inTransaction(q, async () => {
+            await q.query(parts.join(" "));
+            for (const parent of a.memberOf) {
+              await q.query(
+                `GRANT ${ident(g, q, parent, "parent role")} TO ${
+                  ident(g, q, a.name, "role")
+                }`,
+              );
+            }
+          });
           const handle = await context.writeResource("role-result", a.name, {
             role: a.name,
             action: "created",
@@ -1277,6 +1333,13 @@ export const model = {
         const owner = a.owner ?? a.role;
         const ts = new Date().toISOString();
 
+        // Reject every identifier before Phase A creates anything, so a bad
+        // schema name cannot leave a role and database behind with no grants.
+        checkIdent(g, a.database, "database");
+        checkIdent(g, a.role, "role");
+        checkIdent(g, owner, "owner");
+        checkIdent(g, a.schema, "schema");
+
         // Phase A — role + database + CONNECT, on the maintenance DB.
         const phaseA = await withConn(g, g.maintenanceDb, false, async (q) => {
           let roleAction: z.infer<typeof Action> = "unchanged";
@@ -1313,56 +1376,79 @@ export const model = {
           return { roleAction, dbAction };
         });
 
-        // Defaults are safe only when nothing was granted before: the role or
-        // the database is new in this run.
-        const fresh = phaseA.roleAction === "created" ||
-          phaseA.dbAction === "created";
-        const tablePrivs = a.tablePrivs ??
-          (fresh ? ["SELECT", "INSERT", "UPDATE", "DELETE"] : []);
-        const includeFuture = a.includeFuture ?? fresh;
-
         // Phase B — schema + object + default privileges, on the target DB.
-        const privsGranted = await withConn(g, a.database, false, async (q) => {
+        const phaseB = await withConn(g, a.database, false, async (q) => {
+          // The defaults (SELECT/INSERT/UPDATE/DELETE, future objects) apply
+          // only when the role has not been provisioned in this schema before.
+          // "Before" is read from the catalog, not from whether this run
+          // created the role: a first run that failed after Phase A leaves the
+          // role and database in place, and keying on creation would then
+          // grant nothing on every re-run. The schema USAGE grant is the
+          // marker because Phase B is one transaction, so it is present only
+          // after the whole set of grants landed. A role provisioned with less
+          // (say read-only) already holds it, so a re-run with the arguments
+          // omitted leaves its grants alone instead of widening them.
+          const provisioned = await holdsSchemaUsage(q, a.schema, a.role);
+          const tablePrivs = a.tablePrivs ??
+            (provisioned ? [] : ["SELECT", "INSERT", "UPDATE", "DELETE"]);
+          const includeFuture = a.includeFuture ?? !provisioned;
+
           const sc = ident(g, q, a.schema, "schema");
           const ro = ident(g, q, a.role, "role");
-          if (a.createSchema && a.schema !== "public") {
-            await q.query(
-              `CREATE SCHEMA IF NOT EXISTS ${sc} AUTHORIZATION ${
-                ident(g, q, owner, "owner")
-              }`,
-            );
-          }
-          await q.query(`GRANT USAGE, CREATE ON SCHEMA ${sc} TO ${ro}`);
-          const tp = privList(tablePrivs);
-          if (tablePrivs.length > 0) {
-            await q.query(`GRANT ${tp} ON ALL TABLES IN SCHEMA ${sc} TO ${ro}`);
-          }
-          await q.query(
-            `GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA ${sc} TO ${ro}`,
-          );
-          if (includeFuture) {
-            const fr = ident(g, q, owner, "owner");
+          await inTransaction(q, async () => {
+            if (a.createSchema && a.schema !== "public") {
+              await q.query(
+                `CREATE SCHEMA IF NOT EXISTS ${sc} AUTHORIZATION ${
+                  ident(g, q, owner, "owner")
+                }`,
+              );
+            }
+            await q.query(`GRANT USAGE, CREATE ON SCHEMA ${sc} TO ${ro}`);
+            const tp = privList(tablePrivs);
             if (tablePrivs.length > 0) {
               await q.query(
-                `ALTER DEFAULT PRIVILEGES FOR ROLE ${fr} IN SCHEMA ${sc} GRANT ${tp} ON TABLES TO ${ro}`,
+                `GRANT ${tp} ON ALL TABLES IN SCHEMA ${sc} TO ${ro}`,
               );
             }
             await q.query(
-              `ALTER DEFAULT PRIVILEGES FOR ROLE ${fr} IN SCHEMA ${sc} GRANT USAGE, SELECT ON SEQUENCES TO ${ro}`,
+              `GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA ${sc} TO ${ro}`,
             );
-          }
-          return [
-            "CONNECT",
-            "USAGE",
-            "CREATE",
-            ...tablePrivs.map((p) => String(p)),
-          ];
+            if (includeFuture) {
+              // FOR ROLE owner: the owner creates the tables, so its defaults
+              // are the ones that decide what the app role gets on them.
+              const fr = ident(g, q, owner, "owner");
+              if (tablePrivs.length > 0) {
+                await q.query(
+                  `ALTER DEFAULT PRIVILEGES FOR ROLE ${fr} IN SCHEMA ${sc} GRANT ${tp} ON TABLES TO ${ro}`,
+                );
+              }
+              await q.query(
+                `ALTER DEFAULT PRIVILEGES FOR ROLE ${fr} IN SCHEMA ${sc} GRANT USAGE, SELECT ON SEQUENCES TO ${ro}`,
+              );
+            }
+          });
+          return {
+            provisioned,
+            includeFuture,
+            privsGranted: [
+              "CONNECT",
+              "USAGE",
+              "CREATE",
+              ...tablePrivs.map((p) => String(p)),
+            ],
+          };
         });
+        const { includeFuture, privsGranted } = phaseB;
 
+        // "granted" marks the run that applied the first grants to a role and
+        // database that already existed (a re-run after a partial failure, or
+        // a role made by role_create); "unchanged" would hide that it did work.
         const overall: z.infer<typeof Action> =
           phaseA.roleAction === "created" || phaseA.dbAction === "created"
             ? "created"
-            : "unchanged";
+            : phaseB.provisioned
+            ? "unchanged"
+            : "granted";
         const handle = await context.writeResource(
           "app-provision",
           a.database,
@@ -1397,6 +1483,15 @@ async function runGrant(
   const connDb = a.scope === "database" ? g.maintenanceDb : a.database;
   const verb = revoke ? "REVOKE" : "GRANT";
   const dir = revoke ? "FROM" : "TO";
+
+  // Without FOR ROLE, ALTER DEFAULT PRIVILEGES targets the current role, which
+  // here is the admin login. That silently does nothing for the app's own
+  // tables, so refuse rather than guess whose objects the caller meant.
+  if (a.includeFuture && !a.defaultForRole) {
+    throw new Error(
+      "defaultForRole is required when includeFuture is set: name the role that will create the future objects",
+    );
+  }
 
   return await withConn(g, connDb, false, async (q) => {
     const ro = ident(g, q, a.role, "role");
@@ -1436,12 +1531,10 @@ async function runGrant(
           await q.query(`${verb} ${privs} ON ${kw} ${list} ${dir} ${ro}`);
           objects.push(...a.objects.map((o) => `${a.schema}.${o}`));
         }
-        if (a.includeFuture) {
-          const forRole = a.defaultForRole
-            ? `FOR ROLE ${ident(g, q, a.defaultForRole, "defaultForRole")} `
-            : "";
+        if (a.includeFuture && a.defaultForRole) {
+          const fr = ident(g, q, a.defaultForRole, "defaultForRole");
           await q.query(
-            `ALTER DEFAULT PRIVILEGES ${forRole}IN SCHEMA ${sc} ${verb} ${privs} ON ${kwAll} ${dir} ${ro}`,
+            `ALTER DEFAULT PRIVILEGES FOR ROLE ${fr} IN SCHEMA ${sc} ${verb} ${privs} ON ${kwAll} ${dir} ${ro}`,
           );
         }
       }

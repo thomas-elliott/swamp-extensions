@@ -85,10 +85,17 @@ swamp model method run pg app_provision \
 Creates the `myapp` database owned by a new `myapp` login role, grants `CONNECT`,
 schema `USAGE`/`CREATE`, `SELECT/INSERT/UPDATE/DELETE` on existing tables and
 `USAGE/SELECT` on sequences, plus matching **default privileges** for future
-objects. Those table and default privileges are what a fresh provision gets when
-`tablePrivs` / `includeFuture` are not passed. Re-running returns `unchanged`
-and re-issues only the grants it is given, so it never widens a role that was
-provisioned with less.
+objects (`ALTER DEFAULT PRIVILEGES FOR ROLE <owner>`, so they cover the tables the
+owner creates). Those table and default privileges are what the role gets when
+`tablePrivs` / `includeFuture` are not passed and the role does not yet hold the
+schema grant, which is also how a re-run after a failed first attempt completes
+the job (it returns `granted`). Once the role holds the schema grant, re-running
+returns `unchanged` and re-issues only the grants it is given, so it never widens
+a role that was provisioned with less. The grants run in one transaction.
+
+`grant`/`revoke` with `includeFuture` need `defaultForRole`: the role that will
+create the future objects. PostgreSQL applies default privileges per creating
+role, and without `FOR ROLE` it would alter the admin login's own defaults.
 
 ## Safety notes
 
