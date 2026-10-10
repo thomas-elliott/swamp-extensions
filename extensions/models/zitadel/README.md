@@ -104,7 +104,8 @@ swamp model method run zitadel project_authz_set \
 - `role_remove` — verify-first `DELETE` of a role (the one hard delete; cascade-
   revokes grants that reference it).
 - `grant_ensure` — grant a user (id or loginname) a **set** of role keys on a
-  project; re-running converges the set (order-insensitive).
+  project; re-running converges the set (order-insensitive). Omit `roleKeys` to
+  keep an existing grant's roles as they are.
 - `grant_set_state` — deactivate/reactivate a grant (verify-first, reversible).
 - `project_authz_set` — toggle a project's `roleAssertion` / `roleCheck` /
   `hasProjectCheck` on an **existing** project (fetch-merge, never
