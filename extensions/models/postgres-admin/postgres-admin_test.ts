@@ -1,9 +1,9 @@
 /**
- * Unit tests for the load-bearing, security-sensitive logic of
- * `@thomas/postgres-admin` — the bits where a silent bug would be costly:
+ * Unit tests for the security-sensitive logic of `@thomas/postgres-admin`,
+ * where an unnoticed bug would be costly:
  * identifier escaping, password routing (escapeLiteral + no leakage), connection-DB
  * routing, idempotency, connections_list redaction, the read-only backstop, and
- * connection cleanup on the error path. No live DB — the pg connector is faked via
+ * connection cleanup on the error path. No live DB: the pg connector is faked via
  * the __setPgConnect seam.
  */
 import {
@@ -59,7 +59,7 @@ function makeFakeDb(rowsFor?: (sql: string, params?: unknown[]) => Record<string
         queries.push({ db: database, sql, params });
         return Promise.resolve({ rows: rowsFor?.(sql, params) ?? [] });
       },
-      // Deterministic stand-ins for libpq's routines — enough to assert "was escaped".
+      // Deterministic stand-ins for libpq's routines, enough to assert "was escaped".
       escapeIdentifier: (s) => '"' + s.replace(/"/g, '""') + '"',
       escapeLiteral: (s) => "'" + s.replace(/'/g, "''") + "'",
     };
@@ -137,7 +137,7 @@ Deno.test("database_create: rejects an unsafe identifier before any DDL", async 
   }
 });
 
-// ─────────────────────────── role_create (secret hygiene) ───────────────────────────
+// ─────────────────────────── role_create (password handling) ───────────────────────────
 
 Deno.test("role_create: password routed via escapeLiteral, never logged or echoed", async () => {
   const SENTINEL = "S3CRET-SENTINEL";
@@ -149,7 +149,7 @@ Deno.test("role_create: password routed via escapeLiteral, never logged or echoe
 
     // CREATE ROLE carries the password ONLY as an escapeLiteral'd literal.
     assert(hasSql(fake.queries, new RegExp(`CREATE ROLE "appuser" LOGIN CONNECTION LIMIT -1 PASSWORD '${SENTINEL}'`)), `CREATE ROLE shape: ${JSON.stringify(sqls(fake.queries))}`);
-    // membership grant is escaped, and lands in the same transaction as CREATE ROLE
+    // membership grant is escaped, and runs in the same transaction as CREATE ROLE
     assert(hasSql(fake.queries, /GRANT "readers" TO "appuser"/), "member_of GRANT");
     const order = sqls(fake.queries);
     assert(order.indexOf("BEGIN") < order.findIndex((s) => /CREATE ROLE/.test(s)), "BEGIN before CREATE ROLE");
@@ -251,7 +251,7 @@ Deno.test("grant: includeFuture without defaultForRole is refused before any SQL
           allInSchema: true,
           includeFuture: true,
         }, context),
-      /defaultForRole is required/,
+      /defaultForRole is required.*defaultForRole=postgres/,
     );
     assertEquals(fake.queries.length, 0, "no statement issued");
   } finally {
@@ -292,7 +292,7 @@ const everythingExists = (sql: string) =>
     : undefined;
 
 // Role and database exist but the role holds no schema grant: Phase A ran,
-// Phase B never landed. The probe's subselect also reads pg_roles, so answer
+// Phase B did not complete. The probe's subselect also reads pg_roles, so answer
 // it first.
 const existsUnprovisioned = (sql: string) =>
   /aclexplode/.test(sql) ? [] : /FROM pg_roles WHERE rolname/.test(sql) || /FROM pg_database WHERE datname/.test(sql) ? [{ x: 1 }] : undefined;
