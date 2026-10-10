@@ -1401,6 +1401,53 @@ Deno.test("collaborator_ensure keeps an existing level when no permission is pas
   }
 });
 
+// The permission probe reports the effective mode, and everyone can read a
+// public repo, so "read" alone must not pass for an existing collaboration.
+Deno.test("collaborator_ensure adds a non-collaborator who can already read a public repo", async () => {
+  const { caller, calls } = makeFakeApi((c) => {
+    if (c.method === "GET" && c.path.endsWith("/permission")) {
+      return { permission: "read" };
+    }
+    if (c.method === "GET") return undefined; // 404 = not a collaborator
+    return {};
+  });
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("collaborator_ensure").execute(COLLAB_ARGS, context);
+    const put = calls.find((c) => c.method === "PUT");
+    assertEquals(
+      put?.path,
+      "/api/v1/repos/telliott/agent-scratch/collaborators/factory-agents",
+    );
+    assertEquals(put?.body, { permission: "write" });
+    assertEquals(written[0].data.action, "created");
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("collaborator_ensure is unchanged for a collaborator already at read", async () => {
+  const { caller, calls } = makeFakeApi((c) => {
+    if (c.method === "GET" && c.path.endsWith("/permission")) {
+      return { permission: "read" };
+    }
+    return { status: 204, body: {} };
+  });
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("collaborator_ensure").execute(
+      { ...COLLAB_ARGS, permission: "read" },
+      context,
+    );
+    assert(!calls.some((c) => c.method !== "GET"), "no mutation expected");
+    assertEquals(written[0].data.action, "unchanged");
+  } finally {
+    __setCaller(null);
+  }
+});
+
 Deno.test("collaborator_ensure refuses to touch the repo owner", async () => {
   const { caller, calls } = makeFakeApi(() => ({ permission: "owner" }));
   __setCaller(caller);
@@ -1529,6 +1576,98 @@ Deno.test("branch_protection_ensure is unchanged when converged", async () => {
   }
 });
 
+// Forgejo reads enable_push_whitelist only inside its enable_push handling,
+// so a whitelist flag sent on its own is dropped and reads as drift forever.
+Deno.test("branch_protection_ensure sends enable_push alongside a whitelist on update", async () => {
+  const { caller, calls } = makeFakeApi((c) =>
+    c.method === "GET"
+      ? {
+        rule_name: "agents/*",
+        enable_push: true,
+        enable_push_whitelist: false,
+        push_whitelist_usernames: [],
+      }
+      : { rule_name: "agents/*" }
+  );
+  __setCaller(caller);
+  try {
+    const { context } = makeContext();
+    await method("branch_protection_ensure").execute(
+      {
+        owner: "telliott",
+        name: "agent-scratch",
+        rule: "agents/*",
+        enablePushWhitelist: true,
+        pushWhitelistUsernames: ["factory-agents"],
+      },
+      context,
+    );
+    const body = calls.find((c) => c.method === "PATCH")?.body as Record<
+      string,
+      unknown
+    >;
+    assertEquals(body.enable_push, true);
+    assertEquals(body.enable_push_whitelist, true);
+    assertEquals(body.push_whitelist_usernames, ["factory-agents"]);
+    assertEquals(Object.keys(body).length, 3);
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("branch_protection_ensure implies enable_push when creating with a whitelist", async () => {
+  const { caller, calls } = makeFakeApi((c) =>
+    c.method === "GET" ? undefined : { rule_name: "agents/*" }
+  );
+  __setCaller(caller);
+  try {
+    const { context } = makeContext();
+    await method("branch_protection_ensure").execute(
+      {
+        owner: "telliott",
+        name: "agent-scratch",
+        rule: "agents/*",
+        enablePushWhitelist: true,
+        pushWhitelistUsernames: ["factory-agents"],
+      },
+      context,
+    );
+    const post = calls.find((c) => c.method === "POST");
+    assertEquals((post?.body as Record<string, unknown>).enable_push, true);
+    assertEquals(
+      (post?.body as Record<string, unknown>).enable_push_whitelist,
+      true,
+    );
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("branch_protection_ensure refuses a whitelist with enablePush=false", async () => {
+  const { caller, calls } = makeFakeApi(() => undefined);
+  __setCaller(caller);
+  try {
+    const { context } = makeContext();
+    await rejects(
+      () =>
+        method("branch_protection_ensure").execute(
+          {
+            owner: "telliott",
+            name: "agent-scratch",
+            rule: "main",
+            enablePush: false,
+            enablePushWhitelist: true,
+          },
+          context,
+        ),
+      /needs enablePush/,
+    );
+    assert(!calls.some((c) => c.method !== "GET"), "no mutation expected");
+  } finally {
+    __setCaller(null);
+  }
+});
+
 Deno.test("branch_protection_ensure converges a whitelist as an exact set", async () => {
   const { caller, calls } = makeFakeApi((c) =>
     c.method === "GET"
@@ -1595,6 +1734,8 @@ function hookObj(over: Record<string, unknown> = {}): Record<string, unknown> {
     type: "forgejo",
     active: true,
     events: ["push", "pull_request"],
+    branch_filter: "main",
+    authorization_header: "Bearer hook-token",
     created_at: "2026-06-19T00:00:00Z",
     updated_at: "2026-06-19T00:00:00Z",
     // The real API never returns `secret`; include it here precisely so the
@@ -1727,7 +1868,9 @@ Deno.test("webhook_audit rejects name without owner", async () => {
   }
 });
 
-Deno.test("webhook_retarget patches only config.url, preserving the secret", async () => {
+// Forgejo's editHook resets events, branch_filter and authorization_header
+// on any PATCH that leaves them out, so they must travel with the new URL.
+Deno.test("webhook_retarget changes only the URL, carrying events, branch filter and auth header", async () => {
   const { caller, calls } = makeFakeApi((c) => {
     if (c.method === "GET" && c.path.endsWith("/hooks")) return [hookObj()];
     if (c.method === "PATCH") return hookObj({ config: { url: INCLUSTER } });
@@ -1742,7 +1885,12 @@ Deno.test("webhook_retarget patches only config.url, preserving the secret", asy
     );
     const patch = calls.find((c) => c.method === "PATCH");
     assertEquals(patch?.path, "/api/v1/repos/telliott/scrappy/hooks/3");
-    assertEquals(patch?.body, { config: { url: INCLUSTER } });
+    assertEquals(patch?.body, {
+      config: { url: INCLUSTER },
+      events: ["push", "pull_request"],
+      branch_filter: "main",
+      authorization_header: "Bearer hook-token",
+    });
     assert(
       !JSON.stringify(patch?.body).includes("secret"),
       "must not send a secret key — that could clear the stored one",

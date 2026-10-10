@@ -654,12 +654,29 @@ function protectionBody(
     if (current !== null && same(want, cur)) return;
     body[key] = want;
   };
-  diff("enable_push", desired.enablePush, Boolean(current?.enable_push));
+  // Forgejo only reads enable_push_whitelist inside its enable_push handling
+  // (create ANDs the two; edit skips the whitelist when enable_push is absent),
+  // so a whitelist without enable_push is dropped and reported as drift on
+  // every run. A whitelist request implies enable_push; combined with an
+  // explicit enablePush=false it is a contradiction we refuse rather than
+  // let Forgejo resolve silently.
+  if (desired.enablePushWhitelist && desired.enablePush === false) {
+    throw new Error(
+      "enablePushWhitelist needs enablePush: Forgejo turns the whitelist " +
+        "off on a branch nobody may push to.",
+    );
+  }
+  const enablePush = desired.enablePush ??
+    (desired.enablePushWhitelist ? true : undefined);
+  diff("enable_push", enablePush, Boolean(current?.enable_push));
   diff(
     "enable_push_whitelist",
     desired.enablePushWhitelist,
     Boolean(current?.enable_push_whitelist),
   );
+  if (current !== null && "enable_push_whitelist" in body) {
+    body.enable_push = enablePush ?? Boolean(current.enable_push);
+  }
   diff(
     "push_whitelist_usernames",
     desired.pushWhitelistUsernames,
@@ -1584,11 +1601,22 @@ export const model = {
           });
           // `config` is a partial map: Forgejo applies only the keys present,
           // so omitting `secret` leaves the stored one intact. Sending the
-          // whole config back would risk clearing it.
+          // whole config back would risk clearing it. The other three fields
+          // are the opposite: Forgejo's editHook overwrites events (push only
+          // when absent), branch_filter and authorization_header on every
+          // PATCH, so the hook's own values go back with the new URL.
+          const body: Json = { config: { url: `${wantTarget}${query}` } };
+          if (Array.isArray(hook.events)) body.events = hook.events;
+          if (typeof hook.branch_filter === "string") {
+            body.branch_filter = hook.branch_filter;
+          }
+          if (typeof hook.authorization_header === "string") {
+            body.authorization_header = hook.authorization_header;
+          }
           const r = await call(g, {
             method: "PATCH",
             path: `${hooksPath(a.owner, a.name)}/${Number(hook.id)}`,
-            body: { config: { url: `${wantTarget}${query}` } },
+            body,
           });
           updated = r.body;
           action = "updated";
@@ -1750,8 +1778,10 @@ export const model = {
     collaborator_ensure: {
       description:
         "Grant a user access to a repository at a given permission level, or " +
-        "converge an existing grant. Idempotent — reports created/updated/" +
-        "unchanged. Never removes a collaborator.",
+        "converge an existing grant. Converges the collaboration row: a user " +
+        "who is not a collaborator is added even when they can already read " +
+        "the repo (public repos grant everyone read). Idempotent — reports " +
+        "created/updated/unchanged. Never removes a collaborator.",
       arguments: CollaboratorEnsureArgs,
       execute: async (
         rawArgs,
@@ -1760,26 +1790,36 @@ export const model = {
         const a = CollaboratorEnsureArgs.parse(rawArgs);
         const g = context.globalArgs;
         const full = `${a.owner}/${a.name}`;
-        // A non-collaborator answers 404 here; the owner answers "owner",
-        // which no PUT can produce and must never be downgraded.
+        const collabPath = `${repoPath(a.owner, a.name)}/collaborators/${
+          enc(a.user)
+        }`;
+        // The permission probe reports the EFFECTIVE access mode, so a
+        // non-collaborator reads as "read" on a public repo and the owner as
+        // "owner", which no PUT can produce and must never be downgraded.
         const probe = await callTolerant(g, {
           method: "GET",
-          path: `${repoPath(a.owner, a.name)}/collaborators/${
-            enc(a.user)
-          }/permission`,
+          path: `${collabPath}/permission`,
         }, [404]);
-        const current = probe.status === 404
+        const effective = probe.status === 404
           ? "none"
           : String(probe.body.permission ?? "none");
-        if (current === "owner") {
+        if (effective === "owner") {
           throw new Error(
             `${a.user} owns ${full} — a collaborator grant cannot apply to ` +
               "the repo owner.",
           );
         }
-        const want = a.permission ?? (current === "none" ? "write" : current);
+        // Membership is a separate question: 204 for a collaborator, 404 for
+        // anyone else. Only a collaborator has a row to leave alone.
+        const membership = await callTolerant(g, {
+          method: "GET",
+          path: collabPath,
+        }, [404]);
+        const isCollaborator = membership.status < 300;
+        const current = isCollaborator ? effective : "none";
+        const want = a.permission ?? (isCollaborator ? current : "write");
         let action: z.infer<typeof Action>;
-        if (current === want) {
+        if (isCollaborator && current === want) {
           action = "unchanged";
         } else {
           logInfo(context, "Setting collaborator permission", {
@@ -1793,7 +1833,7 @@ export const model = {
             path: `${repoPath(a.owner, a.name)}/collaborators/${enc(a.user)}`,
             body: { permission: want },
           });
-          action = current === "none" ? "created" : "updated";
+          action = isCollaborator ? "updated" : "created";
         }
         const handle = await context.writeResource(
           "collaborator",
