@@ -1,23 +1,23 @@
 # @thomas/postgres-admin
 
 Non-destructive **PostgreSQL administration** for swamp, over a direct TCP
-connection (node-postgres). Built for the common task of standing up a new
-application's database, login role, and permissions — plus auditing what's
-already there — without ever touching table data.
+connection (node-postgres). It creates a new application's database, login
+role, and permissions, and audits existing ones, without reading or writing
+table data.
 
 ## Scope guarantee (read this first)
 
-This extension holds a powerful admin credential, so its surface is deliberately
-narrow and **data-safe**:
+This extension holds an admin credential, so its methods are limited and
+**data-safe**:
 
-- ❌ **Never reads or writes table rows** — no `SELECT`/`INSERT`/`UPDATE`/`DELETE`
-  against user tables. Every query hits `pg_catalog` / `information_schema` only.
+- ❌ **Never reads or writes table rows**: no `SELECT`/`INSERT`/`UPDATE`/`DELETE`
+  against user tables. Every query reads `pg_catalog` / `information_schema` only.
 - ❌ **Never `DROP`s** a database or role, **never `TRUNCATE`s**.
-- ❌ **No arbitrary-SQL method** — all SQL is author-controlled inside the methods.
-- ✅ Read methods additionally run under `default_transaction_read_only = on`.
+- ❌ **No arbitrary-SQL method**: all SQL is author-controlled inside the methods.
+- ✅ Read methods also run under `default_transaction_read_only = on`.
 
-If you need data access or destructive operations, this is intentionally the
-wrong tool.
+This extension does not support data access or destructive operations. Use
+another tool for those.
 
 ## Install
 
@@ -71,7 +71,7 @@ swamp model create @thomas/postgres-admin pg \
 | `grant`             | GRANT on database/schema/table/sequence (+ optional future-object privs).   |
 | `revoke`            | Mirror of `grant`.                                                          |
 | `role_password_set` | Rotate a role's password from a vault value.                                |
-| `app_provision`     | **Headline composite**: db + login role + standard grants in one, idempotent.|
+| `app_provision`     | **Composite**: db + login role + standard grants in one, idempotent.       |
 
 ### Example — provision a new app
 
@@ -88,14 +88,24 @@ schema `USAGE`/`CREATE`, `SELECT/INSERT/UPDATE/DELETE` on existing tables and
 objects (`ALTER DEFAULT PRIVILEGES FOR ROLE <owner>`, so they cover the tables the
 owner creates). Those table and default privileges are what the role gets when
 `tablePrivs` / `includeFuture` are not passed and the role does not yet hold the
-schema grant, which is also how a re-run after a failed first attempt completes
-the job (it returns `granted`). Once the role holds the schema grant, re-running
+schema grant, which is also how a re-run after a failed first attempt finishes
+provisioning (it returns `granted`). Once the role holds the schema grant, re-running
 returns `unchanged` and re-issues only the grants it is given, so it never widens
 a role that was provisioned with less. The grants run in one transaction.
 
 `grant`/`revoke` with `includeFuture` need `defaultForRole`: the role that will
 create the future objects. PostgreSQL applies default privileges per creating
 role, and without `FOR ROLE` it would alter the admin login's own defaults.
+
+## Breaking changes
+
+- **`grant` and `revoke` with `includeFuture` now require `defaultForRole`.**
+  Earlier versions ran `ALTER DEFAULT PRIVILEGES` without `FOR ROLE`, which
+  changes the defaults of the admin login only. That did nothing for tables
+  created by any other role, such as the app's own, and the argument's
+  description wrongly said it defaulted to the schema owner. If your admin login
+  does create the tables, pass `defaultForRole: <adminUser>` to keep the old
+  behaviour.
 
 ## Safety notes
 
@@ -105,8 +115,8 @@ role, and without `FOR ROLE` it would alter the admin login's own defaults.
   `escapeLiteral` (DDL can't parameterise a `PASSWORD` literal), and is never
   logged or written to a result.
 - **Server-log caveat:** if the server runs `log_statement = ddl` or `all`, a
-  `CREATE/ALTER ROLE … PASSWORD '…'` statement (with the literal) lands in the
+  `CREATE/ALTER ROLE … PASSWORD '…'` statement (with the literal) is written to the
   Postgres **server log**. That's a server-side setting outside this extension's
   control; it does not attempt to mutate `log_statement` to hide the password.
-- Pre-flight **`reachable`** check (label `live`) fails fast if the server can't
-  be reached before a mutating method runs.
+- Pre-flight **`reachable`** check (label `live`) fails before a mutating method
+  runs if the server can't be reached.

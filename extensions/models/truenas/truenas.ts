@@ -1,6 +1,6 @@
 import { z } from "npm:zod@4";
-// Type-only imports — erased at compile time, never bundled. They anchor the
-// `satisfies ModelDefinition<typeof GlobalArgs>` clause so each method's
+// Type-only imports: erased at compile time, never bundled. The
+// `satisfies ModelDefinition<typeof GlobalArgs>` clause uses them so each method's
 // `execute` is contextually typed without an explicit `any`.
 import type {
   DataHandle,
@@ -9,26 +9,27 @@ import type {
 } from "jsr:@systeminit/swamp-testing@0.20260521.16";
 
 /**
- * `@thomas/truenas` — administration of a TrueNAS SCALE host via its JSON-RPC 2.0
+ * `@thomas/truenas`: administration of a TrueNAS SCALE host via its JSON-RPC 2.0
  * API over a WebSocket (`wss://<host>/api/current`), authenticated with an API key.
- * Targets 25.04 ("Fangtooth"), where the REST API is gone and the WebSocket RPC is
- * the durable surface.
+ * Targets 25.04 ("Fangtooth"), which has no REST API; the WebSocket RPC is the
+ * supported API.
  *
- * SCOPE: built for the homelab **service-exposure** hardening (R28) — read what is
- * published where, then tighten it. The mutating surface is deliberately narrow:
- *   - app port binding (`app_set_port_bind`) — flip a catalog app's port between
- *     `published` (on the host) and `exposed` (container-internal only); the lever
- *     that closes lldap's plaintext LDAP/LDAPS ports.
- *   - NFS share access (`nfs_share_set_access`) — set the per-share authorized
- *     `networks`/`hosts` allowlist (the one supported per-client gate).
- *   - SMB share access (`smb_share_set_access`) — set per-share `hostsallow`/`hostsdeny`.
- *   - SMB/NFS share delete (`smb_share_delete`, `nfs_share_delete`) — remove a share
+ * SCOPE: built for the homelab **service-exposure** hardening (R28): read what is
+ * published where, then restrict it. The set of mutating methods is deliberately small:
+ *   - app port binding (`app_set_port_bind`): switch a catalog app's port between
+ *     `published` (on the host) and `exposed` (container-internal only); this is how
+ *     lldap's plaintext LDAP/LDAPS ports are closed.
+ *   - NFS share access (`nfs_share_set_access`): set the per-share authorized
+ *     `networks`/`hosts` allowlist (the only supported per-client access control).
+ *   - SMB share access (`smb_share_set_access`): set per-share `hostsallow`/`hostsdeny`.
+ *   - SMB/NFS share delete (`smb_share_delete`, `nfs_share_delete`): remove a share
  *     definition (the dataset/data is left untouched); the removed config is recorded
  *     so it can be re-created.
- * It does NOT touch pools, datasets, users, snapshots, replication, or service
- * start/stop (`filesystem_list` reads a directory and `replication_list` reads task
- * definitions — neither writes, and no verb runs or edits a replication task) (a stopped ssh/nfs service is a lockout/outage risk — left an explicit
- * gap). Every mutating verb verifies its target by id/name first (CLAUDE.md rule 5);
+ * It does NOT change pools, datasets, users, snapshots, replication, or service
+ * start/stop. `filesystem_list` reads a directory and `replication_list` reads task
+ * definitions; neither writes, and no verb runs or edits a replication task. Service
+ * start/stop is an explicit gap because a stopped ssh/nfs service risks a lockout or
+ * outage. Every mutating verb verifies its target by id/name first (CLAUDE.md rule 5);
  * the set-access verbs are reversible (re-run with the prior values) and the delete
  * verbs record the removed config so the share can be re-created.
  *
@@ -41,13 +42,10 @@ import type {
  *
  * TRANSPORT SAFETY: TrueNAS **permanently revokes an API key the instant it is sent
  * over a non-TLS transport** (plain `ws://`/`http://`). This model therefore refuses
- * any non-`wss` endpoint *by construction* — {@link websocketUrl} throws before a
- * socket is opened, and never downgrades `https→ws`. The NAS ships a self-signed
- * cert (`CN=localhost`); `insecureSkipTlsVerify` is a best-effort request to skip cert
- * *validation*, but in swamp's managed Deno runtime it is effectively inert in-process
- * (skip-verify is only honoured process-wide via --unsafely-ignore-certificate-errors)
- * — so the supported path is a trusted cert on the host. Either way the transport stays
- * TLS-encrypted, which is what keeps the key alive.
+ * any non-`wss` endpoint: {@link websocketUrl} throws before a socket is opened, and
+ * never downgrades `https→ws`. The certificate is always validated: Deno skips
+ * validation only process-wide (--unsafely-ignore-certificate-errors), never per
+ * connection, so a NAS on its self-signed `CN=localhost` cert needs a trusted one.
  *
  * Secrets: `apiKey` is supplied via a vault expression, e.g.
  * `${{ vault.get(<vault>, truenas/credential) }}`. It is marked sensitive and
@@ -69,21 +67,13 @@ const GlobalArgs = z.object({
     "TrueNAS API key (Credentials → Users → API keys). Supply via vault: " +
       "${{ vault.get(<vault>, truenas/credential) }}",
   ),
-  insecureSkipTlsVerify: z.coerce.boolean().default(false).describe(
-    "Best-effort request to skip TLS certificate VALIDATION (the NAS uses a " +
-      "self-signed CN=localhost cert). In swamp's managed Deno runtime this flag is " +
-      "effectively inert in-process: skip-verify is only honoured process-wide, when " +
-      "the runtime is started with --unsafely-ignore-certificate-errors. The supported " +
-      "path is a trusted cert on the host; the transport always stays TLS-encrypted, " +
-      "which is what keeps the API key alive.",
-  ),
   timeoutMs: z.coerce.number().int().default(30000).describe(
     "Per-call timeout in milliseconds (also the job-wait budget)",
   ),
 });
 
 // Resolved global-argument shape. Kept internal: `z.infer` is a "slow type", so it
-// must not leak onto the public API — the exported {@link RpcFn}/{@link SessionFactory}
+// must not appear on the public API. The exported {@link RpcFn}/{@link SessionFactory}
 // seams use the loose {@link Json} instead (mirrors `@thomas/garage`).
 type GlobalArgsT = z.infer<typeof GlobalArgs>;
 
@@ -401,7 +391,7 @@ const HOST_LOCKING_PURPOSES = new Set([
 
 // ─────────────────────────── transport seam ───────────────────────────
 
-/** A JSON-ish bag — structurally the resolved global args. */
+/** A loosely typed JSON object; structurally the resolved global args. */
 export type Json = Record<string, unknown>;
 
 /**
@@ -420,7 +410,7 @@ export interface RpcSession {
 /**
  * Opens an authenticated {@link RpcSession} from the resolved global args. Typed
  * loosely as {@link Json} so this EXPORTED seam stays "fast-check" clean (a
- * zod-inferred arg type would drag a slow type onto the public API).
+ * zod-inferred arg type would put a slow type on the public API).
  */
 export type SessionFactory = (g: Json) => Promise<RpcSession>;
 
@@ -434,7 +424,7 @@ export function __setTruenasSession(fn: SessionFactory | null): void {
 /**
  * Build the `wss://<host>/api/current` URL from an operator endpoint. Accepts a bare
  * host, `wss://…`, or `https://…` (upgraded to `wss`). **Throws** on `ws://`/`http://`
- * or any other scheme — sending the API key over a non-TLS transport gets it revoked.
+ * or any other scheme, because TrueNAS revokes an API key sent over a non-TLS transport.
  */
 export function websocketUrl(endpoint: string): string {
   let raw = String(endpoint).trim();
@@ -503,7 +493,7 @@ class JsonRpcSocket {
     try {
       msg = JSON.parse(typeof ev.data === "string" ? ev.data : "");
     } catch {
-      return; // tolerate non-JSON job-progress noise
+      return; // ignore non-JSON job-progress messages
     }
     const id = msg.id;
     if (typeof id !== "number") return; // notifications/progress
@@ -639,9 +629,9 @@ function strArr(v: unknown): string[] {
 const JOB_DONE = new Set(["SUCCESS", "FAILED", "ABORTED"]);
 
 /**
- * Submit a job-returning RPC (`app.update` & friends) and wait for it to finish by
+ * Submit a job-returning RPC (such as `app.update`) and wait for it to finish by
  * polling `core.get_jobs`. Returns the job's `result`; throws (with the job error) on
- * a FAILED/ABORTED terminal state or if the wait budget is exhausted.
+ * a FAILED/ABORTED terminal state or if the wait times out.
  */
 async function callJob(
   session: RpcSession,
@@ -787,8 +777,8 @@ function shapeDirEntry(raw: unknown): z.infer<typeof DirEntry> {
 /**
  * Collect every host-path bind in an app's config. Catalog apps place these
  * differently (`storage.data`, `storage.additional_storage[]`, per-app keys…), so
- * this walks the config for the shape TrueNAS always uses — an object carrying a
- * `host_path_config.path` (or `type: "host_path"` + `path`) — rather than assuming
+ * this walks the config for the shape TrueNAS always uses (an object with a
+ * `host_path_config.path`, or `type: "host_path"` + `path`) rather than assuming
  * one layout. `configPath` records where each was found.
  */
 function collectHostPaths(
@@ -898,8 +888,8 @@ const AppSetPortBindArgs = z.object({
 
 const FilesystemListArgs = z.object({
   // `--input path='["/a","/b"]'` arrives as a STRING (the CLI only decodes JSON for
-  // a declared array type, and this field also accepts a bare path) — so decode a
-  // leading-`[` string here, or the whole JSON blob gets listed as one path name.
+  // a declared array type, and this field also accepts a bare path). Decode a
+  // leading-`[` string here, or the whole JSON string is listed as one path name.
   path: z.preprocess((v) => {
     if (typeof v === "string" && v.trimStart().startsWith("[")) {
       try {
@@ -1071,8 +1061,8 @@ async function resolveSmb(
 
 /**
  * Like {@link resolveNfs} but returns `null` when no share matches (idempotent
- * delete path) — still throws on an AMBIGUOUS selector, since deleting one of
- * several matches blindly is unsafe.
+ * delete path). Still throws on an AMBIGUOUS selector, because it cannot tell which
+ * of several matches to delete.
  */
 async function resolveNfsOrNull(
   session: RpcSession,
@@ -1095,7 +1085,7 @@ async function resolveNfsOrNull(
 
 /**
  * Like {@link resolveSmb} but returns `null` when no share matches (idempotent
- * delete path) — still throws on an AMBIGUOUS selector.
+ * delete path). Still throws on an AMBIGUOUS selector.
  */
 async function resolveSmbOrNull(
   session: RpcSession,
@@ -1120,7 +1110,7 @@ async function resolveSmbOrNull(
 
 /**
  * The `@thomas/truenas` model definition: read/audit methods over apps, NFS/SMB
- * shares, services, and network exposure, plus a narrow reversible mutating surface
+ * shares, services, and network exposure, plus a few reversible mutating methods
  * (app port bind mode, NFS/SMB share access). See the module header for scope and the
  * transport-safety guarantee.
  */
@@ -1500,7 +1490,7 @@ export const model = {
             try {
               rows = asArr(await session.call("filesystem.listdir", [path]));
             } catch (e) {
-              // ENOENT / ENOTDIR is the interesting answer here, not a failure.
+              // ENOENT / ENOTDIR is a valid result here, not a failure.
               const message = (e as Error).message;
               if (
                 !/ENOENT|ENOTDIR|does not exist|not a directory/i.test(message)
@@ -1521,7 +1511,7 @@ export const model = {
               );
               continue;
             }
-            // Sort BEFORE truncating, so which entries survive maxEntries is
+            // Sort BEFORE truncating, so the entries kept under maxEntries are
             // deterministic rather than dependent on listdir order.
             const all = rows.map(shapeDirEntry)
               .sort((x, y) => x.name.localeCompare(y.name));
@@ -1746,7 +1736,7 @@ export const model = {
 
           // Some apps store ports as a LIST (config.ports: [{port_number,bind_mode,
           // host_ips,…}]) instead of the keyed config.network map (e.g. kopia, custom
-          // apps). Handle that form in a dedicated branch — list entries have no key,
+          // apps). That form is handled in its own branch; list entries have no key,
           // so they're selected by portNumber.
           const portsList = asArr(cfg.ports).map((p) => asObj(p));
           const inNetworkMap = a.portKey
@@ -1877,8 +1867,8 @@ export const model = {
 
           // Reconstruct the FULL port object so no field (port_number,
           // certificate_id, …) is dropped, then send the ENTIRE network map with only
-          // this port changed. Sending the whole `network` sidesteps any ambiguity in
-          // how app.update merges nested values — sibling ports (http_port, ldaps_port)
+          // this port changed. Sending the whole `network` avoids depending on how
+          // app.update merges nested values, so sibling ports (http_port, ldaps_port)
           // can't be lost regardless of merge depth.
           const portObj: Record<string, unknown> = { ...current };
           portObj.bind_mode = newBindMode;
@@ -2127,7 +2117,7 @@ export const model = {
         try {
           const share = await resolveNfsOrNull(session, a);
           if (share === null) {
-            // Already gone — idempotent success. The confirmPath guard only
+            // Already gone: idempotent success. The confirmPath guard only
             // protects against deleting the WRONG existing share, so it doesn't
             // apply when there's nothing to delete.
             const ats = new Date().toISOString();
@@ -2211,9 +2201,9 @@ export const model = {
           const newDeny = a.hostsdeny ?? prevDeny;
           const ts = new Date().toISOString();
 
-          // A preset that locks hostsallow/hostsdeny silently discards them on update;
-          // release to NO_PRESET (only when we're actually applying host rules) so the
-          // allowlist sticks. Clearing rules needs no purpose change.
+          // A preset that locks hostsallow/hostsdeny discards them on update without an
+          // error. Switch to NO_PRESET (only when host rules are being applied) so the
+          // allowlist is kept. Clearing rules needs no purpose change.
           const wantHostRules = newAllow.length > 0 || newDeny.length > 0;
           const releaseLock = wantHostRules &&
             HOST_LOCKING_PURPOSES.has(prevPurpose);
@@ -2300,7 +2290,7 @@ export const model = {
         try {
           const share = await resolveSmbOrNull(session, a);
           if (share === null) {
-            // Already gone — idempotent success. The confirmName guard only
+            // Already gone: idempotent success. The confirmName guard only
             // protects against deleting the WRONG existing share, so it doesn't
             // apply when there's nothing to delete.
             const ats = new Date().toISOString();

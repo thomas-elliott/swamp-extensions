@@ -1,10 +1,10 @@
 /**
- * Unit tests for the load-bearing logic of `@thomas/truenas` — the bits where a
- * silent bug would be costly: the wss-only transport guard (the API-key-revoke
- * footgun), port-binding shaping, verify-first resolution, the app.update full-network
- * patch + job-wait, share-access update bodies, the exposure roll-up flags, and the
- * no-op fast paths. No live host — the JSON-RPC transport is faked via the
- * __setTruenasSession seam.
+ * Unit tests for the important logic of `@thomas/truenas`, where an unnoticed bug
+ * would be costly: the wss-only transport guard (TrueNAS revokes an API key sent
+ * without TLS), port-binding shaping, verify-first resolution, the app.update
+ * full-network patch + job-wait, share-access update bodies, the exposure roll-up
+ * flags, and the no-op fast paths. No live host: the JSON-RPC transport is faked via
+ * the __setTruenasSession seam.
  */
 import {
   __setTruenasSession,
@@ -45,7 +45,6 @@ async function rejects(fn: () => Promise<unknown>, re: RegExp): Promise<void> {
 const GLOBALS = {
   endpoint: "wss://nas.test/api/current",
   apiKey: "test-key",
-  insecureSkipTlsVerify: true,
   timeoutMs: 5000,
 };
 
@@ -908,7 +907,7 @@ Deno.test("nfs_share_delete: refuses when confirmPath mismatches", async () => {
 Deno.test("nfs_share_delete: already-absent share succeeds with action=absent (idempotent)", async () => {
   let deleteCalled = false;
   const fake = makeFakeSession((m) => {
-    if (m === "sharing.nfs.query") return []; // nothing matches — already gone
+    if (m === "sharing.nfs.query") return []; // nothing matches: already gone
     if (m === "sharing.nfs.delete") {
       deleteCalled = true;
       return true;
@@ -1009,7 +1008,7 @@ Deno.test("smb_share_delete: refuses when confirmName mismatches", async () => {
 Deno.test("smb_share_delete: already-absent share succeeds with action=absent (idempotent)", async () => {
   let deleteCalled = false;
   const fake = makeFakeSession((m) => {
-    if (m === "sharing.smb.query") return []; // nothing matches — already gone
+    if (m === "sharing.smb.query") return []; // nothing matches: already gone
     if (m === "sharing.smb.delete") {
       deleteCalled = true;
       return true;
@@ -1093,7 +1092,7 @@ Deno.test("smb_share_set_access: sends only the access fields (update is a PATCH
 });
 
 Deno.test("smb_share_set_access: releases a host-locking preset to NO_PRESET", async () => {
-  // DEFAULT_SHARE re-applies empty hostsallow on every update, silently dropping the
+  // DEFAULT_SHARE re-applies empty hostsallow on every update, dropping the
   // allowlist; the method must move the share to NO_PRESET in the same update.
   const before = {
     id: 1,
@@ -1220,7 +1219,6 @@ Deno.test("reachable check applies the schema defaults to globalArgs", async () 
     });
     assertEquals(r.pass, true);
     assertEquals(seen?.timeoutMs, 30000);
-    assertEquals(seen?.insecureSkipTlsVerify, false);
     assert(fake.isClosed(), "the probe session must be closed");
   } finally {
     __setTruenasSession(null);

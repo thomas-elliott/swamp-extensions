@@ -1,5 +1,5 @@
 import { z } from "npm:zod@4";
-// Type-only imports — erased at compile time, never bundled. They anchor the
+// Type-only imports, erased at compile time and never bundled. They type the
 // `satisfies ModelDefinition<typeof GlobalArgs>` clause so each method's
 // `execute` is contextually typed without an explicit `any`.
 import type {
@@ -13,16 +13,16 @@ import type {
 import pg from "npm:pg@8.21.0";
 
 /**
- * `@thomas/postgres-admin` — non-destructive PostgreSQL administration over a
+ * `@thomas/postgres-admin`: non-destructive PostgreSQL administration over a
  * direct TCP connection (node-postgres).
  *
- * SCOPE GUARANTEE (the whole point of this extension): it holds a powerful admin
- * credential, so its surface is deliberately narrow and DATA-SAFE. It NEVER reads
+ * SCOPE GUARANTEE: the extension holds an admin credential, so its methods are
+ * limited and DATA-SAFE. It NEVER reads
  * or writes table rows (no SELECT/INSERT/UPDATE/DELETE against user tables), NEVER
  * DROPs a database or role, NEVER TRUNCATEs, and exposes NO arbitrary-SQL method.
  * Every method issues author-controlled DDL or catalog reads (pg_catalog /
  * information_schema) only. Read methods additionally run under
- * `default_transaction_read_only = on` as a hard backstop.
+ * `default_transaction_read_only = on`, so the server rejects any write.
  *
  * Method sections (by prefix):
  *   - read/audit: `database_list`, `role_list`, `permissions_audit`,
@@ -31,7 +31,7 @@ import pg from "npm:pg@8.21.0";
  *     `role_password_set`, and the composite `app_provision`.
  *
  * Connection: one short-lived `pg.Client` per method run (connect → work →
- * `end()` in a `finally`); no pool — swamp already serialises per-model.
+ * `end()` in a `finally`); no pool, because swamp already serialises runs per model.
  *
  * Identifier safety: identifiers (db/role/schema/table names) are validated
  * against `identifierPattern` AND escaped via `client.escapeIdentifier`; the role
@@ -39,8 +39,8 @@ import pg from "npm:pg@8.21.0";
  * identifier or a PASSWORD literal). Filter VALUES in catalog reads use bound `$1`
  * params. Passwords are marked sensitive, never logged, never echoed in output.
  * CAVEAT: if the server runs `log_statement = ddl|all`, a `CREATE/ALTER ROLE …
- * PASSWORD '…'` lands in the SERVER log — that's a server-side setting outside
- * this extension's control; it does not try to mutate it to hide the password.
+ * PASSWORD '…'` is written to the SERVER log. That setting is outside this
+ * extension's control, and the extension does not change it to hide the password.
  *
  * Secrets: `adminPassword` (and per-call role passwords) are supplied via vault
  * expressions, e.g. `${{ vault.get(<vault>, postgres/admin_password) }}`.
@@ -87,9 +87,9 @@ const GlobalArgs = z.object({
     ),
 });
 
-// Resolved global-argument shape (connection target + safety knobs). Kept
-// internal: `z.infer` is a "slow type", so it must not leak onto the public API
-// (the exported `ConnectFn` seam uses the loose `Json` instead — see below).
+// Resolved global-argument shape (connection target + safety settings). Kept
+// internal: `z.infer` is a "slow type", so it must not appear on the public API
+// (the exported `ConnectFn` seam uses the loose `Json` instead; see below).
 type GlobalArgsT = z.infer<typeof GlobalArgs>;
 
 const Action = z.enum([
@@ -103,7 +103,7 @@ const Action = z.enum([
 ]);
 
 /** Grantable privileges this extension will emit. Bounds the `privileges` arg
- * (Zod rejects anything outside it) — TRUNCATE / ALL are intentionally excluded. */
+ * (Zod rejects anything outside it). TRUNCATE and ALL are excluded on purpose. */
 const Privilege = z.enum([
   "CONNECT",
   "CREATE",
@@ -273,7 +273,7 @@ const AppProvisionResult = z.object({
 
 // ─────────────────────────── connection seam ───────────────────────────
 
-/** Minimal querier surface the methods use — swappable for unit tests. */
+/** The query functions the methods use; unit tests substitute a fake. */
 export interface Querier {
   /** Run a parameterised SQL statement; filter VALUES go in `params` as bound `$n`. */
   query(
@@ -292,12 +292,12 @@ export interface Conn {
   /** Close the underlying socket; always called in a `finally`. */
   end(): Promise<void>;
 }
-/** A JSON-ish bag — structurally the resolved global args. */
+/** A JSON object; in practice, the resolved global args. */
 export type Json = Record<string, unknown>;
 /**
  * Open a connection to `database` on the configured server. The global args are
  * typed loosely as {@link Json} so this EXPORTED seam type stays "fast-check"
- * clean — referencing the zod-inferred `GlobalArgsT` would drag a slow type onto
+ * clean. Referencing the zod-inferred `GlobalArgsT` would put a slow type on
  * the public API. The real implementation re-narrows to the validated shape.
  */
 export type ConnectFn = (g: Json, database: string) => Promise<Conn>;
@@ -348,8 +348,8 @@ function connect(g: GlobalArgsT, database: string): Promise<Conn> {
 /**
  * Connect to `database`, apply session guardrails, run `fn`, and ALWAYS close the
  * socket (error path included). Read methods pass `readOnly: true` which sets
- * `default_transaction_read_only = on` — a hard backstop against any accidental
- * mutation. Mutating methods pass `readOnly: false`.
+ * `default_transaction_read_only = on`, so the server rejects any accidental
+ * write. Mutating methods pass `readOnly: false`.
  */
 async function withConn<T>(
   g: GlobalArgsT,
@@ -404,8 +404,8 @@ function ident(
   return q.escapeIdentifier(name);
 }
 
-/** Run `fn` inside one transaction so a multi-statement change lands whole or
- * not at all. A half-applied change is worse than a failed one here: the next
+/** Run `fn` inside one transaction so a multi-statement change is applied in
+ * full or not at all. A half-applied change is worse than a failed one here: the next
  * run sees the role (or the schema grant) already present and skips the rest. */
 async function inTransaction<T>(
   q: Querier,
@@ -1185,7 +1185,7 @@ export const model = {
           if (a.encoding) parts.push(`ENCODING ${q.escapeLiteral(a.encoding)}`);
           if (a.locale) parts.push(`LOCALE ${q.escapeLiteral(a.locale)}`);
           logInfo(context, "Creating database", { name: a.name });
-          await q.query(parts.join(" ")); // bare statement — CREATE DATABASE cannot run in a txn
+          await q.query(parts.join(" ")); // outside a transaction: CREATE DATABASE cannot run in one
           const row = await readDatabase(q, a.name);
           const handle = await context.writeResource(
             "database",
@@ -1340,7 +1340,7 @@ export const model = {
         checkIdent(g, owner, "owner");
         checkIdent(g, a.schema, "schema");
 
-        // Phase A — role + database + CONNECT, on the maintenance DB.
+        // Phase A: role + database + CONNECT, on the maintenance DB.
         const phaseA = await withConn(g, g.maintenanceDb, false, async (q) => {
           let roleAction: z.infer<typeof Action> = "unchanged";
           if (!(await roleExists(q, a.role))) {
@@ -1376,7 +1376,7 @@ export const model = {
           return { roleAction, dbAction };
         });
 
-        // Phase B — schema + object + default privileges, on the target DB.
+        // Phase B: schema + object + default privileges, on the target DB.
         const phaseB = await withConn(g, a.database, false, async (q) => {
           // The defaults (SELECT/INSERT/UPDATE/DELETE, future objects) apply
           // only when the role has not been provisioned in this schema before.
@@ -1385,7 +1385,7 @@ export const model = {
           // role and database in place, and keying on creation would then
           // grant nothing on every re-run. The schema USAGE grant is the
           // marker because Phase B is one transaction, so it is present only
-          // after the whole set of grants landed. A role provisioned with less
+          // after the whole set of grants was applied. A role provisioned with less
           // (say read-only) already holds it, so a re-run with the arguments
           // omitted leaves its grants alone instead of widening them.
           const provisioned = await holdsSchemaUsage(q, a.schema, a.role);
@@ -1489,7 +1489,10 @@ async function runGrant(
   // tables, so refuse rather than guess whose objects the caller meant.
   if (a.includeFuture && !a.defaultForRole) {
     throw new Error(
-      "defaultForRole is required when includeFuture is set: name the role that will create the future objects",
+      "defaultForRole is required when includeFuture is set: name the role " +
+        "that will create the future objects. Earlier versions used the admin " +
+        `login without saying so; pass defaultForRole=${g.adminUser} to keep ` +
+        "that behaviour.",
     );
   }
 
