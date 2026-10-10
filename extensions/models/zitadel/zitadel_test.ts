@@ -352,13 +352,31 @@ Deno.test("oidc_app_ensure: existing app updates config, no secret echoed", asyn
 Deno.test("oidc_app_redirect_set: read-modify-write adds/removes, preserves other config", async () => {
   let putBody: Record<string, unknown> | null = null;
   let gets = 0;
+  // Every field UpdateOIDCAppConfigRequest accepts, with non-default values,
+  // so a dropped field fails the assertion instead of matching by accident.
+  const preserved = {
+    responseTypes: ["OIDC_RESPONSE_TYPE_CODE"],
+    grantTypes: ["OIDC_GRANT_TYPE_AUTHORIZATION_CODE"],
+    appType: "OIDC_APP_TYPE_USER_AGENT",
+    authMethodType: "OIDC_AUTH_METHOD_TYPE_NONE",
+    postLogoutRedirectUris: ["https://a/out"],
+    devMode: true,
+    accessTokenType: "OIDC_TOKEN_TYPE_JWT",
+    accessTokenRoleAssertion: true,
+    idTokenRoleAssertion: true,
+    idTokenUserinfoAssertion: true,
+    clockSkew: "5s",
+    additionalOrigins: ["https://origin"],
+    skipNativeAppSuccessPage: true,
+    backChannelLogoutUri: "https://a/logout",
+    loginVersion: { loginV2: { baseUri: "https://login" } },
+    ios: { bundleIds: ["io.a"] },
+    android: { packageNames: ["io.a"] },
+  };
   const oidcConfig = {
     clientId: "cid",
     redirectUris: ["https://a/cb", "https://b/cb"],
-    responseTypes: ["OIDC_RESPONSE_TYPE_CODE"],
-    authMethodType: "OIDC_AUTH_METHOD_TYPE_NONE",
-    appType: "OIDC_APP_TYPE_WEB",
-    devMode: false,
+    ...preserved,
   };
   const { caller } = makeFakeApi((c) => {
     if (c.method === "GET" && c.path.includes("/apps/")) {
@@ -383,14 +401,11 @@ Deno.test("oidc_app_redirect_set: read-modify-write adds/removes, preserves othe
       remove: ["https://a/cb"],
     }, context);
     const body = putBody as unknown as Record<string, unknown>;
-    assertEquals(body.redirectUris, ["https://b/cb", "https://c/cb"]);
     assertEquals(
-      body.authMethodType,
-      "OIDC_AUTH_METHOD_TYPE_NONE",
-      "must preserve PKCE/auth method",
+      body,
+      { redirectUris: ["https://b/cb", "https://c/cb"], ...preserved },
+      "every writable field must survive, read-only clientId must not be sent",
     );
-    assertEquals(body.responseTypes, ["OIDC_RESPONSE_TYPE_CODE"]);
-    assertEquals(body.clientId, undefined, "must NOT echo read-only clientId");
     const r = written[0].data;
     assertEquals(r.action, "updated");
     assertEquals(r.previousRedirectUris, ["https://a/cb", "https://b/cb"]);
@@ -1031,6 +1046,35 @@ Deno.test("grant_ensure: converges the role set via PUT when it differs", async 
     );
     assertEquals(putBody?.roleKeys, ["a", "b"]);
     assertEquals(written[0].data.action, "updated");
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("grant_ensure: re-run without roleKeys keeps the existing roles", async () => {
+  const { caller, calls } = makeFakeApi((c) => {
+    if (c.path.endsWith("/projects/_search")) {
+      return { result: [{ id: "p1", name: "homelab" }] };
+    }
+    if (c.path.endsWith("/users/grants/_search")) {
+      return {
+        result: [{ id: "g1", userId: "500", projectId: "p1", roleKeys: ["a"] }],
+      };
+    }
+  });
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("grant_ensure").execute(
+      { user: "500", project: "homelab" },
+      context,
+    );
+    assertEquals(written[0].data.action, "unchanged");
+    assertEquals(written[0].data.roleKeys, ["a"]);
+    assert(
+      !calls.some((c) => c.method === "PUT"),
+      "an omitted roleKeys must not strip the grant's roles",
+    );
   } finally {
     __setCaller(null);
   }

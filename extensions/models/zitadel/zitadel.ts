@@ -1097,8 +1097,10 @@ const GrantListArgs = z.object({
 const GrantEnsureArgs = z.object({
   user: z.string().describe("User id or loginname to grant roles to"),
   project: z.string().describe("Project name or project id"),
-  roleKeys: jsonArray(z.string()).default([]).describe(
-    "The exact set of role keys the user should hold on this project (converged)",
+  // No default: an empty default would read as "strip every role" on a re-run.
+  roleKeys: jsonArray(z.string()).optional().describe(
+    "The exact set of role keys the user should hold on this project (converged). " +
+      "Omit to keep an existing grant's roles as they are; a new grant gets none.",
   ),
 });
 
@@ -1410,28 +1412,14 @@ export const model = {
           return { dataHandles: [handle] };
         }
 
-        // Carry over EVERY writable oidc_config field verbatim (raw API enum values
-        // round-trip on PUT); only redirectUris changes. Read-only fields (clientId,
-        // complianceProblems, …) are intentionally omitted.
-        const WRITABLE = [
-          "responseTypes",
-          "grantTypes",
-          "appType",
-          "authMethodType",
-          "postLogoutRedirectUris",
-          "devMode",
-          "accessTokenType",
-          "idTokenRoleAssertion",
-          "idTokenUserinfoAssertion",
-          "clockSkew",
-          "additionalOrigins",
-          "skipNativeAppSuccessPage",
-          "backChannelLogoutUri",
-        ];
-        const body: Json = { redirectUris: next };
-        for (const k of WRITABLE) {
+        // The update replaces every field, so the body starts from the current
+        // config (raw API enum values round-trip on PUT) and only redirectUris
+        // changes. Read-only fields (clientId, complianceProblems) are not sent.
+        const body: Json = {};
+        for (const k of OIDC_UPDATE_FIELDS) {
           if (oidc[k] !== undefined) body[k] = oidc[k];
         }
+        body.redirectUris = next;
 
         logInfo(context, "Setting OIDC redirect URIs", {
           appId: a.appId,
@@ -2330,14 +2318,20 @@ export const model = {
         const ts = nowIso();
         let grantId: string;
         let action: z.infer<typeof Action>;
+        let roleKeys: string[];
         if (existing && typeof existing.id === "string") {
           grantId = existing.id;
           const cur = Array.isArray(existing.roleKeys)
-            ? [...existing.roleKeys as string[]].sort()
+            ? existing.roleKeys as string[]
             : [];
-          const want = [...a.roleKeys].sort();
+          // The update replaces the whole set, so an omitted roleKeys keeps
+          // the current one rather than clearing it.
+          roleKeys = a.roleKeys ?? cur;
+          const curSorted = [...cur].sort();
+          const want = [...roleKeys].sort();
           if (
-            cur.length === want.length && cur.every((r, i) => r === want[i])
+            curSorted.length === want.length &&
+            curSorted.every((r, i) => r === want[i])
           ) {
             action = "unchanged";
           } else {
@@ -2348,16 +2342,17 @@ export const model = {
                   encodeURIComponent(grantId)
                 }`,
               ),
-              body: { roleKeys: a.roleKeys },
+              body: { roleKeys },
             });
             action = "updated";
             logInfo(context, "Updated grant", { userId, projectId, grantId });
           }
         } else {
+          roleKeys = a.roleKeys ?? [];
           const r = await call(g, {
             method: "POST",
             path: mgmt(`/users/${encodeURIComponent(userId)}/grants`),
-            body: { projectId, roleKeys: a.roleKeys },
+            body: { projectId, roleKeys },
           });
           grantId = String(r.body.userGrantId ?? r.body.id ?? "");
           action = "created";
@@ -2367,7 +2362,7 @@ export const model = {
           grantId,
           userId,
           projectId,
-          roleKeys: a.roleKeys,
+          roleKeys,
           state: "active",
           action,
           timestamp: ts,
