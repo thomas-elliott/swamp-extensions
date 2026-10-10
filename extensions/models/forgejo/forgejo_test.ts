@@ -473,6 +473,89 @@ Deno.test("mirror_ensure tolerates equivalent source URLs (.git / case)", async 
   }
 });
 
+Deno.test("mirror_ensure creates private with an 8h interval when neither is passed", async () => {
+  const { caller, calls } = makeFakeApi((c) => {
+    if (c.method === "GET") return undefined;
+    return mirrorObj();
+  });
+  __setCaller(caller);
+  try {
+    const { context } = makeContext();
+    await method("mirror_ensure").execute(
+      {
+        owner: "mirrors",
+        name: "scrappy",
+        cloneAddr: "https://github.com/thomas-elliott/scrappy.git",
+      },
+      context,
+    );
+    const body = calls.find((c) => c.method === "POST")?.body as Record<
+      string,
+      unknown
+    >;
+    assertEquals(body.private, true);
+    assertEquals(body.mirror_interval, "8h0m0s");
+  } finally {
+    __setCaller(null);
+  }
+});
+
+// Issue #4: re-running for an unrelated reason must not reset visibility or
+// interval that the caller did not pass.
+Deno.test("mirror_ensure leaves visibility and interval alone when not passed", async () => {
+  const { caller, calls } = makeFakeApi((c) => {
+    if (c.method === "PATCH") {
+      return mirrorObj({
+        private: false,
+        mirror_interval: "24h0m0s",
+        description: "new",
+      });
+    }
+    return mirrorObj({ private: false, mirror_interval: "24h0m0s" });
+  });
+  __setCaller(caller);
+  try {
+    const { context } = makeContext();
+    await method("mirror_ensure").execute(
+      {
+        owner: "mirrors",
+        name: "scrappy",
+        cloneAddr: "https://github.com/thomas-elliott/scrappy.git",
+        description: "new",
+      },
+      context,
+    );
+    const patch = calls.find((c) => c.method === "PATCH");
+    assertEquals(patch?.body, { description: "new" });
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("mirror_ensure still converges visibility when it is passed", async () => {
+  const { caller, calls } = makeFakeApi((c) => {
+    if (c.method === "PATCH") return mirrorObj({ private: true });
+    return mirrorObj({ private: false });
+  });
+  __setCaller(caller);
+  try {
+    const { context } = makeContext();
+    await method("mirror_ensure").execute(
+      {
+        owner: "mirrors",
+        name: "scrappy",
+        cloneAddr: "https://github.com/thomas-elliott/scrappy.git",
+        private: true,
+      },
+      context,
+    );
+    const patch = calls.find((c) => c.method === "PATCH");
+    assertEquals(patch?.body, { private: true });
+  } finally {
+    __setCaller(null);
+  }
+});
+
 Deno.test("mirror_ensure reconciles a drifted interval (semantic compare)", async () => {
   const { caller, calls } = makeFakeApi((c) => {
     if (c.method === "PATCH") return mirrorObj({ mirror_interval: "24h0m0s" });
