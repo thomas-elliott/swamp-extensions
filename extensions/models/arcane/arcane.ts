@@ -42,10 +42,17 @@ import { join } from "node:path";
 const RepositorySpec = z.object({
   name: z.string().describe("Display name of the git repository connection"),
   url: z.string().describe("Clone URL, e.g. git@github.com:me/gitops.git"),
-  authType: z.string().default("none").describe(
-    "Arcane auth type: none | token | ssh (verify accepted values for your version)",
+  // No schema defaults for authType and enabled: they would read as explicit
+  // values and reset an existing connection. gitops_repo_ensure applies them
+  // on create only.
+  authType: z.enum(["none", "http", "ssh"]).optional().describe(
+    "Arcane auth type: none | http (username + token) | ssh. A new connection " +
+      "defaults to none; when omitted, an existing connection keeps its auth type.",
   ),
-  enabled: z.boolean().default(true),
+  enabled: z.boolean().optional().describe(
+    "A new connection defaults to enabled; when omitted, an existing " +
+      "connection keeps its state.",
+  ),
   description: z.string().optional(),
   token: z.string().optional().meta({ sensitive: true }).describe(
     "PAT for token auth — secret; supply via vault. Sent only when present.",
@@ -64,24 +71,44 @@ const SyncSpec = z.object({
   composePath: z.string().describe(
     "Path to the compose file relative to repo root, e.g. projects/homepage/compose.yaml",
   ),
-  branch: z.string().default("main"),
+  // No schema defaults below: they would read as explicit values, count as
+  // drift against a sync tuned in the UI, and reset it. gitops_sync_ensure
+  // applies them on create only.
+  branch: z.string().optional().describe(
+    'Branch to sync. A new sync defaults to "main"; when omitted, an existing ' +
+      "sync keeps its branch.",
+  ),
   projectName: z.string().optional().describe(
     "Deployed project name; defaults to `name`",
   ),
   repository: z.string().optional().describe(
     "Repository connection name to resolve the id from; defaults to globalArgs.repository.name",
   ),
-  autoSync: z.boolean().default(true),
-  syncInterval: z.number().int().default(5).describe(
-    "Auto-sync interval in minutes",
+  autoSync: z.boolean().optional().describe(
+    "A new sync defaults to true; when omitted, an existing sync keeps its setting.",
   ),
-  syncDirectory: z.boolean().default(true).describe(
-    "The 'Sync Files' toggle: pull sibling files alongside the compose file",
+  syncInterval: z.number().int().optional().describe(
+    "Auto-sync interval in minutes. A new sync defaults to 5; when omitted, an " +
+      "existing sync keeps its interval.",
   ),
-  targetType: z.string().default("project").describe(
-    "project (compose) | swarm",
+  syncDirectory: z.boolean().optional().describe(
+    "The 'Sync Files' toggle: pull sibling files alongside the compose file. A " +
+      "new sync defaults to true; when omitted, an existing sync keeps its setting.",
+  ),
+  targetType: z.enum(["project", "swarm_stack"]).optional().describe(
+    "project (compose) | swarm_stack. A new sync defaults to project; when " +
+      "omitted, an existing sync keeps its target type.",
   ),
 });
+
+/** Settings Arcane gives a new sync when the spec leaves them out. */
+const SYNC_CREATE_DEFAULTS = {
+  branch: "main",
+  autoSync: true,
+  syncInterval: 5,
+  syncDirectory: true,
+  targetType: "project",
+};
 
 const GlobalArgs = z.object({
   baseUrl: z.string().describe(
@@ -340,6 +367,25 @@ function safeJson(body: string): unknown {
   } catch {
     return body;
   }
+}
+
+/**
+ * The error message from a streamed (NDJSON) Arcane response, or undefined when
+ * no line carries one. Arcane's project up and pull handlers write
+ * `{"error": "..."}` as a line of the 200 body when the operation fails, so the
+ * body has to be read to know whether it worked.
+ */
+export function streamError(body: unknown): string | undefined {
+  const lines = typeof body === "string" ? body.split("\n") : [body];
+  for (const line of lines) {
+    const obj = typeof line === "string" ? safeJson(line.trim()) : line;
+    if (
+      obj && typeof obj === "object" && typeof (obj as Json).error === "string"
+    ) {
+      return (obj as Json).error as string;
+    }
+  }
+  return undefined;
 }
 
 /** Signature of the Arcane HTTP transport, swappable via {@link __setArcaneTransport}. */
@@ -1297,26 +1343,27 @@ export const model = {
   checks: {
     "reachable": {
       description:
-        "Verify the Arcane API authenticates (GET /version with the X-API-Key)",
+        "Verify the Arcane API authenticates (GET /auth/me with the X-API-Key)",
       labels: ["live"],
       execute: async (
         context: Pick<MethodContext<GlobalArgsT>, "globalArgs">,
       ) => {
-        const g = context.globalArgs;
-        // `swamp model validate` does NOT resolve vault expressions before checks, so
-        // the key is still a literal `${{ … }}` and a probe can't auth. Skip then —
-        // real reachability is exercised at method-run time.
-        if (/\$\{\{/.test(String(g.apiKey))) return { pass: true };
+        const baseUrl = String(context.globalArgs?.baseUrl ?? "");
         try {
-          // Cheap, read-only, auth-exercising probe — the same endpoint the
-          // `version` method reads. Goes through the model's HTTP transport.
-          await arcane(g, "GET", "/version");
+          // Checks get globalArgs without the schema's defaults; parse to apply them.
+          const g = GlobalArgs.parse(context.globalArgs);
+          // Older swamp left the key as an unresolved `${{ … }}` here. Skip then;
+          // the method run checks it.
+          if (/\$\{\{/.test(g.apiKey)) return { pass: true };
+          // /version is registered without security in Arcane, so it would pass
+          // with a wrong key. /auth/me needs a valid key and no permission.
+          await arcane(g, "GET", "/auth/me");
           return { pass: true };
         } catch (e) {
           return {
             pass: false,
             errors: [
-              `Cannot reach Arcane at ${g.baseUrl}: ${(e as Error).message}`,
+              `Cannot reach Arcane at ${baseUrl}: ${(e as Error).message}`,
             ],
           };
         }
@@ -1517,7 +1564,7 @@ export const model = {
         const g: GlobalArgsT = context.globalArgs;
         logInfo(context, "Listing Arcane git repositories");
         const rows = coerceList(
-          await arcane(g, "GET", "/customize/git-repositories"),
+          await arcane(g, "GET", "/customize/git-repositories?limit=-1"),
         );
         const observedAt = new Date().toISOString();
         const handles: DataHandle[] = [];
@@ -1562,16 +1609,15 @@ export const model = {
           name: desired.name,
         });
         const existing = coerceList(
-          await arcane(g, "GET", "/customize/git-repositories"),
+          await arcane(g, "GET", "/customize/git-repositories?limit=-1"),
         )
           .find((r) => asString(pick(r, "name")) === desired.name);
 
-        const payload: Json = {
-          name: desired.name,
-          url: desired.url,
-          authType: desired.authType,
-          enabled: desired.enabled,
-        };
+        // Arcane's update keeps any field the body leaves out, so send only
+        // what the spec sets; a new connection gets the documented defaults.
+        const payload: Json = { name: desired.name, url: desired.url };
+        if (desired.authType !== undefined) payload.authType = desired.authType;
+        if (desired.enabled !== undefined) payload.enabled = desired.enabled;
         if (desired.description !== undefined) {
           payload.description = desired.description;
         }
@@ -1589,19 +1635,29 @@ export const model = {
           await arcane(g, "PUT", `/customize/git-repositories/${id}`, payload);
           action = "updated";
         } else {
+          payload.authType ??= "none";
+          payload.enabled ??= true;
           const created = unwrap(
             await arcane(g, "POST", "/customize/git-repositories", payload),
           );
           id = asString(pick(created, "id")) ?? "";
           action = "created";
         }
+        // What the connection holds now: the spec's values over the current ones.
+        const current = existing ?? {};
         const handle = await context.writeResource("repository", desired.name, {
           id,
           name: desired.name,
           url: desired.url,
-          authType: desired.authType,
-          enabled: desired.enabled,
-          description: desired.description,
+          authType: asString(
+            payload.authType ?? pick(current, "authType", "auth_type"),
+          ),
+          enabled: (payload.enabled ?? pick(current, "enabled")) as
+            | boolean
+            | undefined,
+          description: asString(
+            payload.description ?? pick(current, "description"),
+          ),
           action,
           observedAt: new Date().toISOString(),
         });
@@ -1624,7 +1680,7 @@ export const model = {
         const g: GlobalArgsT = context.globalArgs;
         logInfo(context, "Listing Arcane GitOps syncs");
         const rows = coerceList(
-          await arcane(g, "GET", `${ENV(g)}/gitops-syncs`),
+          await arcane(g, "GET", `${ENV(g)}/gitops-syncs?limit=-1`),
         );
         const observedAt = new Date().toISOString();
         const handles: DataHandle[] = [];
@@ -1671,10 +1727,10 @@ export const model = {
           prune: args.prune ?? false,
         });
         const repos = coerceList(
-          await arcane(g, "GET", "/customize/git-repositories"),
+          await arcane(g, "GET", "/customize/git-repositories?limit=-1"),
         );
         const existing = coerceList(
-          await arcane(g, "GET", `${ENV(g)}/gitops-syncs`),
+          await arcane(g, "GET", `${ENV(g)}/gitops-syncs?limit=-1`),
         );
         const observedAt = new Date().toISOString();
         const handles: DataHandle[] = [];
@@ -1698,27 +1754,33 @@ export const model = {
 
         for (const desired of g.syncs) {
           const repositoryId = repoId(desired.repository);
+          // Arcane's update keeps any field the body leaves out, so the payload
+          // carries only what the spec sets. Anything else stays as the server
+          // has it, including an interval tuned in the UI.
           const payload: Json = {
             name: desired.name,
-            branch: desired.branch,
             composePath: desired.composePath,
             repositoryId,
             projectName: desired.projectName ?? desired.name,
-            autoSync: desired.autoSync,
-            syncInterval: desired.syncInterval,
-            syncDirectory: desired.syncDirectory,
-            targetType: desired.targetType,
           };
+          for (const key of Object.keys(SYNC_CREATE_DEFAULTS)) {
+            const v = desired[key as keyof typeof SYNC_CREATE_DEFAULTS];
+            if (v !== undefined) payload[key] = v;
+          }
           const found = existing.find((s) =>
             asString(pick(s, "name")) === desired.name
           );
 
           let id: string;
           let action: "created" | "updated" | "unchanged";
+          // The spec's values over the current ones: what the sync holds after
+          // this run, and what drift is measured against.
+          let want: Record<string, unknown>;
           if (found) {
             id = asString(pick(found, "id")) ?? "";
+            want = syncView({ ...found, ...payload });
             const drifted = JSON.stringify(syncView(found)) !==
-              JSON.stringify(syncView({ ...payload }));
+              JSON.stringify(want);
             if (drifted) {
               await arcane(g, "PUT", `${ENV(g)}/gitops-syncs/${id}`, payload);
               action = "updated";
@@ -1726,8 +1788,10 @@ export const model = {
               action = "unchanged";
             }
           } else {
+            const body = { ...SYNC_CREATE_DEFAULTS, ...payload };
+            want = syncView(body);
             const created = unwrap(
-              await arcane(g, "POST", `${ENV(g)}/gitops-syncs`, payload),
+              await arcane(g, "POST", `${ENV(g)}/gitops-syncs`, body),
             );
             id = asString(pick(created, "id")) ?? "";
             action = "created";
@@ -1736,14 +1800,14 @@ export const model = {
             await context.writeResource("sync", desired.name, {
               id,
               name: desired.name,
-              branch: desired.branch,
+              branch: asString(want.branch),
               composePath: desired.composePath,
               repositoryId,
               projectName: desired.projectName ?? desired.name,
-              autoSync: desired.autoSync,
-              syncInterval: desired.syncInterval,
-              syncDirectory: desired.syncDirectory,
-              targetType: desired.targetType,
+              autoSync: want.autoSync as boolean | undefined,
+              syncInterval: asNumber(want.syncInterval),
+              syncDirectory: want.syncDirectory as boolean | undefined,
+              targetType: asString(want.targetType),
               action,
               observedAt,
             }),
@@ -1790,7 +1854,7 @@ export const model = {
           names: args.names ?? [],
         });
         const existing = coerceList(
-          await arcane(g, "GET", `${ENV(g)}/gitops-syncs`),
+          await arcane(g, "GET", `${ENV(g)}/gitops-syncs?limit=-1`),
         );
         const wanted: string[] = args.names ?? [];
         const targets = wanted.length === 0
@@ -1837,7 +1901,7 @@ export const model = {
           names: args.names ?? [],
         });
         const existing = coerceList(
-          await arcane(g, "GET", `${ENV(g)}/gitops-syncs`),
+          await arcane(g, "GET", `${ENV(g)}/gitops-syncs?limit=-1`),
         );
         const wanted: string[] = args.names ?? [];
         const targets = wanted.length === 0
@@ -2104,7 +2168,7 @@ export const model = {
             );
           }
           const syncs = coerceList(
-            await arcane(g, "GET", `${ENV(g)}/gitops-syncs`),
+            await arcane(g, "GET", `${ENV(g)}/gitops-syncs?limit=-1`),
           );
           const sync = syncs.find((s) =>
             asString(pick(s, "projectName", "project_name")) === name ||
@@ -2764,7 +2828,9 @@ export const model = {
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const g: GlobalArgsT = context.globalArgs;
-        const rows = coerceList(await arcane(g, "GET", `${ENV(g)}/volumes`));
+        const rows = coerceList(
+          await arcane(g, "GET", `${ENV(g)}/volumes?limit=-1`),
+        );
         const handles: DataHandle[] = [];
         for (const r of rows) {
           const res = volumeResource(r, "observed");
@@ -2945,7 +3011,14 @@ function makeLifecycle(
         if (destructive && httpMethod === "DELETE") {
           await deleteIfPresent(g, path);
         } else {
-          await arcane(g, httpMethod, path);
+          // up and pull stream NDJSON: the 200 arrives before the work runs and
+          // a failure is an error line in the body, so the status proves nothing.
+          const failure = streamError(await arcane(g, httpMethod, path));
+          if (failure !== undefined) {
+            throw new Error(
+              `Arcane ${operation} of '${name}' failed: ${failure}`,
+            );
+          }
         }
         handles.push(
           await context.writeResource(

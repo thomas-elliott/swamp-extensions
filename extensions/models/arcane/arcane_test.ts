@@ -10,6 +10,7 @@ import {
   b64,
   coerceList,
   model,
+  streamError,
   projectHealthy,
   pruneResult,
   renderNames,
@@ -1263,7 +1264,7 @@ Deno.test("version reads the flat /version body (no envelope) into arcane-versio
 Deno.test("gitops_sync_status fans out over all syncs and surfaces the failing one", async () => {
   __setArcaneTransport(
     (_g: unknown, m: string, p: string): Promise<unknown> => {
-      if (m === "GET" && p === "/environments/0/gitops-syncs") {
+      if (m === "GET" && p === "/environments/0/gitops-syncs?limit=-1") {
         return Promise.resolve({
           success: true,
           data: [{ id: "s1", name: "web" }, { id: "s2", name: "db" }],
@@ -1320,7 +1321,7 @@ Deno.test("gitops_sync_status fans out over all syncs and surfaces the failing o
 Deno.test("gitops_sync_status names a missing sync instead of silently skipping it", async () => {
   __setArcaneTransport(
     (_g: unknown, m: string, p: string): Promise<unknown> => {
-      if (m === "GET" && p === "/environments/0/gitops-syncs") {
+      if (m === "GET" && p === "/environments/0/gitops-syncs?limit=-1") {
         return Promise.resolve({
           success: true,
           data: [{ id: "s1", name: "web" }],
@@ -1368,9 +1369,6 @@ Deno.test("reachable check: skips (pass) when the apiKey is still a vault expres
       globalArgs: {
         baseUrl: "https://arcane.example:8443",
         apiKey: "${{ vault.get(myvault, arcane/api_key) }}",
-        environmentId: "0",
-        skipTlsVerify: false,
-        syncs: [],
       },
     });
     assertEquals(res.pass, true);
@@ -1399,9 +1397,6 @@ Deno.test("reachable check: fails with errors when the probe throws", async () =
       globalArgs: {
         baseUrl: "https://arcane.example:8443",
         apiKey: "real-key",
-        environmentId: "0",
-        skipTlsVerify: false,
-        syncs: [],
       },
     });
     assertEquals(res.pass, false);
@@ -1414,11 +1409,13 @@ Deno.test("reachable check: fails with errors when the probe throws", async () =
   }
 });
 
-Deno.test("reachable check: passes when the /version probe succeeds", async () => {
+Deno.test("reachable check: probes an authenticated endpoint and applies the schema defaults", async () => {
   const paths: string[] = [];
-  __setArcaneTransport((_g, _method, path) => {
+  let seen: Record<string, unknown> = {};
+  __setArcaneTransport((g, _method, path) => {
+    seen = g;
     paths.push(path);
-    return Promise.resolve({ currentVersion: "2.0.3" });
+    return Promise.resolve({ success: true, data: { id: "u1" } });
   });
   try {
     const checks = (model as unknown as {
@@ -1427,17 +1424,385 @@ Deno.test("reachable check: passes when the /version probe succeeds", async () =
         { execute: (c: unknown) => Promise<{ pass: boolean }> }
       >;
     }).checks;
+    // A hand-edited definition can omit the defaulted settings; the check
+    // must still get them.
     const res = await checks.reachable.execute({
       globalArgs: {
         baseUrl: "https://arcane.example:8443",
         apiKey: "real-key",
-        environmentId: "0",
-        skipTlsVerify: false,
-        syncs: [],
       },
     });
     assertEquals(res.pass, true);
-    assertEquals(paths, ["/version"], "probes the cheap /version endpoint");
+    // /version has no auth upstream, so a wrong key would pass it.
+    assertEquals(paths, ["/auth/me"], "probes an endpoint that needs the key");
+    assertEquals(seen.skipTlsVerify, false);
+    assertEquals(seen.environmentId, "0");
+  } finally {
+    __setArcaneTransport(null);
+  }
+});
+
+Deno.test("reachable check: a rejected key fails rather than passing", async () => {
+  __setArcaneTransport(() => {
+    throw new Error(
+      "Arcane GET /auth/me -> HTTP 401: Invalid or expired API key",
+    );
+  });
+  try {
+    const checks = (model as unknown as {
+      checks: Record<
+        string,
+        {
+          execute: (
+            c: unknown,
+          ) => Promise<{ pass: boolean; errors?: string[] }>;
+        }
+      >;
+    }).checks;
+    const res = await checks.reachable.execute({
+      globalArgs: { baseUrl: "https://arcane.example:8443", apiKey: "wrong" },
+    });
+    assertEquals(res.pass, false);
+    assert((res.errors ?? []).some((e) => /HTTP 401/.test(e)));
+  } finally {
+    __setArcaneTransport(null);
+  }
+});
+
+// ─────────────────────────── streaming lifecycle ───────────────────────────
+
+Deno.test("streamError finds the error line in an NDJSON body and nothing else", () => {
+  assertEquals(
+    streamError(
+      '{"type":"activity","id":"a1"}\n{"type":"deploy","phase":"begin"}\n{"error":"service web: image not found"}\n',
+    ),
+    "service web: image not found",
+  );
+  assertEquals(
+    streamError(
+      '{"type":"deploy","phase":"begin"}\n{"type":"deploy","phase":"complete"}\n',
+    ),
+    undefined,
+  );
+  // a single-line body arrives already parsed
+  assertEquals(streamError({ error: "boom" }), "boom");
+  assertEquals(streamError({ success: true }), undefined);
+  assertEquals(streamError(null), undefined);
+  assertEquals(streamError("not json at all"), undefined);
+});
+
+for (
+  const [name, suffix] of [["project_up", "/up"], ["project_pull", "/pull"]]
+) {
+  Deno.test(`${name}: an error line in the 200 body fails the method`, async () => {
+    __setArcaneTransport(
+      (_g: unknown, m: string, p: string): Promise<unknown> => {
+        if (m === "GET" && p === "/environments/0/projects?limit=-1") {
+          return Promise.resolve({
+            success: true,
+            data: [{ id: "p1", name: "web" }],
+          });
+        }
+        if (m === "POST" && p === `/environments/0/projects/p1${suffix}`) {
+          // Arcane streams: status 200, then the failure as a body line.
+          return Promise.resolve(
+            '{"type":"activity","id":"a1"}\n{"error":"pull access denied for ghcr.io/x/y"}\n',
+          );
+        }
+        return Promise.reject(new Error(`unexpected ${m} ${p}`));
+      },
+    );
+    try {
+      const { context, written } = makeContext(TEST_GLOBALS);
+      let message = "";
+      try {
+        await method(name).execute({ names: ["web"] }, context);
+      } catch (e) {
+        message = e instanceof Error ? e.message : String(e);
+      }
+      assert(/web/.test(message), "names the project");
+      assert(/pull access denied/.test(message), "carries Arcane's error");
+      assertEquals(
+        written.filter((w) => w.specName === "operation-result").length,
+        0,
+        "no success recorded",
+      );
+    } finally {
+      __setArcaneTransport(null);
+    }
+  });
+
+  Deno.test(`${name}: a clean streamed body records success`, async () => {
+    __setArcaneTransport(
+      (_g: unknown, m: string, p: string): Promise<unknown> => {
+        if (m === "GET" && p === "/environments/0/projects?limit=-1") {
+          return Promise.resolve({
+            success: true,
+            data: [{ id: "p1", name: "web" }],
+          });
+        }
+        if (m === "POST" && p === `/environments/0/projects/p1${suffix}`) {
+          return Promise.resolve(
+            '{"type":"activity","id":"a1"}\n{"status":"complete"}\n',
+          );
+        }
+        return Promise.reject(new Error(`unexpected ${m} ${p}`));
+      },
+    );
+    try {
+      const { context, written } = makeContext(TEST_GLOBALS);
+      await method(name).execute({ names: ["web"] }, context);
+      const r = written.find((w) => w.specName === "operation-result");
+      assert(r, "operation-result written");
+      assertEquals(r!.data.success, true);
+    } finally {
+      __setArcaneTransport(null);
+    }
+  });
+}
+
+// ─────────────────────────── gitops ensure methods ───────────────────────────
+
+Deno.test("globalArgs schema accepts Arcane's enum values and rejects the old ones", () => {
+  const base = { baseUrl: "https://a", apiKey: "k" };
+  const repo = (authType: string) =>
+    model.globalArguments.safeParse({
+      ...base,
+      repository: { name: "r", url: "u", authType },
+    }).success;
+  assertEquals(repo("http"), true);
+  assertEquals(repo("ssh"), true);
+  assertEquals(repo("none"), true);
+  assertEquals(
+    repo("token"),
+    false,
+    "Arcane rejects token (oneof=none http ssh)",
+  );
+  const sync = (targetType: string) =>
+    model.globalArguments.safeParse({
+      ...base,
+      syncs: [{ name: "s", composePath: "c.yaml", targetType }],
+    }).success;
+  assertEquals(sync("project"), true);
+  assertEquals(sync("swarm_stack"), true);
+  assertEquals(sync("swarm"), false, "Arcane's value is swarm_stack");
+});
+
+Deno.test("gitops_repo_ensure: an existing connection keeps authType and enabled when the spec omits them", async () => {
+  const calls: Call[] = [];
+  __setArcaneTransport(
+    (_g: unknown, m: string, p: string, body?: unknown): Promise<unknown> => {
+      calls.push({ method: m, path: p, body });
+      if (m === "GET" && p === "/customize/git-repositories?limit=-1") {
+        return Promise.resolve({
+          success: true,
+          data: [{
+            id: "r1",
+            name: "gitops",
+            url: "git@h:me/gitops.git",
+            authType: "ssh",
+            enabled: false,
+            description: "set in the UI",
+          }],
+        });
+      }
+      if (m === "PUT" && p === "/customize/git-repositories/r1") {
+        return Promise.resolve({ success: true, data: { id: "r1" } });
+      }
+      return Promise.reject(new Error(`unexpected ${m} ${p}`));
+    },
+  );
+  try {
+    const { context, written } = makeContext({
+      ...TEST_GLOBALS,
+      repository: { name: "gitops", url: "git@h:me/gitops.git" },
+    });
+    await method("gitops_repo_ensure").execute({}, context);
+    const put = calls.find((c) => c.method === "PUT")!;
+    assertEquals(
+      bodyOf(put),
+      { name: "gitops", url: "git@h:me/gitops.git" },
+      "only what was passed is sent",
+    );
+    const r = written.find((w) => w.specName === "repository")!;
+    assertEquals(r.data.action, "updated");
+    assertEquals(r.data.authType, "ssh", "reports the kept auth type");
+    assertEquals(r.data.enabled, false, "reports the kept state");
+    assertEquals(r.data.description, "set in the UI");
+  } finally {
+    __setArcaneTransport(null);
+  }
+});
+
+Deno.test("gitops_repo_ensure: a new connection gets authType none and enabled true", async () => {
+  const calls: Call[] = [];
+  __setArcaneTransport(
+    (_g: unknown, m: string, p: string, body?: unknown): Promise<unknown> => {
+      calls.push({ method: m, path: p, body });
+      if (m === "GET" && p === "/customize/git-repositories?limit=-1") {
+        return Promise.resolve({ success: true, data: [] });
+      }
+      if (m === "POST" && p === "/customize/git-repositories") {
+        return Promise.resolve({ success: true, data: { id: "r9" } });
+      }
+      return Promise.reject(new Error(`unexpected ${m} ${p}`));
+    },
+  );
+  try {
+    const { context, written } = makeContext({
+      ...TEST_GLOBALS,
+      repository: { name: "gitops", url: "https://h/me/gitops.git" },
+    });
+    await method("gitops_repo_ensure").execute({}, context);
+    const post = calls.find((c) => c.method === "POST")!;
+    assertEquals(bodyOf(post).authType, "none");
+    assertEquals(bodyOf(post).enabled, true);
+    const r = written.find((w) => w.specName === "repository")!;
+    assertEquals(r.data.action, "created");
+    assertEquals(r.data.id, "r9");
+    assertEquals(r.data.authType, "none");
+    assertEquals(r.data.enabled, true);
+  } finally {
+    __setArcaneTransport(null);
+  }
+});
+
+function syncServer(existing: Record<string, unknown>[]) {
+  const calls: Call[] = [];
+  __setArcaneTransport(
+    (_g: unknown, m: string, p: string, body?: unknown): Promise<unknown> => {
+      calls.push({ method: m, path: p, body });
+      if (m === "GET" && p === "/customize/git-repositories?limit=-1") {
+        return Promise.resolve({
+          success: true,
+          data: [{ id: "r1", name: "gitops" }],
+        });
+      }
+      if (m === "GET" && p === "/environments/0/gitops-syncs?limit=-1") {
+        return Promise.resolve({ success: true, data: existing });
+      }
+      if (m === "PUT" && p.startsWith("/environments/0/gitops-syncs/")) {
+        return Promise.resolve({ success: true, data: { id: "s1" } });
+      }
+      if (m === "POST" && p === "/environments/0/gitops-syncs") {
+        return Promise.resolve({ success: true, data: { id: "s2" } });
+      }
+      return Promise.reject(new Error(`unexpected ${m} ${p}`));
+    },
+  );
+  return calls;
+}
+
+const UI_TUNED_SYNC = {
+  id: "s1",
+  name: "web",
+  branch: "release",
+  composePath: "projects/web/compose.yaml",
+  repositoryId: "r1",
+  projectName: "web",
+  autoSync: false,
+  syncInterval: 15,
+  syncDirectory: false,
+  targetType: "swarm_stack",
+};
+
+Deno.test("gitops_sync_ensure: settings the spec omits are not drift and are not reset", async () => {
+  const calls = syncServer([UI_TUNED_SYNC]);
+  try {
+    const { context, written } = makeContext({
+      ...TEST_GLOBALS,
+      repository: { name: "gitops", url: "u" },
+      syncs: [{ name: "web", composePath: "projects/web/compose.yaml" }],
+    });
+    await method("gitops_sync_ensure").execute({ prune: false }, context);
+    assertEquals(
+      calls.filter((c) => c.method === "PUT").length,
+      0,
+      "a UI-tuned sync is left alone",
+    );
+    const r = written.find((w) => w.specName === "sync")!;
+    assertEquals(r.data.action, "unchanged");
+    assertEquals(r.data.syncInterval, 15, "reports the server's interval");
+    assertEquals(r.data.branch, "release");
+    assertEquals(r.data.targetType, "swarm_stack");
+  } finally {
+    __setArcaneTransport(null);
+  }
+});
+
+Deno.test("gitops_sync_ensure: a passed setting that differs is updated on its own", async () => {
+  const calls = syncServer([UI_TUNED_SYNC]);
+  try {
+    const { context, written } = makeContext({
+      ...TEST_GLOBALS,
+      repository: { name: "gitops", url: "u" },
+      syncs: [{
+        name: "web",
+        composePath: "projects/web/compose.yaml",
+        branch: "main",
+      }],
+    });
+    await method("gitops_sync_ensure").execute({ prune: false }, context);
+    const put = calls.find((c) => c.method === "PUT")!;
+    assert(put, "drift on a passed field is written");
+    assertEquals(bodyOf(put).branch, "main");
+    assertEquals(
+      bodyOf(put).syncInterval,
+      undefined,
+      "omitted fields stay out",
+    );
+    assertEquals(bodyOf(put).autoSync, undefined);
+    assertEquals(bodyOf(put).targetType, undefined);
+    const r = written.find((w) => w.specName === "sync")!;
+    assertEquals(r.data.action, "updated");
+    assertEquals(r.data.branch, "main");
+    assertEquals(r.data.syncInterval, 15);
+  } finally {
+    __setArcaneTransport(null);
+  }
+});
+
+Deno.test("gitops_sync_ensure: a new sync gets the create defaults", async () => {
+  const calls = syncServer([]);
+  try {
+    const { context, written } = makeContext({
+      ...TEST_GLOBALS,
+      repository: { name: "gitops", url: "u" },
+      syncs: [{ name: "web", composePath: "projects/web/compose.yaml" }],
+    });
+    await method("gitops_sync_ensure").execute({ prune: false }, context);
+    const post = calls.find((c) => c.method === "POST")!;
+    assertEquals(bodyOf(post), {
+      branch: "main",
+      autoSync: true,
+      syncInterval: 5,
+      syncDirectory: true,
+      targetType: "project",
+      name: "web",
+      composePath: "projects/web/compose.yaml",
+      repositoryId: "r1",
+      projectName: "web",
+    });
+    const r = written.find((w) => w.specName === "sync")!;
+    assertEquals(r.data.action, "created");
+    assertEquals(r.data.id, "s2");
+    assertEquals(r.data.targetType, "project");
+  } finally {
+    __setArcaneTransport(null);
+  }
+});
+
+Deno.test("volume_list asks Arcane for every volume, not the first page", async () => {
+  const paths: string[] = [];
+  __setArcaneTransport((_g, _m, p) => {
+    paths.push(p);
+    return Promise.resolve({ success: true, data: [{ name: "v1" }] });
+  });
+  try {
+    const { context, written } = makeContext(TEST_GLOBALS);
+    await method("volume_list").execute({}, context);
+    assertEquals(paths, ["/environments/0/volumes?limit=-1"]);
+    assertEquals(written.length, 1);
   } finally {
     __setArcaneTransport(null);
   }
