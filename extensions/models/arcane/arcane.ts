@@ -1395,7 +1395,7 @@ const LifecycleArgs = z.object({
 /** The `@thomas/arcane` swamp model: schema, methods, and lifecycle for managing Docker via Arcane. */
 export const model = {
   type: "@thomas/arcane",
-  version: "2026.06.24.1",
+  version: "2026.10.11.1",
   globalArguments: GlobalArgs,
   checks: {
     "reachable": {
@@ -1465,6 +1465,13 @@ export const model = {
     },
     {
       toVersion: "2026.06.24.1",
+      description: "No change to global arguments or stored data.",
+      upgradeAttributes: (
+        old: Record<string, unknown>,
+      ): Record<string, unknown> => old,
+    },
+    {
+      toVersion: "2026.10.11.1",
       description: "No change to global arguments or stored data.",
       upgradeAttributes: (
         old: Record<string, unknown>,

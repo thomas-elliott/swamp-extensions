@@ -1,6 +1,6 @@
 manifestVersion: 1
 name: "@thomas/arcane"
-version: 2026.06.24.1
+version: 2026.10.11.1
 description: >-
   Management of an Arcane Docker instance through its REST API: GitOps sync
   setup, compose project lifecycle with a validated deploy for each mode, swarm
