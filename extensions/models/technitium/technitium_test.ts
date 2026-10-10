@@ -16,6 +16,8 @@ import {
   namesFrom,
   prefixNew,
   recordInstanceName,
+  SETTINGS_SECTIONS,
+  settingsSectionFlags,
   slug,
   unwrapEnvelope,
 } from "./technitium.ts";
@@ -533,14 +535,27 @@ Deno.test("record_add spreads rData into flat query params", async () => {
   }
 });
 
-Deno.test("record_update maps newRData to new* params and keeps identifying rData", async () => {
+// `records/update` resets ttl, disable, comments and expiryTtl to defaults when
+// they are not sent, so the method reads the record first and sends them back.
+// The responder serves both the pre-read (matches 1.1.1.1) and the read-back
+// (matches 2.2.2.2).
+const UPDATE_LIVE_RECORDS = [
+  {
+    type: "A",
+    ttl: 300,
+    disabled: true,
+    comments: "keep me",
+    expiryTtl: 86400,
+    rData: { ipAddress: "1.1.1.1" },
+  },
+  { type: "A", ttl: 300, rData: { ipAddress: "2.2.2.2" } },
+];
+
+Deno.test("record_update maps newRData to new* params and carries the record's ttl, disable, comments and expiryTtl", async () => {
   const calls: Call[] = [];
-  scriptTransport(
-    calls,
-    recordsResponder([{ type: "A", rData: { ipAddress: "2.2.2.2" } }]),
-  );
+  scriptTransport(calls, recordsResponder(UPDATE_LIVE_RECORDS));
   try {
-    const { context } = makeContext();
+    const { context, written } = makeContext();
     await method("record_update").execute(
       {
         zone: "example.com",
@@ -551,13 +566,73 @@ Deno.test("record_update maps newRData to new* params and keeps identifying rDat
       },
       context,
     );
-    assertEquals(calls[0].params, {
+    assertEquals(calls[0].path, "/zones/records/get");
+    assertEquals(calls[1].path, "/zones/records/update");
+    assertEquals(calls[1].params, {
       domain: "www.example.com",
       type: "A",
       zone: "example.com",
+      ttl: 300,
+      disable: true,
+      comments: "keep me",
+      expiryTtl: 86400,
       ipAddress: "1.1.1.1",
       newIpAddress: "2.2.2.2",
     });
+    assertEquals(written[0].data.ttl, 300);
+    assertEquals(written[0].data.disabled, true);
+  } finally {
+    __setTechnitiumTransport(null);
+  }
+});
+
+Deno.test("record_update sends the caller's ttl and disable over the record's own", async () => {
+  const calls: Call[] = [];
+  scriptTransport(calls, recordsResponder(UPDATE_LIVE_RECORDS));
+  try {
+    const { context } = makeContext();
+    await method("record_update").execute(
+      {
+        zone: "example.com",
+        domain: "www.example.com",
+        type: "A",
+        ttl: 60,
+        disable: false,
+        rData: { ipAddress: "1.1.1.1" },
+        newRData: { ipAddress: "2.2.2.2" },
+      },
+      context,
+    );
+    const p = calls[1].params ?? {};
+    assertEquals(p.ttl, 60);
+    assertEquals(p.disable, false);
+    assertEquals(p.comments, "keep me");
+  } finally {
+    __setTechnitiumTransport(null);
+  }
+});
+
+Deno.test("record_update throws before the POST when no record matches rData", async () => {
+  const calls: Call[] = [];
+  scriptTransport(calls, recordsResponder(UPDATE_LIVE_RECORDS));
+  try {
+    const { context, written } = makeContext();
+    await assertRejects(
+      () =>
+        method("record_update").execute(
+          {
+            zone: "example.com",
+            domain: "www.example.com",
+            type: "A",
+            rData: { ipAddress: "9.9.9.9" },
+            newRData: { ipAddress: "2.2.2.2" },
+          },
+          context,
+        ),
+      "no A record at www.example.com",
+    );
+    assertEquals(calls.map((c) => c.path), ["/zones/records/get"]);
+    assertEquals(written.length, 0);
   } finally {
     __setTechnitiumTransport(null);
   }
@@ -641,8 +716,10 @@ Deno.test("record_update writes APP content via recordData with no new* params",
       },
       context,
     );
-    assertEquals(calls[0].path, "/zones/records/update");
-    assertEquals(calls[0].params, {
+    // the pre-read matches the APP record by type alone, whatever rData says
+    assertEquals(calls[0].path, "/zones/records/get");
+    assertEquals(calls[1].path, "/zones/records/update");
+    assertEquals(calls[1].params, {
       domain: "x.zone",
       type: "APP",
       zone: "zone",
@@ -651,7 +728,7 @@ Deno.test("record_update writes APP content via recordData with no new* params",
       recordData: '{"local":["C"]}',
     });
     // the bug: prefixNew would emit `newData`, which Technitium ignores → empty
-    const p = calls[0].params ?? {};
+    const p = calls[1].params ?? {};
     assert(!("newData" in p), "no newData param");
     assert(!("data" in p), "no raw `data` param");
     assert(!("newRData" in p), "no newRData param");
@@ -802,6 +879,113 @@ Deno.test("record_delete throws when read-back shows the record still present", 
       "still",
     );
     assertEquals(written.length, 0);
+  } finally {
+    __setTechnitiumTransport(null);
+  }
+});
+
+Deno.test("client_resolve sends the API's `dnssec` flag, not the argument name", async () => {
+  const calls: Call[] = [];
+  scriptTransport(calls, () => ({ result: { RCODE: "NoError", Answer: [] } }));
+  try {
+    const { context } = makeContext();
+    await method("client_resolve").execute(
+      {
+        domain: "example.com",
+        type: "A",
+        server: "this-server",
+        protocol: "Udp",
+        dnssecValidation: true,
+      },
+      context,
+    );
+    assertEquals(calls[0].path, "/dnsClient/resolve");
+    assertEquals(calls[0].params?.dnssec, true);
+    assert(!("dnssecValidation" in (calls[0].params ?? {})));
+  } finally {
+    __setTechnitiumTransport(null);
+  }
+});
+
+// ----- settings backup / restore flags ------------------------------------
+// The download and upload transports bypass the test seam, so the flag builder
+// that produces their query string is tested directly.
+
+const BACKUP_DEFAULTS = settingsSectionFlags(
+  {
+    authConfig: true,
+    clusterConfig: true,
+    webServiceSettings: true,
+    dnsSettings: true,
+    logSettings: true,
+    zones: true,
+    allowedZones: true,
+    blockedZones: true,
+    blockLists: true,
+    apps: true,
+    scopes: true,
+    stats: false,
+    logs: false,
+  },
+  undefined,
+);
+
+Deno.test("settingsSectionFlags sends every section the API knows, and only those", () => {
+  assertEquals(
+    Object.keys(BACKUP_DEFAULTS).sort(),
+    [...SETTINGS_SECTIONS].sort(),
+  );
+  // the flag the old code sent, which the API never had
+  assert(!("dnsApps" in BACKUP_DEFAULTS));
+  // the three sections whose absence made a "full" backup incomplete
+  assertEquals(BACKUP_DEFAULTS.dnsSettings, true);
+  assertEquals(BACKUP_DEFAULTS.webServiceSettings, true);
+  assertEquals(BACKUP_DEFAULTS.logSettings, true);
+});
+
+Deno.test("settingsSectionFlags lets options override a default", () => {
+  const flags = settingsSectionFlags(
+    { ...BACKUP_DEFAULTS } as Parameters<typeof settingsSectionFlags>[0],
+    { authConfig: false, logs: true },
+  );
+  assertEquals(flags.authConfig, false);
+  assertEquals(flags.logs, true);
+  assertEquals(flags.zones, true);
+});
+
+Deno.test("settingsSectionFlags rejects a section name the API does not know", () => {
+  assertThrows(
+    () =>
+      settingsSectionFlags(
+        { ...BACKUP_DEFAULTS } as Parameters<typeof settingsSectionFlags>[0],
+        { dnsApps: true },
+      ),
+    "Unknown settings section(s): dnsApps",
+  );
+});
+
+// ----- reachable check -------------------------------------------------------
+
+// A check receives globalArgs without the schema's defaults, so an unset
+// skipTlsVerify reached the transport as undefined.
+Deno.test("reachable check applies the schema defaults to globalArgs", async () => {
+  let seenSkipTls: unknown;
+  __setTechnitiumTransport((g) => {
+    seenSkipTls = g.skipTlsVerify;
+    return Promise.resolve({ enableBlocking: true });
+  });
+  try {
+    const checks = (model as unknown as {
+      checks: Record<
+        string,
+        { execute: (c: unknown) => Promise<{ pass: boolean }> }
+      >;
+    }).checks;
+    const res = await checks.reachable.execute({
+      globalArgs: { baseUrl: TEST_GLOBALS.baseUrl, apiToken: TEST_GLOBALS.apiToken },
+    });
+    assertEquals(res.pass, true);
+    assertEquals(seenSkipTls, false);
   } finally {
     __setTechnitiumTransport(null);
   }
