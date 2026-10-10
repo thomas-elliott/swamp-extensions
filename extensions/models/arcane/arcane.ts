@@ -314,6 +314,10 @@ const PruneResultResource = z.object({
 
 const API = "/api";
 const REQUEST_TIMEOUT_MS = 30_000;
+// Up, down, redeploy, pull and destroy send nothing back until Docker has
+// finished, so a 30 s idle timeout would fail a slow redeploy that is still
+// running, and project_deploy would start a rollback on top of it.
+const OPERATION_TIMEOUT_MS = 10 * 60_000;
 
 type GlobalArgsT = z.infer<typeof GlobalArgs>;
 /** A parsed JSON object. */
@@ -326,6 +330,7 @@ export type HttpMethod = "GET" | "POST" | "PUT" | "DELETE";
 function httpRequest(
   opts: https.RequestOptions,
   secure: boolean,
+  timeoutMs: number,
   body?: string,
 ): Promise<HttpResult> {
   const transport = secure ? https : http;
@@ -342,8 +347,8 @@ function httpRequest(
     });
     req.on("error", reject);
     req.setTimeout(
-      REQUEST_TIMEOUT_MS,
-      () => req.destroy(new Error("request timed out")),
+      timeoutMs,
+      () => req.destroy(new Error(`request timed out after ${timeoutMs} ms`)),
     );
     if (body) req.write(body);
     req.end();
@@ -385,6 +390,7 @@ export type ArcaneFn = (
   method: HttpMethod,
   path: string,
   body?: unknown,
+  timeoutMs?: number,
 ) => Promise<unknown>;
 
 let _arcaneOverride: ArcaneFn | null = null;
@@ -404,8 +410,9 @@ function arcane(
   method: HttpMethod,
   path: string,
   body?: unknown,
+  timeoutMs = REQUEST_TIMEOUT_MS,
 ): Promise<unknown> {
-  return (_arcaneOverride ?? arcaneReal)(g, method, path, body);
+  return (_arcaneOverride ?? arcaneReal)(g, method, path, body, timeoutMs);
 }
 
 /** The real HTTP implementation behind `arcane()`. */
@@ -414,6 +421,7 @@ async function arcaneReal(
   method: HttpMethod,
   path: string,
   body?: unknown,
+  timeoutMs = REQUEST_TIMEOUT_MS,
 ): Promise<unknown> {
   const u = new URL(g.baseUrl.replace(/\/+$/, "") + API + path);
   const secure = u.protocol === "https:";
@@ -436,6 +444,7 @@ async function arcaneReal(
       rejectUnauthorized: !g.skipTlsVerify,
     },
     secure,
+    timeoutMs,
     payload,
   );
   if (res.status >= 400) {
@@ -447,9 +456,13 @@ async function arcaneReal(
 }
 
 /** DELETE that treats 404 (already gone) as success, for idempotent pruning. */
-async function deleteIfPresent(g: GlobalArgsT, path: string): Promise<void> {
+async function deleteIfPresent(
+  g: GlobalArgsT,
+  path: string,
+  timeoutMs = REQUEST_TIMEOUT_MS,
+): Promise<void> {
   try {
-    await arcane(g, "DELETE", path);
+    await arcane(g, "DELETE", path, undefined, timeoutMs);
   } catch (e) {
     if (e instanceof Error && /HTTP 404/.test(e.message)) return;
     throw e;
@@ -598,10 +611,10 @@ export function __setComposeValidator(fn: ValidateFn | null): void {
 }
 
 /**
- * Validate compose content LOCALLY with `docker compose config -q` (guardrail #9b:
- * read-only, on the swamp host, never via SSH). Fails closed: any non-zero exit
- * throws with the validator's stderr. Returns the local compose version so
- * version skew vs Arcane's deployer (an accepted risk, §3) stays visible. Routes
+ * Validate compose content with `docker compose config -q` on the swamp host,
+ * never over SSH. Any non-zero exit throws with the validator's stderr. Returns
+ * the local compose version, because it can differ from the version Arcane
+ * deploys with and that difference should stay visible. Routes
  * through the test seam when one is installed.
  */
 function composeConfigValidate(
@@ -1153,7 +1166,7 @@ async function stackGone(g: GlobalArgsT, path: string): Promise<boolean> {
  * returns it (with `services:0`) and `swarm_stack_list` still shows it, so a single
  * DELETE leaves the stack half-removed. This function therefore DELETEs, polls the
  * stack GET, and re-issues DELETE until the record 404s. A non-404 DELETE error (e.g.
- * an in-use conflict) propagates immediately and is never forced (guardrail #5). If the
+ * an in-use conflict) propagates immediately and is never forced. If the
  * record is still present at the deadline it throws rather than report success.
  */
 async function pollStackRemoved(
@@ -1233,9 +1246,6 @@ const ProjectCreateArgs = z.object({
   composeContent: z.string().optional(),
   envPath: z.string().optional(),
   envContent: z.string().optional(),
-  validate: z.boolean().default(true).describe(
-    "Run local compose validation before pushing (fail-closed)",
-  ),
 });
 
 const ProjectUpdateArgs = z.object({
@@ -1244,7 +1254,6 @@ const ProjectUpdateArgs = z.object({
   composeContent: z.string().optional(),
   envPath: z.string().optional(),
   envContent: z.string().optional(),
-  validate: z.boolean().default(true),
 });
 
 const ProjectDeployArgs = z.object({
@@ -1363,48 +1372,42 @@ export const model = {
   upgrades: [
     {
       toVersion: "2026.05.21.1",
-      description:
-        "Rename methods to the gitops_/project_ prefix convention and add the Phase 2 (direct compose + deploy) and Phase 3 (swarm secret/config + rotation) methods/resources. globalArguments schema is unchanged, so this is a no-op data migration.",
+      description: "No change to global arguments or stored data.",
       upgradeAttributes: (
         old: Record<string, unknown>,
       ): Record<string, unknown> => old,
     },
     {
       toVersion: "2026.05.22.1",
-      description:
-        "Add the swarm_stack_ section (swarm_stack_validate via config/render [fail-closed], swarm_stack_deploy, _list, _get, _remove, _tasks), swarm_service_force_update, volume_list/_remove/_prune, network_prune, image_prune, plus swarm-stack / swarm-stack-render / swarm-task / volume / prune-result resources. globalArguments schema is unchanged, so this is a no-op data migration.",
+      description: "No change to global arguments or stored data.",
       upgradeAttributes: (
         old: Record<string, unknown>,
       ): Record<string, unknown> => old,
     },
     {
       toVersion: "2026.05.23.1",
-      description:
-        "Publish version bump (4bcc8df) ships the slow-types fix; globalArguments schema is unchanged, so this is a no-op data migration.",
+      description: "No change to global arguments or stored data.",
       upgradeAttributes: (
         old: Record<string, unknown>,
       ): Record<string, unknown> => old,
     },
     {
       toVersion: "2026.05.24.1",
-      description:
-        "Repair the broken 2026.05.23.1 publish (which shipped without its migration entry, leaving the type unloadable). globalArguments schema is unchanged, so this is a no-op data migration; the .23.1 release is yanked in favour of this version.",
+      description: "No change to global arguments or stored data.",
       upgradeAttributes: (
         old: Record<string, unknown>,
       ): Record<string, unknown> => old,
     },
     {
       toVersion: "2026.06.12.1",
-      description:
-        "Add the `version` and `gitops_sync_status` read-only methods (both endpoints exist on Arcane v1.19.x and v2.0.x). globalArguments schema is unchanged, so this is a no-op data migration.",
+      description: "No change to global arguments or stored data.",
       upgradeAttributes: (
         old: Record<string, unknown>,
       ): Record<string, unknown> => old,
     },
     {
       toVersion: "2026.06.24.1",
-      description:
-        "First registry publish of the version/gitops_sync_status work (2026.06.12.1 was prepared but never pushed). No source change since 2026.06.12.1; globalArguments schema is unchanged, so this is a no-op data migration.",
+      description: "No change to global arguments or stored data.",
       upgradeAttributes: (
         old: Record<string, unknown>,
       ): Record<string, unknown> => old,
@@ -1518,7 +1521,7 @@ export const model = {
   methods: {
     version: {
       description:
-        "Read Arcane's version (GET /version, works on v1 and v2) — preflight/verify for manager upgrades",
+        "Read Arcane's version (GET /version); use it before and after upgrading the manager",
       arguments: z.object({}),
       execute: async (
         _args,
@@ -2025,7 +2028,7 @@ export const model = {
 
     project_create: {
       description:
-        "Create a compose project in Arcane (direct mode), pushing compose content via the API. Validates locally first (fail-closed unless validate:false).",
+        "Create a compose project in Arcane (direct mode), pushing compose content via the API. Validates locally first and stops if validation fails or cannot run.",
       arguments: ProjectCreateArgs,
       execute: async (
         args: z.infer<typeof ProjectCreateArgs>,
@@ -2033,9 +2036,7 @@ export const model = {
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const g: GlobalArgsT = context.globalArgs;
         const { composeContent, envContent } = await resolveComposeInput(args);
-        if (args.validate !== false) {
-          await composeConfigValidate(composeContent, envContent);
-        }
+        await composeConfigValidate(composeContent, envContent);
         const body: Json = { name: args.name, composeContent };
         if (envContent !== undefined) body.envContent = envContent;
         logInfo(context, "Creating Arcane project", { name: args.name });
@@ -2056,7 +2057,7 @@ export const model = {
 
     project_update: {
       description:
-        "Update a compose project's content in Arcane (direct mode). Validates locally first (fail-closed unless validate:false). Does NOT redeploy — use project_redeploy or project_deploy.",
+        "Update a compose project's content in Arcane (direct mode). Validates locally first and stops if validation fails or cannot run. Does NOT redeploy — use project_redeploy or project_deploy.",
       arguments: ProjectUpdateArgs,
       execute: async (
         args: z.infer<typeof ProjectUpdateArgs>,
@@ -2065,9 +2066,7 @@ export const model = {
         const g: GlobalArgsT = context.globalArgs;
         const id = await resolveProjectId(g, args.name);
         const { composeContent, envContent } = await resolveComposeInput(args);
-        if (args.validate !== false) {
-          await composeConfigValidate(composeContent, envContent);
-        }
+        await composeConfigValidate(composeContent, envContent);
         const body: Json = { composeContent };
         if (envContent !== undefined) body.envContent = envContent;
         logInfo(context, "Updating Arcane project", { name: args.name, id });
@@ -2181,7 +2180,13 @@ export const model = {
               "no matching sync found; redeploying current content",
             );
           }
-          await arcane(g, "POST", `${ENV(g)}/projects/${id}/redeploy`);
+          await arcane(
+            g,
+            "POST",
+            `${ENV(g)}/projects/${id}/redeploy`,
+            undefined,
+            OPERATION_TIMEOUT_MS,
+          );
           const health = await pollProjectHealthy(
             g,
             id,
@@ -2244,7 +2249,13 @@ export const model = {
             await arcane(g, "PUT", `${ENV(g)}/projects/${id}`, body);
             await record("update", true, 200, "updated compose content");
           }
-          await arcane(g, "POST", `${ENV(g)}/projects/${id}/redeploy`);
+          await arcane(
+            g,
+            "POST",
+            `${ENV(g)}/projects/${id}/redeploy`,
+            undefined,
+            OPERATION_TIMEOUT_MS,
+          );
           await record("redeploy", true, 200, "redeploy issued");
           const health = await pollProjectHealthy(
             g,
@@ -2292,7 +2303,11 @@ export const model = {
         }
         if (isFirstDeploy) {
           if (id) {
-            await deleteIfPresent(g, `${ENV(g)}/projects/${id}/destroy`);
+            await deleteIfPresent(
+              g,
+              `${ENV(g)}/projects/${id}/destroy`,
+              OPERATION_TIMEOUT_MS,
+            );
             await record(
               "rollback",
               true,
@@ -2333,7 +2348,13 @@ export const model = {
           const rb: Json = { composeContent: priorCompose };
           if (priorEnv !== undefined) rb.envContent = priorEnv;
           await arcane(g, "PUT", `${ENV(g)}/projects/${id}`, rb);
-          await arcane(g, "POST", `${ENV(g)}/projects/${id}/redeploy`);
+          await arcane(
+            g,
+            "POST",
+            `${ENV(g)}/projects/${id}/redeploy`,
+            undefined,
+            OPERATION_TIMEOUT_MS,
+          );
           const rbHealth = await pollProjectHealthy(
             g,
             id,
@@ -2369,7 +2390,7 @@ export const model = {
     project_down: makeLifecycle("down", "POST", "/down"),
     project_redeploy: makeLifecycle("redeploy", "POST", "/redeploy"),
     project_pull: makeLifecycle("pull", "POST", "/pull"),
-    project_destroy: makeLifecycle("destroy", "DELETE", "/destroy", true),
+    project_destroy: makeLifecycle("destroy", "DELETE", "/destroy"),
 
     // --- swarm secret_ / config_ CRUD (rotation lives in secret_rotate / config_rotate) ---
     ...makeSwarmObject("secret"),
@@ -2614,7 +2635,7 @@ export const model = {
 
     swarm_stack_deploy: {
       description:
-        "Validated deploy of a swarm stack: render (fail-closed, guardrail #2) -> POST the stack -> poll service convergence. " +
+        "Validated deploy of a swarm stack: render (any render error stops the deploy) -> POST the stack -> poll service convergence. " +
         "Records per-step operation-results + a swarm-stack resource. A non-converging deploy is surfaced (not force-removed, not auto-rolled-back).",
       arguments: SwarmStackDeployArgs,
       execute: async (
@@ -2649,7 +2670,7 @@ export const model = {
 
         const { composeContent, envContent } = await resolveComposeInput(args);
 
-        // 1. Validate via render — MUST pass before deploy (guardrail #2). A render
+        // 1. Validate via render; it must pass before the deploy. A render
         //    error throws from arcane() (4xx) and aborts the deploy.
         const renderBody: Json = { name, composeContent };
         if (envContent !== undefined) renderBody.envContent = envContent;
@@ -2736,7 +2757,7 @@ export const model = {
       description:
         "Remove a swarm stack by name (docker stack rm via Arcane) and confirm the stored record is cleared. " +
         "Arcane's first DELETE tears down services but RETAINS the stack record, so this polls GET until 404, re-issuing DELETE until the record is gone (the teardown two-call bug). " +
-        "In-use conflicts are surfaced by Arcane, never forced (guardrail #5).",
+        "In-use conflicts are surfaced by Arcane, never forced.",
       arguments: SwarmStackRemoveArgs,
       execute: async (
         args: z.infer<typeof SwarmStackRemoveArgs>,
@@ -2835,7 +2856,7 @@ export const model = {
 
     volume_remove: {
       description:
-        "Remove a docker volume by name. Idempotent (404 = already gone). An in-use volume returns 409 and is surfaced, NOT forced — unless force:true, which bypasses the in-use guard (discouraged, guardrail #5 — risks data loss).",
+        "Remove a docker volume by name. Idempotent: a volume that is already gone counts as removed. An in-use volume is refused, not forced, unless force:true, which bypasses Docker's in-use check and risks data loss.",
       arguments: VolumeRemoveArgs,
       execute: async (
         args: z.infer<typeof VolumeRemoveArgs>,
@@ -2855,11 +2876,11 @@ export const model = {
           );
         } catch (e) {
           const msg = e instanceof Error ? e.message : String(e);
-          if (/HTTP 404/.test(msg)) {
-            // already gone — idempotent success
-          } else if (/HTTP 409/.test(msg) || /in use/i.test(msg)) {
-            // Arcane surfaces "volume is in use" as 409 OR 500 — treat both as the
-            // in-use guard (often a stopped container still references it).
+          // Arcane returns every delete failure as a 500 carrying Docker's
+          // message, so the message is the only way to tell the cases apart.
+          if (/no such volume/i.test(msg)) {
+            // already gone
+          } else if (/in use/i.test(msg)) {
             throw new Error(
               `volume '${args.name}' is in use — not removed (set force:true only if you are certain it is safe). ${msg}`,
             );
@@ -2958,14 +2979,13 @@ export const model = {
 
 /**
  * Build a fan-out project-lifecycle method. Resolves each name to a project id,
- * issues the action, and records an operation-result per target. Destructive
- * actions require an explicit, non-empty name list (no wildcard).
+ * issues the action, and records an operation-result per target. The argument
+ * schema requires at least one name, so there is no "all projects" form.
  */
 function makeLifecycle(
   operation: string,
   httpMethod: HttpMethod,
   suffix: string,
-  destructive = false,
 ): MethodDefinition<z.ZodTypeAny, GlobalArgsT> {
   return {
     description:
@@ -2977,9 +2997,6 @@ function makeLifecycle(
     ): Promise<{ dataHandles: DataHandle[] }> => {
       const g: GlobalArgsT = context.globalArgs;
       const names: string[] = args.names;
-      if (destructive && names.length === 0) {
-        throw new Error(`${operation} requires explicit project names`);
-      }
       logInfo(context, `Running project ${operation}`, { names });
       const projects = coerceList(
         await arcane(g, "GET", `${ENV(g)}/projects?limit=-1`),
@@ -2998,12 +3015,14 @@ function makeLifecycle(
       for (const name of names) {
         const id = asString(pick(byName.get(name)!, "id")) ?? "";
         const path = `${ENV(g)}/projects/${id}${suffix}`;
-        if (destructive && httpMethod === "DELETE") {
-          await deleteIfPresent(g, path);
+        if (httpMethod === "DELETE") {
+          await deleteIfPresent(g, path, OPERATION_TIMEOUT_MS);
         } else {
           // up and pull stream NDJSON: the 200 arrives before the work runs and
           // a failure is an error line in the body, so the status alone shows nothing.
-          const failure = streamError(await arcane(g, httpMethod, path));
+          const failure = streamError(
+            await arcane(g, httpMethod, path, undefined, OPERATION_TIMEOUT_MS),
+          );
           if (failure !== undefined) {
             throw new Error(
               `Arcane ${operation} of '${name}' failed: ${failure}`,
@@ -3122,7 +3141,7 @@ function makeSwarmObject(
     },
     [`${kind}_remove`]: {
       description:
-        `Remove a swarm ${kind} by name. Docker blocks removal of an in-use ${kind} (409); that conflict is surfaced, never forced (guardrail #5).`,
+        `Remove a swarm ${kind} by name. Docker blocks removal of an in-use ${kind} (409); that conflict is surfaced, never forced.`,
       arguments: NameArg,
       execute: async (
         args: z.infer<typeof NameArg>,

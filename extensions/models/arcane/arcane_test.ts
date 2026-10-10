@@ -171,9 +171,8 @@ Deno.test("serviceConvergence classifies rolling-update states", () => {
 // These exercise the branching of project_deploy and secret_rotate against scripted
 // API responses, using the __setArcaneTransport / __setComposeValidator test seams.
 // A minimal fake context replaces swamp's runtime (only globalArgs, logger, and
-// writeResource are used by these methods). Calling execute() directly bypasses
-// the zod argument parsing swamp does at runtime, so defaults (rollback, removeOld,
-// timeouts) are passed explicitly here.
+// writeResource are used by these methods). method() parses the arguments
+// through the method's schema first, as swamp does, so defaults apply.
 
 type Call = { method: string; path: string; body?: unknown };
 type WriteCall = {
@@ -218,13 +217,17 @@ function makeContext(globalArgs: Record<string, unknown>) {
 }
 
 type MethodDef = {
+  arguments: { parse: (v: unknown) => unknown };
   execute: (
     args: unknown,
     context: unknown,
   ) => Promise<{ dataHandles: unknown[] }>;
 };
-function method(name: string): MethodDef {
-  return (model.methods as unknown as Record<string, MethodDef>)[name];
+function method(name: string): Pick<MethodDef, "execute"> {
+  const m = (model.methods as unknown as Record<string, MethodDef>)[name];
+  return {
+    execute: (args, context) => m.execute(m.arguments.parse(args), context),
+  };
 }
 
 const bodyOf = (c: Call): Record<string, unknown> =>
@@ -1820,6 +1823,91 @@ Deno.test("volume_list asks Arcane for every volume, not the first page", async 
     assertEquals(paths, ["/environments/0/volumes?limit=-1"]);
     assertEquals(written.length, 1);
   } finally {
+    __setArcaneTransport(null);
+  }
+});
+
+// ─────────────────────────── volume_remove ───────────────────────────
+
+// Arcane wraps every delete failure as a 500 carrying Docker's message.
+Deno.test("volume_remove: a volume that is already gone counts as removed", async () => {
+  __setArcaneTransport(() => {
+    throw new Error(
+      "Arcane DELETE /volumes/v1 -> HTTP 500: failed to remove volume: get v1: no such volume",
+    );
+  });
+  try {
+    const { context, written } = makeContext(TEST_GLOBALS);
+    await method("volume_remove").execute({ name: "v1" }, context);
+    assertEquals(written[0].data.action, "deleted");
+  } finally {
+    __setArcaneTransport(null);
+  }
+});
+
+Deno.test("volume_remove: an in-use volume is refused, not forced", async () => {
+  const paths: string[] = [];
+  __setArcaneTransport((_g, _m, p) => {
+    paths.push(p);
+    throw new Error(
+      "Arcane DELETE /volumes/v1 -> HTTP 500: failed to remove volume: volume is in use",
+    );
+  });
+  try {
+    const { context } = makeContext(TEST_GLOBALS);
+    let message = "";
+    try {
+      await method("volume_remove").execute({ name: "v1" }, context);
+    } catch (e) {
+      message = (e as Error).message;
+    }
+    assert(/is in use — not removed/.test(message), message);
+    assertEquals(paths, ["/environments/0/volumes/v1"], "no force=true");
+  } finally {
+    __setArcaneTransport(null);
+  }
+});
+
+// ─────────────────────────── timeouts and validation ───────────────────────────
+
+Deno.test("redeploy and lifecycle calls get the long timeout; reads keep the short one", async () => {
+  const timeouts: Record<string, number | undefined> = {};
+  __setArcaneTransport((_g, m, p, _b, timeoutMs) => {
+    timeouts[`${m} ${p}`] = timeoutMs;
+    if (p.endsWith("/projects?limit=-1")) {
+      return Promise.resolve([{ id: "p1", name: "web" }]);
+    }
+    return Promise.resolve("");
+  });
+  try {
+    const { context } = makeContext(TEST_GLOBALS);
+    await method("project_redeploy").execute({ names: ["web"] }, context);
+    assertEquals(timeouts["GET /environments/0/projects?limit=-1"], 30_000);
+    assertEquals(
+      timeouts["POST /environments/0/projects/p1/redeploy"],
+      10 * 60_000,
+    );
+  } finally {
+    __setArcaneTransport(null);
+  }
+});
+
+Deno.test("project_create always validates; validate:false is not an option", async () => {
+  let validated = false;
+  __setComposeValidator(() => {
+    validated = true;
+    return Promise.resolve({ version: "v2.test" });
+  });
+  __setArcaneTransport(() => Promise.resolve({ data: { id: "p1" } }));
+  try {
+    const { context } = makeContext(TEST_GLOBALS);
+    await method("project_create").execute(
+      { name: "web", composeContent: "services: {}\n", validate: false },
+      context,
+    );
+    assert(validated, "the compose file must be validated");
+  } finally {
+    __setComposeValidator(null);
     __setArcaneTransport(null);
   }
 });
