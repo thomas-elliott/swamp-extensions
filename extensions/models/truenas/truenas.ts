@@ -14,11 +14,10 @@ import type {
  * Targets 25.04 ("Fangtooth"), which has no REST API; the WebSocket RPC is the
  * supported API.
  *
- * SCOPE: built for the homelab **service-exposure** hardening (R28): read what is
- * published where, then restrict it. The set of mutating methods is deliberately small:
+ * SCOPE: read what a TrueNAS host exposes, then restrict it. The set of mutating
+ * methods is deliberately small:
  *   - app port binding (`app_set_port_bind`): switch a catalog app's port between
- *     `published` (on the host) and `exposed` (container-internal only); this is how
- *     lldap's plaintext LDAP/LDAPS ports are closed.
+ *     `published` (on the host) and `exposed` (container-internal only).
  *   - NFS share access (`nfs_share_set_access`): set the per-share authorized
  *     `networks`/`hosts` allowlist (the only supported per-client access control).
  *   - SMB share access (`smb_share_set_access`): set per-share `hostsallow`/`hostsdeny`.
@@ -29,7 +28,7 @@ import type {
  * start/stop. `filesystem_list` reads a directory and `replication_list` reads task
  * definitions; neither writes, and no verb runs or edits a replication task. Service
  * start/stop is an explicit gap because a stopped ssh/nfs service risks a lockout or
- * outage. Every mutating verb verifies its target by id/name first (CLAUDE.md rule 5);
+ * outage. Every mutating verb verifies its target by id/name first;
  * the set-access verbs are reversible (re-run with the prior values) and the delete
  * verbs record the removed config so the share can be re-created.
  *
@@ -159,7 +158,8 @@ const SmbShare = z.object({
       "moving the share to NO_PRESET (smb_share_set_access does this automatically).",
   ),
   unrestricted: z.boolean().describe(
-    "True when hostsallow is empty (no host allowlist in force)",
+    "True when hostsallow is empty (no host allowlist in force). hostsdeny does " +
+      "not count: it still admits every host it does not name.",
   ),
   action: Action,
   timestamp: z.string(),
@@ -258,8 +258,8 @@ const BindableIp = z.object({
 const NetworkInfo = z.object({
   bindableIps: z.array(BindableIp).describe(
     'IPs an app port can publish on (interface.ip_in_use). "0.0.0.0" is always ' +
-      "implicitly available; a tailscale IP appears ONLY if tailscale0 is a host " +
-      "interface (it is not on this NAS — the tailscale app owns it).",
+      "implicitly available. A Tailscale IP appears only if tailscale0 is a host " +
+      "interface, which it is not when the Tailscale app provides it.",
   ),
   interfaces: z.array(z.object({
     name: z.string(),
@@ -287,12 +287,12 @@ const ExposureAudit = z.object({
   version: z.string(),
   /** Every app port with bindMode=published. */
   publishedPorts: z.array(ExposedPort),
-  /** NFS shares with no networks AND no hosts restriction. */
+  /** Enabled NFS shares with no networks AND no hosts restriction. */
   unrestrictedNfsShares: z.array(z.string()),
   /** Enabled SMB shares with an empty hostsallow. */
   unrestrictedSmbShares: z.array(z.string()),
   flags: z.object({
-    /** Published ports bound to 0.0.0.0 (reachable on every interface incl. tailnet). */
+    /** Published ports bound to 0.0.0.0 (reachable on every interface). */
     portsOnAllInterfaces: z.array(z.number()),
     /** Plaintext LDAP (389) published anywhere. */
     plaintextLdapPublished: z.boolean(),
@@ -430,7 +430,7 @@ export function websocketUrl(endpoint: string): string {
       `refusing non-TLS endpoint ${
         JSON.stringify(endpoint)
       }: TrueNAS revokes an ` +
-        "API key sent over cleartext — use wss:// (or https://), never ws:///http://",
+        "API key sent over cleartext — use wss:// (or https://), never ws:// or http://",
     );
   }
   if (u.pathname === "/" || u.pathname === "") u.pathname = "/api/current";
@@ -645,6 +645,9 @@ async function callJob(
     const jobs = asArr(
       await session.call("core.get_jobs", [[["id", "=", jobId]]]),
     );
+    if (jobs.length === 0) {
+      throw new Error(`${method} job ${jobId} not found in core.get_jobs`);
+    }
     const job = asObj(jobs[0]);
     const state = String(job.state ?? "");
     if (JOB_DONE.has(state)) {
@@ -1198,8 +1201,7 @@ export const model = {
       garbageCollection: 5,
     },
     "exposure-audit": {
-      description:
-        "Service-exposure roll-up across apps/shares/services (R28 source)",
+      description: "Service-exposure roll-up across apps/shares/services",
       schema: ExposureAudit,
       lifetime: "infinite",
       garbageCollection: 10,
@@ -1319,7 +1321,9 @@ export const model = {
             handles.push(
               await context.writeResource(
                 "nfs-share",
-                String(shaped.id),
+                // Prefixed: TrueNAS numbers NFS shares, SMB shares and replication
+                // tasks separately, and swamp names data per model, not per spec.
+                `nfs-${shaped.id}`,
                 shaped,
               ),
             );
@@ -1351,7 +1355,7 @@ export const model = {
             handles.push(
               await context.writeResource(
                 "smb-share",
-                String(shaped.id),
+                `smb-${shaped.id}`,
                 shaped,
               ),
             );
@@ -1421,14 +1425,6 @@ export const model = {
             await session.call("system.general.config", []),
           );
           const ts = new Date().toISOString();
-          const bindableIps = inUse.map((r) => {
-            const o = asObj(r);
-            return {
-              address: String(o.address ?? ""),
-              netmask: nullableNum(o.netmask),
-              interface: asStr(o.interface),
-            };
-          });
           const interfaces = ifaces.map((r) => {
             const o = asObj(r);
             const state = asObj(o.state);
@@ -1439,6 +1435,20 @@ export const model = {
               name: String(o.name ?? o.id ?? ""),
               type: asStr(o.type),
               addresses: addrs,
+            };
+          });
+          // ip_in_use does not say which interface holds an address, so look
+          // it up in the interface list.
+          const interfaceOf = new Map(
+            interfaces.flatMap((i) => i.addresses.map((a) => [a, i.name])),
+          );
+          const bindableIps = inUse.map((r) => {
+            const o = asObj(r);
+            const address = String(o.address ?? "");
+            return {
+              address,
+              netmask: nullableNum(o.netmask),
+              interface: interfaceOf.get(address),
             };
           });
           const handle = await context.writeResource("network-info", "main", {
@@ -1601,9 +1611,7 @@ export const model = {
           for (const raw of rows) {
             const shaped = shapeReplication(raw, ts);
             handles.push(
-              // Prefixed: TrueNAS id sequences are PER-TABLE, so a bare id would
-              // collide with the nfs-share/smb-share instances in this model's
-              // shared data namespace and silently overwrite them.
+              // Prefixed, like the shares: see nfs_share_list.
               await context.writeResource(
                 "replication-task",
                 `repl-${shaped.id}`,
@@ -1622,7 +1630,7 @@ export const model = {
       description:
         "Roll up service exposure across apps/NFS/SMB/services into one report " +
         "(published ports, unrestricted shares, 0.0.0.0 binds, plaintext-LDAP flag). " +
-        "Read-only — the R28 data source.",
+        "Read-only.",
       arguments: Empty,
       execute: async (
         _rawArgs,
@@ -1674,7 +1682,7 @@ export const model = {
           publishedPorts.sort((a, b) => a.portNumber - b.portNumber);
 
           const unrestrictedNfs = nfs.map((r) => shapeNfs(r, ts))
-            .filter((s) => s.unrestricted).map((s) => s.path);
+            .filter((s) => s.enabled && s.unrestricted).map((s) => s.path);
           const unrestrictedSmb = smb.map((r) => shapeSmb(r, ts))
             .filter((s) => s.enabled && s.unrestricted).map((s) => s.name);
           const nonWildcard = inUse
@@ -1963,7 +1971,7 @@ export const model = {
           if (sameStrArr(a.networks, prevNames)) {
             const handle = await context.writeResource(
               "app-networks-result",
-              a.app,
+              `${a.app}-networks`,
               {
                 app: a.app,
                 previousNetworks: prevNames,
@@ -2000,7 +2008,7 @@ export const model = {
             .map((n) => String(asObj(n).name));
           const handle = await context.writeResource(
             "app-networks-result",
-            a.app,
+            `${a.app}-networks`,
             {
               app: a.app,
               previousNetworks: prevNames,
@@ -2044,7 +2052,7 @@ export const model = {
           ) {
             const handle = await context.writeResource(
               "nfs-share-result",
-              String(id),
+              `nfs-result-${id}`,
               {
                 id,
                 path: String(share.path ?? ""),
@@ -2070,7 +2078,7 @@ export const model = {
           const after = await resolveNfs(session, { id });
           const handle = await context.writeResource(
             "nfs-share-result",
-            String(id),
+            `nfs-result-${id}`,
             {
               id,
               path: String(after.path ?? share.path ?? ""),
@@ -2115,7 +2123,7 @@ export const model = {
             // slashes, which an instance name cannot.
             const handle = await context.writeResource(
               "nfs-share-result",
-              a.id !== undefined ? String(a.id) : pathKey(a.path ?? ""),
+              `nfs-result-${a.id ?? pathKey(a.path ?? "")}`,
               {
                 id: a.id ?? 0,
                 path: a.path ?? "",
@@ -2150,7 +2158,7 @@ export const model = {
           // The removed config is captured in previous* so the export can be re-created.
           const handle = await context.writeResource(
             "nfs-share-result",
-            String(id),
+            `nfs-result-${id}`,
             {
               id,
               path,
@@ -2205,7 +2213,7 @@ export const model = {
           ) {
             const handle = await context.writeResource(
               "smb-share-result",
-              String(id),
+              `smb-result-${id}`,
               {
                 id,
                 name: String(share.name ?? ""),
@@ -2241,7 +2249,7 @@ export const model = {
           const after = await resolveSmb(session, { id });
           const handle = await context.writeResource(
             "smb-share-result",
-            String(id),
+            `smb-result-${id}`,
             {
               id,
               name: String(after.name ?? share.name ?? ""),
@@ -2288,7 +2296,7 @@ export const model = {
             // hold characters an instance name cannot.
             const handle = await context.writeResource(
               "smb-share-result",
-              a.id !== undefined ? String(a.id) : pathKey(a.name ?? ""),
+              `smb-result-${a.id ?? pathKey(a.name ?? "")}`,
               {
                 id: a.id ?? 0,
                 name: a.name ?? "",
@@ -2325,7 +2333,7 @@ export const model = {
           // The removed config is captured in previous* so the share can be re-created.
           const handle = await context.writeResource(
             "smb-share-result",
-            String(id),
+            `smb-result-${id}`,
             {
               id,
               name,
