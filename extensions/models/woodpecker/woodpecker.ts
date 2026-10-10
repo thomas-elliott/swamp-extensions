@@ -390,6 +390,41 @@ async function callTolerant(
   return r;
 }
 
+/**
+ * The server clamps `perPage` to this (`session.Pagination`, `maxPageSize`),
+ * and a request without `page` is silently page 1. So a bare GET on a list
+ * endpoint returns at most 50 rows and nothing says there were more.
+ */
+const PAGE_SIZE = 50;
+
+/**
+ * Fetch every row of a paginated list endpoint, walking `page=1,2,...` until a
+ * page comes back short. `limit` stops early (and trims) when the caller only
+ * wants the first N.
+ */
+async function pageAll(
+  g: GlobalArgsT,
+  path: string,
+  limit?: number,
+): Promise<Json[]> {
+  const sep = path.includes("?") ? "&" : "?";
+  const rows: Json[] = [];
+  for (let page = 1;; page++) {
+    const perPage = limit === undefined
+      ? PAGE_SIZE
+      : Math.min(PAGE_SIZE, limit - rows.length);
+    const r = await call(g, {
+      method: "GET",
+      path: `${path}${sep}page=${page}&perPage=${perPage}`,
+    });
+    const batch = asArray(r.body);
+    rows.push(...batch);
+    if (batch.length < perPage) break;
+    if (limit !== undefined && rows.length >= limit) break;
+  }
+  return limit === undefined ? rows : rows.slice(0, limit);
+}
+
 // ─────────────────────────── helpers ───────────────────────────
 
 type Ctx = MethodContext<GlobalArgsT>;
@@ -538,9 +573,8 @@ async function tokenForge(
 }
 
 /** Every forge registered on the server (`GET /api/forges`). */
-async function listForges(g: GlobalArgsT): Promise<Json[]> {
-  const r = await call(g, { method: "GET", path: "/api/forges" });
-  return asArray(r.body);
+function listForges(g: GlobalArgsT): Promise<Json[]> {
+  return pageAll(g, "/api/forges");
 }
 
 /**
@@ -727,7 +761,12 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/** Terminal pipeline statuses — a wait loop stops on any of these. */
+/**
+ * Statuses on which a wait loop stops. The full upstream set is in
+ * `server/model/const.go`; a user cancel lands as `killed`, there is no
+ * `canceled`. `blocked` is included because a pipeline awaiting approval
+ * will not move without a human, so polling it only runs the clock down.
+ */
 const TERMINAL = new Set([
   "success",
   "failure",
@@ -740,6 +779,13 @@ const TERMINAL = new Set([
 function isTerminal(status: string): boolean {
   return TERMINAL.has(status);
 }
+
+/**
+ * Statuses `POST .../cancel` accepts (`server/pipeline/cancel.go`); anything
+ * else is a 400. Kept separate from {@link TERMINAL} because `blocked` is in
+ * both: finished as far as waiting goes, but still cancellable.
+ */
+const CANCELLABLE = new Set(["running", "pending", "blocked"]);
 
 /** Convert a unix-seconds timestamp to ISO, or undefined if absent/zero. */
 function unixToIso(v: unknown): string | undefined {
@@ -894,20 +940,30 @@ const RepoAvailableArgs = z.object({
   ),
 });
 
+/**
+ * A boolean that refuses to guess. `z.coerce.boolean()` runs `Boolean(v)`, so
+ * `"0"` and `"False"` come out true; on the trust flags that would hand a
+ * pipeline the host network and docker socket by typo.
+ */
+const StrictBool = z.union(
+  [z.boolean(), z.literal("true"), z.literal("false")],
+  { error: 'expected true or false (or the strings "true" / "false")' },
+).transform((v) => v === true || v === "true");
+
 /** The shared repo-settings fields used by enable/update. */
 const RepoConfigShape = {
-  trusted: z.coerce.boolean().optional().describe(
+  trusted: StrictBool.optional().describe(
     "Convenience: set ALL three trust capabilities (network/volumes/security) " +
       "to this value. Needed for steps that mount the host docker socket. " +
       "Granular flags below override it.",
   ),
-  trustedNetwork: z.coerce.boolean().optional().describe(
+  trustedNetwork: StrictBool.optional().describe(
     "Trust capability: host network access.",
   ),
-  trustedVolumes: z.coerce.boolean().optional().describe(
+  trustedVolumes: StrictBool.optional().describe(
     "Trust capability: host volume mounts (e.g. /var/run/docker.sock).",
   ),
-  trustedSecurity: z.coerce.boolean().optional().describe(
+  trustedSecurity: StrictBool.optional().describe(
     "Trust capability: relaxed security options.",
   ),
   timeout: z.coerce.number().int().optional().describe(
@@ -1179,9 +1235,9 @@ export const model = {
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const g = context.globalArgs;
         logInfo(context, "Listing enabled repos");
-        const r = await call(g, { method: "GET", path: "/api/repos" });
+        const repos = await pageAll(g, "/api/repos");
         const handles: DataHandle[] = [];
-        for (const repo of asArray(r.body)) {
+        for (const repo of repos) {
           handles.push(
             await context.writeResource(
               "repo",
@@ -1322,12 +1378,9 @@ export const model = {
         const a = OrgRef.parse(rawArgs);
         const g = context.globalArgs;
         const orgId = await resolveOrgId(g, a.owner);
-        const r = await call(g, {
-          method: "GET",
-          path: `/api/orgs/${orgId}/secrets`,
-        });
+        const secrets = await pageAll(g, `/api/orgs/${orgId}/secrets`);
         const handles: DataHandle[] = [];
-        for (const s of asArray(r.body)) {
+        for (const s of secrets) {
           handles.push(
             await writeSecret(context, "org", a.owner, s, "observed"),
           );
@@ -1349,12 +1402,9 @@ export const model = {
         const id = await resolveRepoId(g, a.repo);
         const repo = await getRepo(g, id);
         const full = String(repo.full_name ?? a.repo);
-        const r = await call(g, {
-          method: "GET",
-          path: `/api/repos/${id}/secrets`,
-        });
+        const secrets = await pageAll(g, `/api/repos/${id}/secrets`);
         const handles: DataHandle[] = [];
-        for (const s of asArray(r.body)) {
+        for (const s of secrets) {
           handles.push(await writeSecret(context, "repo", full, s, "observed"));
         }
         return { dataHandles: handles };
@@ -1370,12 +1420,13 @@ export const model = {
         const a = PipelineListArgs.parse(rawArgs);
         const g = context.globalArgs;
         const id = await resolveRepoId(g, a.repo);
-        const r = await call(g, {
-          method: "GET",
-          path: `/api/repos/${id}/pipelines?perPage=${a.limit}`,
-        });
+        const pipelines = await pageAll(
+          g,
+          `/api/repos/${id}/pipelines`,
+          a.limit,
+        );
         const handles: DataHandle[] = [];
-        for (const p of asArray(r.body)) {
+        for (const p of pipelines) {
           handles.push(
             await context.writeResource(
               "pipeline",
@@ -1554,11 +1605,11 @@ export const model = {
         const a = StatusAllArgs.parse(rawArgs);
         const g = context.globalArgs;
         logInfo(context, "Collecting fleet pipeline status");
-        const r = await call(g, { method: "GET", path: "/api/repos" });
+        const repos = await pageAll(g, "/api/repos");
         const match = a.match?.toLowerCase();
         const ts = nowIso();
         const handles: DataHandle[] = [];
-        for (const repo of asArray(r.body)) {
+        for (const repo of repos) {
           const full = String(repo.full_name ?? "");
           if (match && !full.toLowerCase().includes(match)) continue;
           const repoId = Number(repo.id ?? 0);
@@ -1954,7 +2005,7 @@ export const model = {
         const number = await resolveNumber(g, id, a.number);
         const before = await getPipeline(g, id, number);
         const status = String(before.status ?? "");
-        if (isTerminal(status)) {
+        if (!CANCELLABLE.has(status)) {
           logInfo(context, "Pipeline already finished; nothing to cancel", {
             repo: a.repo,
             number,
@@ -2046,9 +2097,9 @@ export const model = {
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const g = context.globalArgs;
         logInfo(context, "Listing agents");
-        const r = await call(g, { method: "GET", path: "/api/agents" });
+        const agents = await pageAll(g, "/api/agents");
         const handles: DataHandle[] = [];
-        for (const ag of asArray(r.body)) {
+        for (const ag of agents) {
           handles.push(
             await context.writeResource(
               "agent",
@@ -2129,12 +2180,9 @@ export const model = {
         const a = RepoRef.parse(rawArgs);
         const g = context.globalArgs;
         const id = await resolveRepoId(g, a.repo);
-        const r = await call(g, {
-          method: "GET",
-          path: `/api/repos/${id}/cron`,
-        });
+        const crons = await pageAll(g, `/api/repos/${id}/cron`);
         const handles: DataHandle[] = [];
-        for (const c of asArray(r.body)) {
+        for (const c of crons) {
           handles.push(
             await context.writeResource(
               "cron",
@@ -2158,11 +2206,7 @@ export const model = {
         const a = CronSetArgs.parse(rawArgs);
         const g = context.globalArgs;
         const id = await resolveRepoId(g, a.repo);
-        const list = await call(g, {
-          method: "GET",
-          path: `/api/repos/${id}/cron`,
-        });
-        const existing = asArray(list.body).find((c) =>
+        const existing = (await pageAll(g, `/api/repos/${id}/cron`)).find((c) =>
           String(c.name ?? "") === a.name
         );
         const payload: Json = { name: a.name, schedule: a.schedule };
@@ -2214,11 +2258,7 @@ export const model = {
         const a = CronDeleteArgs.parse(rawArgs);
         const g = context.globalArgs;
         const id = await resolveRepoId(g, a.repo);
-        const list = await call(g, {
-          method: "GET",
-          path: `/api/repos/${id}/cron`,
-        });
-        const existing = asArray(list.body).find((c) =>
+        const existing = (await pageAll(g, `/api/repos/${id}/cron`)).find((c) =>
           String(c.name ?? "") === a.name
         );
         if (!existing) {

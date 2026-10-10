@@ -452,7 +452,7 @@ Deno.test("repo_secret_list: secret instance name sanitizes the repo full name",
     if (c.path === "/api/repos/1") {
       return Promise.resolve({ status: 200, body: repoObj() });
     }
-    if (c.path === "/api/repos/1/secrets") {
+    if (c.path.startsWith("/api/repos/1/secrets?")) {
       return Promise.resolve({
         status: 200,
         body: ([{
@@ -636,7 +636,7 @@ Deno.test("pipeline_wait: terminal on first poll -> no wait, writes pipeline + s
 
 Deno.test("status_all: per-repo latest; 404 latest -> status 'none'", async () => {
   const { caller } = makeFakeApi((c) => {
-    if (c.path === "/api/repos") {
+    if (c.path.startsWith("/api/repos?")) {
       return {
         status: 200,
         body: ([
@@ -726,7 +726,7 @@ Deno.test("pipeline_restart: POSTs to the pipeline; action 'restarted'", async (
 Deno.test("cron_set: no existing -> POST create; identical -> unchanged (no write)", async () => {
   // create
   let { caller, calls } = makeFakeApi((c) => {
-    if (c.method === "GET" && c.path === "/api/repos/1/cron") {
+    if (c.method === "GET" && c.path.startsWith("/api/repos/1/cron?")) {
       return { status: 200, body: ([] as unknown) as Record<string, unknown> };
     }
     if (c.method === "POST" && c.path === "/api/repos/1/cron") {
@@ -751,7 +751,7 @@ Deno.test("cron_set: no existing -> POST create; identical -> unchanged (no writ
   }
   // unchanged
   ({ caller, calls } = makeFakeApi((c) => {
-    if (c.method === "GET" && c.path === "/api/repos/1/cron") {
+    if (c.method === "GET" && c.path.startsWith("/api/repos/1/cron?")) {
       return {
         status: 200,
         body: ([{
@@ -783,7 +783,7 @@ Deno.test("cron_set: no existing -> POST create; identical -> unchanged (no writ
 
 Deno.test("cron_delete: already-absent is an idempotent no-op (no DELETE)", async () => {
   const { caller, calls } = makeFakeApi((c) => {
-    if (c.method === "GET" && c.path === "/api/repos/1/cron") {
+    if (c.method === "GET" && c.path.startsWith("/api/repos/1/cron?")) {
       return { status: 200, body: ([] as unknown) as Record<string, unknown> };
     }
     return undefined;
@@ -840,7 +840,7 @@ Deno.test("repo_enable: a cross-forge repo explains the forge binding", async ()
       };
     }
     if (c.path === "/api/user") return { login: "thomas-elliott", forge_id: 1 };
-    if (c.path === "/api/forges") {
+    if (c.path.startsWith("/api/forges?")) {
       return {
         status: 200,
         body: ([
@@ -887,7 +887,7 @@ Deno.test("repo_enable: a broken diagnostic never masks the real error", async (
 Deno.test("forge_list: flags the token's own forge", async () => {
   const { caller } = makeFakeApi((c) => {
     if (c.path === "/api/user") return { login: "telliott", forge_id: 2 };
-    if (c.path === "/api/forges") {
+    if (c.path.startsWith("/api/forges?")) {
       return {
         status: 200,
         body: ([
@@ -956,6 +956,150 @@ Deno.test("reachable check applies the schema defaults to globalArgs", async () 
     });
     assertEquals(res.pass, true);
     assertEquals(seenTimeout, 30000);
+  } finally {
+    __setCaller(null);
+  }
+});
+
+// ─────────────────────────── pagination ───────────────────────────
+
+Deno.test("repo_secret_list: walks pages until a short one (52 secrets over 2 pages)", async () => {
+  const secret = (i: number) => ({ id: i, name: `s${i}`, events: ["push"] });
+  const { caller, calls } = makeFakeApi((c) => {
+    if (c.path === "/api/repos/1") return repoObj();
+    const m = c.path.match(/^\/api\/repos\/1\/secrets\?page=(\d+)&perPage=50$/);
+    if (m) {
+      const page = Number(m[1]);
+      const body = page === 1
+        ? Array.from({ length: 50 }, (_, i) => secret(i + 1))
+        : page === 2
+        ? [secret(51), secret(52)]
+        : [];
+      return { status: 200, body: body as unknown as Record<string, unknown> };
+    }
+    return undefined;
+  });
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("repo_secret_list").execute({ repo: "1" }, context);
+    const pages = calls.filter((c) => c.path.includes("/secrets?")).map((c) =>
+      c.path
+    );
+    assertEquals(pages, [
+      "/api/repos/1/secrets?page=1&perPage=50",
+      "/api/repos/1/secrets?page=2&perPage=50",
+    ], "page 2 was short, so no page 3");
+    assertEquals(written.length, 52);
+    assertEquals(written[51].data.name, "s52", "the 52nd secret is visible");
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("pipeline_list: limit above 50 spans pages and is trimmed exactly", async () => {
+  const pipe = (n: number) => ({ number: n, status: "success", event: "push" });
+  const { caller, calls } = makeFakeApi((c) => {
+    const m = c.path.match(
+      /^\/api\/repos\/1\/pipelines\?page=(\d+)&perPage=(\d+)$/,
+    );
+    if (m) {
+      const page = Number(m[1]);
+      const perPage = Number(m[2]);
+      const start = (page - 1) * 50;
+      const body = Array.from({ length: perPage }, (_, i) => pipe(start + i + 1));
+      return { status: 200, body: body as unknown as Record<string, unknown> };
+    }
+    return undefined;
+  });
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("pipeline_list").execute({ repo: "1", limit: 60 }, context);
+    assertEquals(calls.map((c) => c.path), [
+      "/api/repos/1/pipelines?page=1&perPage=50",
+      "/api/repos/1/pipelines?page=2&perPage=10",
+    ]);
+    assertEquals(written.length, 60);
+  } finally {
+    __setCaller(null);
+  }
+});
+
+// ─────────────────────────── statuses ───────────────────────────
+
+Deno.test("pipeline_cancel: blocked (awaiting approval) is cancellable upstream, so POST", async () => {
+  let cancelled = false;
+  const { caller, calls } = makeFakeApi((c) => {
+    if (c.path.endsWith("/cancel")) {
+      cancelled = true;
+      return {};
+    }
+    if (c.path === "/api/repos/1/pipelines/5") {
+      return pipelineWithSteps({ status: cancelled ? "killed" : "blocked" });
+    }
+    return undefined;
+  });
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("pipeline_cancel").execute({ repo: "1", number: 5 }, context);
+    assert(calls.some((c) => c.path.endsWith("/cancel")), "cancel POSTed");
+    assertEquals(written[0].data.action, "cancelled");
+    assertEquals(written[0].data.status, "killed");
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("pipeline_wait: a cancelled pipeline reports killed and stops on the first poll", async () => {
+  const { caller, calls } = makeFakeApi((c) => {
+    if (c.path === "/api/repos/1/pipelines/5") {
+      return pipelineWithSteps({ status: "killed" });
+    }
+    return undefined;
+  });
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("pipeline_wait").execute(
+      { repo: "1", number: 5, pollIntervalSec: 0, timeoutSec: 1 },
+      context,
+    );
+    assertEquals(
+      calls.filter((c) => c.path === "/api/repos/1/pipelines/5").length,
+      1,
+    );
+    assertEquals(written[0].data.status, "killed");
+  } finally {
+    __setCaller(null);
+  }
+});
+
+// ─────────────────────────── strict booleans ───────────────────────────
+
+Deno.test("trusted flags: '0' and 'False' are rejected, not coerced to true", async () => {
+  const { caller, calls } = makeFakeApi(() => repoObj());
+  __setCaller(caller);
+  try {
+    const { context } = makeContext();
+    for (const bad of ["0", "False", "1", "yes", null]) {
+      await rejects(
+        () =>
+          method("repo_update").execute(
+            { repo: "1", trustedVolumes: bad },
+            context,
+          ),
+        /expected true or false/,
+      );
+    }
+    assertEquals(calls.length, 0, "rejected before any API call");
+    // The canonical spellings still work, string or boolean.
+    const { context: ctx2 } = makeContext();
+    await method("repo_update").execute(
+      { repo: "1", trusted: "false", trustedVolumes: true },
+      ctx2,
+    );
   } finally {
     __setCaller(null);
   }

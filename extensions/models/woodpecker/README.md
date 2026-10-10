@@ -86,7 +86,8 @@ swamp model method run woodpecker pipeline_logs \
 
 - `pipeline_restart` — re-run a pipeline (creates a new run), e.g. after fixing
   infra instead of an empty commit.
-- `pipeline_cancel` — stop a running pipeline (no-op if already finished).
+- `pipeline_cancel` — stop a running, pending or blocked pipeline (no-op if
+  already finished).
 - `pipeline_approve` / `pipeline_decline` — release a pipeline blocked by
   `require_approval`.
 
