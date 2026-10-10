@@ -63,8 +63,8 @@ swamp model method run arcane-prod swarm_stack_remove --input '{"name":"unifi"}'
 - **`project_*`** — compose projects. Lifecycle: `project_list`, `project_get`,
   `project_up` / `project_down` / `project_redeploy` / `project_restart` /
   `project_pull` / `project_destroy`. `project_redeploy` is pull + compose up,
-  which leaves an unchanged container running; `project_restart` is down then
-  up. Direct (API) authoring: `project_validate`,
+  which leaves an unchanged container running; `project_restart` restarts the
+  containers in place. Direct (API) authoring: `project_validate`,
   `project_create`, `project_update`. Orchestration: `project_deploy`
   (validated, mode-aware, rolls back by default).
 - **`secret_*` / `config_*`** — swarm secret/config CRUD plus `secret_rotate` /
@@ -205,7 +205,10 @@ rotation); the per-type prunes above cover the rest.
   cannot run. A `validate: false` still passed is ignored.
 - **`authType` accepts `none`, `http` or `ssh`, and `targetType` `project` or
   `swarm_stack`**, the values Arcane uses. The old `token` and `swarm` were
-  never accepted by Arcane.
+  never accepted by Arcane; the model upgrade rewrites them to `http` and
+  `swarm_stack` in existing definitions.
+- **`healthTimeoutSec` and `pollIntervalSec` must be positive.** `healthTimeoutSec: 0` used to switch the
+  timeout off.
 
 ## Fixes
 
@@ -218,8 +221,14 @@ rotation); the per-type prunes above cover the rest.
   `health: starting` used to count as healthy, so one crash-looping behind a
   slow healthcheck deployed as healthy. Deploys of services with slow
   healthchecks now take until those checks pass.
-- **`project_deploy`'s `healthTimeoutSec` bounds the redeploy call.** It used
-  to get its own 10-minute limit, so a compose `depends_on` that never became
-  healthy held the deploy (and the model lock) far past the timeout.
-- **New `project_restart`** (down then up), since `project_redeploy` does not
-  restart an unchanged project.
+- **`project_deploy`'s `healthTimeoutSec` bounds the redeploy call.** The
+  redeploy used to get a fixed limit of its own, so a compose `depends_on` that
+  never became healthy held the deploy (and the model lock) past the timeout.
+- **`project_deploy` reads the redeploy's streamed body.** Arcane answers a
+  failed redeploy (an image that can't be pulled, say) with 200 and an error
+  line, so the deploy used to carry on and could report the old containers as
+  a healthy deploy.
+- **Request time limits cover the whole request.** They used to reset whenever
+  data arrived, so a streamed operation printing progress could run past them.
+- **New `project_restart`**, using Arcane's restart, since `project_redeploy`
+  does not restart an unchanged project.

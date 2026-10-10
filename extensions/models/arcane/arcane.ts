@@ -314,9 +314,9 @@ const PruneResultResource = z.object({
 
 const API = "/api";
 const REQUEST_TIMEOUT_MS = 30_000;
-// Up, down, redeploy, pull and destroy send nothing back until Docker has
-// finished, so a 30 s idle timeout would fail a slow one that is still running.
-// project_deploy bounds its redeploys by healthTimeoutSec instead.
+// Up, down, redeploy, pull and destroy answer only when Docker has finished,
+// so they get longer than the 30 s an ordinary request gets. project_deploy
+// bounds its redeploys by healthTimeoutSec instead.
 const OPERATION_TIMEOUT_MS = 10 * 60_000;
 
 type GlobalArgsT = z.infer<typeof GlobalArgs>;
@@ -333,8 +333,9 @@ function httpRequest(
   timeoutMs: number,
   body?: string,
 ): Promise<HttpResult> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
   const transport = secure ? https : http;
-  return new Promise((resolve, reject) => {
+  return new Promise<HttpResult>((resolve, reject) => {
     const req = transport.request(opts, (res) => {
       const chunks: Buffer[] = [];
       res.on("data", (c: Buffer) => chunks.push(c));
@@ -346,13 +347,15 @@ function httpRequest(
       res.on("error", reject);
     });
     req.on("error", reject);
-    req.setTimeout(
-      timeoutMs,
+    // A limit on the whole request, not an idle one: up, pull and redeploy
+    // stream progress lines, which would keep resetting an idle timer.
+    timer = setTimeout(
       () => req.destroy(new Error(`request timed out after ${timeoutMs} ms`)),
+      timeoutMs,
     );
     if (body) req.write(body);
     req.end();
-  });
+  }).finally(() => clearTimeout(timer));
 }
 
 /** Parse a JSON body, returning null for an empty body and the raw string if it isn't JSON. */
@@ -367,7 +370,7 @@ function safeJson(body: string): unknown {
 
 /**
  * The error message from a streamed (NDJSON) Arcane response, or undefined when
- * no line carries one. Arcane's project up and pull handlers write
+ * no line carries one. Arcane's project up, pull and redeploy handlers write
  * `{"error": "..."}` as a line of the 200 body when the operation fails, so the
  * body has to be read to know whether it worked.
  */
@@ -843,13 +846,16 @@ async function redeployAndPoll(
 ): Promise<HealthResult> {
   const deadline = Date.now() + timeoutSec * 1000;
   try {
-    await arcane(
-      g,
-      "POST",
-      `${ENV(g)}/projects/${id}/redeploy`,
-      undefined,
-      timeoutSec * 1000,
+    const failure = streamError(
+      await arcane(
+        g,
+        "POST",
+        `${ENV(g)}/projects/${id}/redeploy`,
+        undefined,
+        timeoutSec * 1000,
+      ),
     );
+    if (failure !== undefined) throw new Error(`redeploy failed: ${failure}`);
   } catch (e) {
     if (e instanceof Error && /request timed out/.test(e.message)) {
       throw new Error(
@@ -1327,16 +1333,16 @@ const ProjectDeployArgs = z.object({
   rollback: z.boolean().default(true).describe(
     "Roll back to prior state on failure (direct mode). false = stop and report, leaving the failed state for inspection.",
   ),
-  healthTimeoutSec: z.number().int().default(120).describe(
+  healthTimeoutSec: z.number().int().positive().default(120).describe(
     "How long the redeploy and the wait for the project to become healthy may take together",
   ),
-  pollIntervalSec: z.number().int().default(5),
+  pollIntervalSec: z.number().int().positive().default(5),
 });
 
 const SwarmServiceForceUpdateArgs = z.object({
   name: z.string().describe("Swarm service name (e.g. unifi_unifi)"),
   convergeTimeoutSec: z.number().int().default(180),
-  pollIntervalSec: z.number().int().default(5),
+  pollIntervalSec: z.number().int().positive().default(5),
 });
 
 const SwarmStackValidateArgs = z.object({
@@ -1357,7 +1363,7 @@ const SwarmStackDeployArgs = z.object({
     "Remove services no longer present in the compose file",
   ),
   convergeTimeoutSec: z.number().int().default(180),
-  pollIntervalSec: z.number().int().default(5),
+  pollIntervalSec: z.number().int().positive().default(5),
 });
 
 const SwarmStackRemoveArgs = z.object({
@@ -1365,7 +1371,7 @@ const SwarmStackRemoveArgs = z.object({
   removeTimeoutSec: z.number().int().default(30).describe(
     "Max seconds to keep re-issuing DELETE until the stack record 404s",
   ),
-  pollIntervalSec: z.number().int().default(2),
+  pollIntervalSec: z.number().int().positive().default(2),
 });
 
 const SwarmStackTasksArgs = z.object({
@@ -1472,10 +1478,23 @@ export const model = {
     },
     {
       toVersion: "2026.10.11.1",
-      description: "No change to global arguments or stored data.",
+      description:
+        "Map the retired values Arcane never accepted: repository.authType token → http, syncs[].targetType swarm → swarm_stack.",
       upgradeAttributes: (
         old: Record<string, unknown>,
-      ): Record<string, unknown> => old,
+      ): Record<string, unknown> => {
+        const out = { ...old };
+        const repo = out.repository as Record<string, unknown> | undefined;
+        if (repo?.authType === "token") {
+          out.repository = { ...repo, authType: "http" };
+        }
+        if (Array.isArray(out.syncs)) {
+          out.syncs = out.syncs.map((s: Record<string, unknown>) =>
+            s?.targetType === "swarm" ? { ...s, targetType: "swarm_stack" } : s
+          );
+        }
+        return out;
+      },
     },
   ],
   resources: {
@@ -2284,10 +2303,9 @@ export const model = {
           `compose valid (docker compose ${version})`,
         );
 
-        // 3. Apply (create/update) → redeploy → health, capturing ANY failure. Arcane
-        //    rejects a bad deploy synchronously (a container that exits is returned as
-        //    HTTP 400, not a 200 + async failure), so the redeploy can throw; the throw
-        //    takes the same rollback path as an unhealthy poll result.
+        // 3. Apply (create/update) → redeploy → health, capturing ANY failure. A
+        //    failed redeploy throws (an HTTP error, or an error line in its streamed
+        //    200 body) and takes the same rollback path as an unhealthy poll result.
         let failReason: string | undefined;
         let healthy = false;
         try {
@@ -2426,16 +2444,13 @@ export const model = {
       },
     },
 
-    project_up: makeLifecycle("up", [["POST", "/up"]]),
-    project_down: makeLifecycle("down", [["POST", "/down"]]),
-    project_redeploy: makeLifecycle("redeploy", [["POST", "/redeploy"]]),
+    project_up: makeLifecycle("up", "POST", "/up"),
+    project_down: makeLifecycle("down", "POST", "/down"),
+    project_redeploy: makeLifecycle("redeploy", "POST", "/redeploy"),
     // Redeploy is pull + compose up, which leaves an unchanged container running.
-    project_restart: makeLifecycle("restart", [["POST", "/down"], [
-      "POST",
-      "/up",
-    ]]),
-    project_pull: makeLifecycle("pull", [["POST", "/pull"]]),
-    project_destroy: makeLifecycle("destroy", [["DELETE", "/destroy"]]),
+    project_restart: makeLifecycle("restart", "POST", "/restart"),
+    project_pull: makeLifecycle("pull", "POST", "/pull"),
+    project_destroy: makeLifecycle("destroy", "DELETE", "/destroy"),
 
     // --- swarm secret_ / config_ CRUD (rotation lives in secret_rotate / config_rotate) ---
     ...makeSwarmObject("secret"),
@@ -3024,12 +3039,13 @@ export const model = {
 
 /**
  * Build a fan-out project-lifecycle method. Resolves each name to a project id,
- * issues the action's calls in order, and records an operation-result per target.
- * The argument schema requires at least one name, so there is no "all projects" form.
+ * issues the action, and records an operation-result per target. The argument
+ * schema requires at least one name, so there is no "all projects" form.
  */
 function makeLifecycle(
   operation: string,
-  steps: [HttpMethod, string][],
+  httpMethod: HttpMethod,
+  suffix: string,
 ): MethodDefinition<z.ZodTypeAny, GlobalArgsT> {
   return {
     description:
@@ -3058,14 +3074,13 @@ function makeLifecycle(
       const handles: DataHandle[] = [];
       for (const name of names) {
         const id = asString(pick(byName.get(name)!, "id")) ?? "";
-        for (const [httpMethod, suffix] of steps) {
-          const path = `${ENV(g)}/projects/${id}${suffix}`;
-          if (httpMethod === "DELETE") {
-            await deleteIfPresent(g, path, OPERATION_TIMEOUT_MS);
-            continue;
-          }
-          // up and pull stream NDJSON: the 200 arrives before the work runs and
-          // a failure is an error line in the body, so the status alone shows nothing.
+        const path = `${ENV(g)}/projects/${id}${suffix}`;
+        if (httpMethod === "DELETE") {
+          await deleteIfPresent(g, path, OPERATION_TIMEOUT_MS);
+        } else {
+          // up, pull and redeploy stream NDJSON: the 200 arrives before the work
+          // runs and a failure is an error line in the body, so the status alone
+          // shows nothing.
           const failure = streamError(
             await arcane(g, httpMethod, path, undefined, OPERATION_TIMEOUT_MS),
           );
@@ -3237,8 +3252,8 @@ function makeRotate(
     removeOld: z.boolean().default(true).describe(
       `Remove the old ${kind} after successful convergence`,
     ),
-    healthTimeoutSec: z.number().int().default(180),
-    pollIntervalSec: z.number().int().default(5),
+    healthTimeoutSec: z.number().int().positive().default(180),
+    pollIntervalSec: z.number().int().positive().default(5),
   });
   return {
     [`${kind}_rotate`]: {
