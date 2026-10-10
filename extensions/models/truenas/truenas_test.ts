@@ -955,7 +955,7 @@ Deno.test("nfs_share_delete: already-absent share succeeds with action=absent (i
     assertEquals(r.id, 9);
     assertEquals(
       written[0].name,
-      "9",
+      "nfs-result-9",
       "by id: named after the id, as a real delete is",
     );
   } finally {
@@ -974,7 +974,7 @@ Deno.test("nfs_share_delete: absent share selected by path gets a slash-free ins
       { path: "/mnt/tank/old" },
       context,
     );
-    assertEquals(written[0].name, "mnt-tank-old");
+    assertEquals(written[0].name, "nfs-result-mnt-tank-old");
     assertEquals(written[0].data.path, "/mnt/tank/old");
     assertEquals(written[0].data.action, "absent");
   } finally {
@@ -1089,7 +1089,7 @@ Deno.test("smb_share_delete: absent share selected by name gets a safe instance 
       { name: "Old Media/2019" },
       context,
     );
-    assertEquals(written[0].name, "Old-Media-2019");
+    assertEquals(written[0].name, "smb-result-Old-Media-2019");
     assertEquals(written[0].data.name, "Old Media/2019");
     assertEquals(written[0].data.action, "absent");
 
@@ -1097,7 +1097,7 @@ Deno.test("smb_share_delete: absent share selected by name gets a safe instance 
     await method("smb_share_delete").execute({ id: 6 }, byId.context);
     assertEquals(
       byId.written[0].name,
-      "6",
+      "smb-result-6",
       "by id: named after the id, as a real delete is",
     );
   } finally {
@@ -1301,6 +1301,77 @@ Deno.test("reachable check fails, not throws, when endpoint is omitted", async (
     assertEquals(r.pass, false);
     assert(/endpoint/.test((r.errors ?? []).join(" ")), "must name the field");
     assertEquals(opened, false, "must not open a session without an endpoint");
+  } finally {
+    __setTruenasSession(null);
+  }
+});
+
+// swamp names data per model, not per spec, and TrueNAS numbers NFS and SMB
+// shares separately, so share 1 of each must not share a name.
+Deno.test("nfs and smb shares with the same id get different data names", async () => {
+  const fake = makeFakeSession((m) =>
+    m === "sharing.nfs.query"
+      ? [{ id: 1, path: "/mnt/a" }]
+      : m === "sharing.smb.query"
+      ? [{ id: 1, name: "a", path: "/mnt/a" }]
+      : []
+  );
+  __setTruenasSession(fake.factory);
+  try {
+    const nfs = makeContext();
+    await method("nfs_share_list").execute({}, nfs.context);
+    const smb = makeContext();
+    await method("smb_share_list").execute({}, smb.context);
+    assertEquals([nfs.written[0].name, smb.written[0].name], [
+      "nfs-1",
+      "smb-1",
+    ]);
+  } finally {
+    __setTruenasSession(null);
+  }
+});
+
+Deno.test("app_set_port_bind: a job id core.get_jobs does not know fails at once", async () => {
+  const fake = makeFakeSession((m) => {
+    if (m === "app.query") return [structuredClone(LLDAP_APP)];
+    if (m === "app.update") return 42;
+    if (m === "core.get_jobs") return [];
+    return undefined;
+  });
+  __setTruenasSession(fake.factory);
+  try {
+    const { context } = makeContext();
+    await rejects(
+      () =>
+        method("app_set_port_bind").execute(
+          { app: "lldap", portKey: "ldap_port", bindMode: "exposed" },
+          context,
+        ),
+      /job 42 not found/,
+    );
+    assertEquals(fake.methods().filter((m) => m === "core.get_jobs").length, 1);
+  } finally {
+    __setTruenasSession(null);
+  }
+});
+
+Deno.test("network_info: each bindable IP names the interface that holds it", async () => {
+  const fake = makeFakeSession((m) => {
+    if (m === "interface.ip_in_use") {
+      return [{ address: "10.0.0.5", netmask: 24 }];
+    }
+    if (m === "interface.query") {
+      return [{ name: "eno1", state: { aliases: [{ address: "10.0.0.5" }] } }];
+    }
+    if (m === "system.general.config") return { ui_address: ["0.0.0.0"] };
+    return undefined;
+  });
+  __setTruenasSession(fake.factory);
+  try {
+    const { context, written } = makeContext();
+    await method("network_info").execute({}, context);
+    const ips = written[0].data.bindableIps as Array<Record<string, unknown>>;
+    assertEquals(ips[0].interface, "eno1");
   } finally {
     __setTruenasSession(null);
   }

@@ -3,9 +3,8 @@
 Administration of a [TrueNAS SCALE](https://www.truenas.com/) host (25.04+)
 through its **JSON-RPC 2.0 API over a WebSocket** (`wss://<host>/api/current`,
 API-key auth). Audit what each app/share/service exposes, then restrict it.
-Built for the homelab **service-exposure** hardening (R28).
 
-Only three kinds of change are supported, and each is reversible:
+These are the only changes it makes:
 
 - **App port binding:** switch a catalog app's port between `published` (bound
   on the host) and `exposed` (container-internal only). This closes a service's
@@ -14,11 +13,15 @@ Only three kinds of change are supported, and each is reversible:
 - **NFS share access:** set the per-share authorized `networks`/`hosts`
   allowlist (the only supported per-client access control on TrueNAS).
 - **SMB share access:** set per-share `hostsallow`/`hostsdeny`.
+- **Share delete:** remove an NFS or SMB share definition. The dataset and its
+  data are left alone, and the removed configuration is recorded so the share
+  can be re-created.
 
 It does **not** touch pools, datasets, users, snapshots, replication, or service
 start/stop. Service start/stop is left as an explicit gap because a stopped
 `ssh`/`nfs` service risks a lockout or outage. Every mutating verb verifies its
-target by id/name first and is reversible by re-running with the prior values.
+target by id/name first. The access changes are reversible by re-running with
+the prior values.
 
 ## ⚠️ Transport safety — never send the key over cleartext
 
@@ -103,7 +106,7 @@ swamp data get nas mnt-Backup --json | jq '.content | {exists, entries: [.entrie
 swamp model method run nas replication_list
 swamp data query nas 'attributes.targetDataset.startsWith("Backup/")'
 
-# Close lldap's plaintext LDAP + LDAPS (no consumers) — container-internal only
+# Close lldap's plaintext LDAP + LDAPS — container-internal only
 swamp model method run nas app_set_port_bind --input app=lldap --input portKey=ldap_port  --input bindMode=exposed
 swamp model method run nas app_set_port_bind --input app=lldap --input portKey=ldaps_port --input bindMode=exposed
 
@@ -131,6 +134,14 @@ so you can tell.
   uses its self-signed certificate, see the TLS note above.
 - **`endpoint` is required.** It used to default to the placeholder
   `wss://nas.example.com/api/current`. Set it to your NAS.
+- **Shares and results have prefixed data names.** `nfs_share_list` writes
+  `nfs-<id>` and `smb_share_list` `smb-<id>`, because TrueNAS numbers the two
+  separately and share 1 of each used to overwrite the other. Share results are
+  `nfs-result-<id>` / `smb-result-<id>`, and `app_set_networks` results
+  `<app>-networks`. A CEL expression that reads one by its old name needs the
+  new one.
+- **`exposure_audit` lists only enabled NFS shares** as unrestricted, as it
+  already did for SMB.
 
 ## Known limitations
 
