@@ -36,7 +36,7 @@ inline it:
 ```bash
 swamp model create @thomas/stalwart stalwart \
   --global-arg apiUrl=https://mail.example.com \
-  --global-arg 'apiKey=${{ vault.get(op-homelab, stalwart/api_key) }}'
+  --global-arg 'apiKey=${{ vault.get(<vault>, stalwart/api_key) }}'
 ```
 
 | Global arg      | Required | Notes                                                            |
@@ -92,12 +92,26 @@ swamp model method run stalwart health_status
 swamp model method run stalwart jmap_probe --input type=Principal --input limit=5
 ```
 
-**Not built yet:** `group_set_state`, `spam_config_ensure`, and `spam_train`
-(only if Stalwart has a JMAP train method).
-
 > Stalwart does not publish its JMAP management method and type names. They were
 > confirmed against a live 0.16 server and are pinned in the `USING` /
 > `JMAP_TYPES` constants in `stalwart.ts`.
+
+## Breaking changes
+
+- **Boolean arguments accept only `true`/`false`** (or the strings `"true"` /
+  `"false"`). Earlier versions read `"0"`, `"False"` and any other non-empty
+  string as true.
+- **Aliases are full addresses.** `AccountInfo.aliases` and `alias_list` used to
+  report the local part only.
+- **`mailing_list_ensure` and `group_ensure` name their data by full address**
+  (`team@example.com`, not `team`), so lists and groups with the same local part
+  on different domains no longer overwrite each other. A CEL expression that
+  reads one by its old name needs the full address.
+- **`account_ensure` records the account as it is afterwards.** `memberOf` holds
+  group ids, as `account_list` records it (it used to hold the addresses
+  passed), and aliases, role and description that were not passed show what the
+  account kept instead of empty values.
+- **`account_ensure` refuses an address that belongs to a group.**
 
 ## License
 

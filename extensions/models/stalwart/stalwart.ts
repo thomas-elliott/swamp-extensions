@@ -648,6 +648,11 @@ function mapKeys(v: unknown): string[] {
   return v && typeof v === "object" ? Object.keys(v as Json) : [];
 }
 
+/** A string field from a wire object, or undefined when it is not a string. */
+function asOptString(v: unknown): string | undefined {
+  return typeof v === "string" ? v : undefined;
+}
+
 /**
  * Full addresses out of an `aliases` List<EmailAlias> wire object. Stalwart
  * stores an alias as a local part (`name`) plus a `domainId`, so the domain
@@ -876,12 +881,11 @@ const ROLE_PRESETS: Record<string, { description: string; enabled: string[] }> =
   {
     "swamp-admin": {
       description: "Swamp Admin",
-      // NB: to ASSIGN a custom role (e.g. `automated-mailbox`), this principal must
-      // itself hold every permission that role grants (Stalwart privilege
-      // non-escalation). swamp-admin is granted the `User` + `Automated Mailbox`
-      // member roles out-of-band via the web-admin (a one-time step by the
-      // fallback admin, because swamp-admin can't grant itself permissions), so
-      // those perms are NOT in this flat list.
+      // To assign a custom role (e.g. `automated-mailbox`), the API key's
+      // principal must itself hold every permission that role grants: Stalwart
+      // does not allow privilege escalation. A principal cannot grant itself
+      // permissions, so give it the `User` and `Automated Mailbox` roles from
+      // another admin account; they are not in this list.
       enabled: [
         "authenticate",
         // settings singletons the extension reads/writes (settings_get/_set)
@@ -1021,7 +1025,7 @@ const DomainSetStateArgs = z.object({
 const AccountSetStateArgs = z.object({
   account: z.string().describe("Account — local part or full address"),
   state: StateArg.describe(
-    "active = permissions Inherit; inactive = permissions Replace-empty (can't authenticate)",
+    "active = permissions Inherit (an own Merge/Replace list is lost); inactive = permissions Replace-empty (can't authenticate)",
   ),
 });
 
@@ -1507,7 +1511,8 @@ export const model = {
       description:
         "Create or converge a role (idempotent by name). Pass a `preset` " +
         "(swamp-admin | automated-mailbox) or an explicit name + permissions. " +
-        "Never destroys; only adds/updates the enabled-permission set.",
+        "Never destroys the role. Sets its enabled permissions to exactly the given " +
+        "list, so a permission not listed is removed; other role settings are kept.",
       arguments: RoleEnsureArgs,
       execute: async (
         rawArgs,
@@ -1530,6 +1535,8 @@ export const model = {
           "id",
           "description",
           "enabledPermissions",
+          "disabledPermissions",
+          "roleIds",
         ]);
         const existing = rows.find((r) =>
           String(r.description) === description
@@ -1580,8 +1587,9 @@ export const model = {
           id,
           description,
           enabledPermissions: desired,
-          disabledPermissions: [],
-          nestedRoleIds: [],
+          // Only enabledPermissions is written; the other sets are as they were.
+          disabledPermissions: mapKeys(existing?.disabledPermissions),
+          nestedRoleIds: mapKeys(existing?.roleIds),
           action,
           timestamp: nowIso(),
         });
@@ -1753,13 +1761,15 @@ export const model = {
 
         let id: string;
         let action: "created" | "updated" | "unchanged";
+        // The role union the account holds afterwards, for the resource.
+        let roles: unknown = existing?.roles;
         if (!existing) {
+          roles = (await buildRolesUnion(g, accountId, a.role ?? "user")).union;
           const create: Json = {
             "@type": "User",
             name: local,
             domainId,
-            roles:
-              (await buildRolesUnion(g, accountId, a.role ?? "user")).union,
+            roles,
           };
           if (a.aliases) create.aliases = desiredAliases;
           if (desiredMembers) create.memberGroupIds = desiredMembers;
@@ -1805,6 +1815,7 @@ export const model = {
           }
           if (a.role) {
             const { union } = await buildRolesUnion(g, accountId, a.role);
+            roles = union;
             const cur = (existing.roles ?? {}) as Json;
             const same = cur["@type"] === union["@type"] &&
               (union["@type"] !== "Custom" ||
@@ -1835,16 +1846,19 @@ export const model = {
             action = "updated";
           }
         }
+        // Record the account as it is now, shaped like account_list: what was
+        // not passed is what the server kept.
+        const domainNames = new Map([...domains].map(([n, i]) => [i, n]));
         const handle = await context.writeResource("account", a.email, {
           id,
           name: local,
           email: a.email,
           domainId,
           type: "individual",
-          aliases: a.aliases ?? [],
-          roles: a.role ? a.role.toLowerCase() : undefined,
-          memberOf: a.memberOf ?? [],
-          description: a.description,
+          aliases: a.aliases ?? aliasAddresses(existing?.aliases, domainNames),
+          roles: rolesLabel(roles),
+          memberOf: desiredMemberKeys ?? mapKeys(existing?.memberGroupIds),
+          description: a.description ?? asOptString(existing?.description),
           action,
           timestamp: nowIso(),
         });
@@ -1925,11 +1939,12 @@ export const model = {
             action = "updated";
           }
         }
-        const handle = await context.writeResource("mailing-list", local, {
+        // Named by full address: team@a.com and team@b.com are different lists.
+        const handle = await context.writeResource("mailing-list", a.address, {
           id,
           name: local,
-          description: a.description,
-          recipients: a.recipients ?? [],
+          description: a.description ?? asOptString(existing?.description),
+          recipients: a.recipients ?? mapKeys(existing?.recipients),
           action,
           timestamp: nowIso(),
         });
@@ -2004,10 +2019,11 @@ export const model = {
             action = "unchanged";
           }
         }
-        const handle = await context.writeResource("group", local, {
+        // Named by full address: team@a.com and team@b.com are different groups.
+        const handle = await context.writeResource("group", a.address, {
           id,
           name: local,
-          description: a.description,
+          description: a.description ?? asOptString(existing?.description),
           action,
           timestamp: nowIso(),
         });
@@ -2069,8 +2085,10 @@ export const model = {
       description:
         "Disable or re-enable an account WITHOUT deleting it. Disable replaces " +
         "the account's permissions with an empty set (it can no longer " +
-        "authenticate); re-enable restores `Inherit` (role-based). Reversible, " +
-        "idempotent, verify-before-mutate. Mailbox + aliases are untouched.",
+        "authenticate); re-enable sets them to `Inherit` (role-based). An account " +
+        "that had its own Merge or Replace permission list loses it on re-enable, " +
+        "so for such an account this cannot be undone. Idempotent. Mailbox and " +
+        "aliases are untouched.",
       arguments: AccountSetStateArgs,
       execute: async (
         rawArgs,

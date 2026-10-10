@@ -1,7 +1,7 @@
 /**
  * Unit tests for `@thomas/stalwart`: the Prometheus parser, the `reachable`
  * check, the JMAP request envelopes, idempotency and verify-before-mutate for
- * each method, and the no-destroy guarantee (no method source references the
+ * each method, and the no-destroy guarantee (the module never writes a
  * JMAP `destroy` verb). No live server: the JMAP/REST callers are faked via the
  * __setJmap / __setRest seams.
  */
@@ -928,10 +928,8 @@ Deno.test("account_ensure: memberOf resolves group addresses to memberGroupIds o
       { g1: true, g2: true },
       "set-map of group ids",
     );
-    assertEquals(written[0].data.memberOf, [
-      "gmail@example.com",
-      "outlook@example.com",
-    ]);
+    // Group ids, as account_list records them.
+    assertEquals(written[0].data.memberOf, ["g1", "g2"]);
   } finally {
     __setJmap(null);
     __setRest(null);
@@ -1280,22 +1278,17 @@ Deno.test("group_ensure: creates a Group account with Default roles", async () =
   }
 });
 
-Deno.test("no-destroy guarantee: no method execute body references the destroy verb", async () => {
-  // NO method may send `destroy`. Scan each method's source for a `destroy`
-  // reference.
-  const methods = model.methods as unknown as Record<
-    string,
-    { execute: (...a: unknown[]) => unknown }
-  >;
-  for (const [name, def] of Object.entries(methods)) {
-    const src = def.execute.toString();
-    assert(
-      !/\bdestroy\b/.test(src),
-      `method ${name} must not reference destroy`,
-    );
-  }
-  // Use the JMAP seam import so an unused-import error doesn't hide a regression.
-  __setJmap(null);
+Deno.test("no-destroy guarantee: the module never builds a JMAP destroy", async () => {
+  // A JMAP /set removes objects only through a `destroy` property, so the
+  // guarantee holds if no code in the module, helpers included, writes one.
+  const src = await Deno.readTextFile(
+    new URL("./stalwart.ts", import.meta.url),
+  );
+  const code = src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, "");
+  assert(
+    !/\bdestroy\s*:|["']destroy["']/.test(code),
+    "no `destroy` property anywhere in stalwart.ts",
+  );
 });
 
 // A check receives globalArgs without the schema's defaults, so an unset
@@ -1343,5 +1336,59 @@ Deno.test("boolean arguments reject anything but true/false", () => {
       !fieldFails(good),
       `reload=${JSON.stringify(good)} must be accepted`,
     );
+  }
+});
+
+// ─────────────────────────── recorded state ───────────────────────────
+
+Deno.test("mailing_list_ensure: data is named by full address, so domains do not collide", async () => {
+  makeTypedJmap({
+    "x:Domain": [{ id: "d1", name: "a.test" }],
+    "x:MailingList": [{
+      id: "m1",
+      name: "team",
+      domainId: "d1",
+      recipients: { "x@a.test": true },
+      description: "kept",
+    }],
+  });
+  try {
+    const { context, written } = makeContext();
+    await method("mailing_list_ensure").execute(
+      { address: "team@a.test" },
+      context,
+    );
+    assertEquals(written[0].name, "team@a.test");
+    // Not passed, so the list kept them; the record says so.
+    assertEquals(written[0].data.recipients, ["x@a.test"]);
+    assertEquals(written[0].data.description, "kept");
+  } finally {
+    __setJmap(null);
+    __setRest(null);
+  }
+});
+
+Deno.test("account_ensure: aliases not passed are recorded as the account keeps them", async () => {
+  makeTypedJmap({
+    "x:Domain": [{ id: "d1", name: "a.test" }],
+    "x:Account": [{
+      id: "u1",
+      "@type": "User",
+      name: "me",
+      emailAddress: "me@a.test",
+      domainId: "d1",
+      aliases: { "0": { name: "alt", domainId: "d1", enabled: true } },
+      roles: { "@type": "User" },
+    }],
+  });
+  try {
+    const { context, written } = makeContext();
+    await method("account_ensure").execute({ email: "me@a.test" }, context);
+    assertEquals(written[0].data.aliases, ["alt@a.test"]);
+    assertEquals(written[0].data.roles, "user");
+    assertEquals(written[0].data.action, "unchanged");
+  } finally {
+    __setJmap(null);
+    __setRest(null);
   }
 });
