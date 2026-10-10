@@ -1,75 +1,75 @@
 # @thomas/forgejo
 
-Careful administration of a self-hosted **[Forgejo](https://forgejo.org)** (or
-Gitea) server for swamp, over its **`/api/v1` REST API**. Built for three
-repeatable tasks: **provisioning repositories/organizations**, **running GitHub
-pull-mirrors**, and **driving pull requests** — find-or-create an org,
+Administration of a self-hosted **[Forgejo](https://forgejo.org)** (or Gitea)
+server for swamp, over its **`/api/v1` REST API**. Built for three repeatable
+tasks: **provisioning repositories/organizations**, **running GitHub
+pull-mirrors**, and **managing pull requests**: find-or-create an org,
 find-or-create a repo and converge its settings, mirror a GitHub repo, audit
-every mirror's sync health in one call, and open/inspect/merge a PR, without the
-per-repo UI click-through.
+every mirror's sync health in one call, and open/inspect/merge a PR, without
+working through the UI one repo at a time.
 
 ## Scope guarantee (read this first)
 
-This extension can hold an admin-scoped token, so its surface is deliberately
-narrow and its mutations are **find-or-create or reversible**, with one guarded
+This extension can hold an admin-scoped token, so it has a small set of methods
+and its mutations are **find-or-create or reversible**, with one guarded
 exception (`pr_merge`):
 
-- ✅ **No delete methods.** Removing a repo, org, or mirror stays a deliberate
-  manual act in the Forgejo UI. The leftover **empty shell repo** of a failed
-  migration is **detected and reported** by `mirror_ensure` with a clear message
-  — never auto-deleted.
-- ✅ **Reversible lifecycle** — the only "off switch" is `repo_archive` (undo
-  with `repo_unarchive`). Both are idempotent no-ops when already in the
+- ✅ **No delete methods.** Removing a repo, org, or mirror is done manually in
+  the Forgejo UI. The leftover **empty repo** of a failed migration is
+  **detected and reported** by `mirror_ensure` with a clear message and never
+  deleted automatically.
+- ✅ **Reversible lifecycle.** The only way to disable a repo is `repo_archive`
+  (undo with `repo_unarchive`). Both are idempotent no-ops when already in the
   requested state.
-- ✅ **Idempotent provisioning** — every `*_ensure` probes by name first (absent
+- ✅ **Idempotent provisioning.** Every `*_ensure` probes by name first (absent
   ⇒ create, present ⇒ converge the supplied settings via PATCH) and reports
   `action: created/updated/unchanged`, so re-runs are safe in a pipeline.
-- ✅ **Write-only source credentials** — `mirror_ensure`'s `authToken` (for
+- ✅ **Write-only source credentials.** `mirror_ensure`'s `authToken` (for
   private GitHub sources) is supplied via a vault reference, sent once to
   `/repos/migrate`, and **never read back, stored in the data model, or
   logged**.
-- ✅ **Refuses unreconcilable drift** — a mirror's source URL is fixed at
+- ✅ **Refuses unreconcilable drift.** A mirror's source URL is fixed at
   migration time; asking `mirror_ensure` for a different source on an existing
-  mirror is an error, not a silent ignore. A name collision with a non-mirror
-  repo is likewise refused.
+  mirror is an error; it is not ignored. A name collision with a non-mirror repo
+  is likewise refused.
 - ✅ **Webhooks are read and repointed, never created, and no credential is ever
   emitted.** `webhook_audit` reports where every hook posts; `webhook_retarget`
   changes `config.url` alone, sending the hook's own events, branch filter and
-  authorization header back with it because Forgejo resets all three on any
-  edit that leaves them out. Neither sends a `secret` key — doing so would
-  overwrite the shared secret the CI server relies on. Creating a hook is left
-  to the CI server that owns that secret (Woodpecker: `repo_repair`).
+  authorization header back with it because Forgejo resets all three on any edit
+  that leaves them out. Neither sends a `secret` key, because that would
+  overwrite the shared secret the CI server uses. Creating a hook is left to the
+  CI server that owns that secret (Woodpecker: `repo_repair`).
 - ✅ **A hook URL's query string is treated as a credential.** Woodpecker
   authenticates its hooks with an `?access_token=<JWT>` on the URL itself, so
   the raw URL is a secret. Every reported `url` has its query **values
   redacted**, including in error messages; `matchesExpected` compares
   scheme/host/path only; and `webhook_retarget` **carries the existing query
-  over verbatim** — writing a query-free URL would leave a hook that still fires
-  but no longer authenticates.
-- ⚠️ **`pr_merge` is the one irreversible mutation** — it writes to the base
+  over verbatim**, because a URL without the query would leave a hook that still
+  fires but no longer authenticates.
+- ⚠️ **`pr_merge` is the one irreversible mutation.** It writes to the base
   branch. It refuses a PR that is closed, already merged, draft, or that the
   server does not report as mergeable, and refuses a head whose combined CI
   state is not `success` unless `force=true` is passed. `force` overrides the CI
-  gate **only** — it never overrides a conflicting PR.
+  gate **only**; it never overrides a conflicting PR.
 
 ## Authentication — scoped access token
 
 The model authenticates with a **Forgejo access token** (your avatar →
-**Settings → Applications**), sent as `Authorization: token <t>`. Scopes for the
-full surface:
+**Settings → Applications**), sent as `Authorization: token <t>`. Scopes needed
+by every method:
 
 ```
 write:repository, write:organization, read:admin, read:misc, read:user
 ```
 
-`read:admin` is only exercised by `user_list`; `read:misc` only by `health`. The
+`read:admin` is only used by `user_list`; `read:misc` only by `health`. The
 token's user must be a **site admin** for `user_list` and for the listing
 methods to see private repos across all owners.
 
-Known Forgejo gotchas this model designs around:
+Known Forgejo limitations this model works around:
 
-- Token CRUD (`/users/{u}/tokens`) is **basic-auth-only** — this model never
-  mints or revokes tokens.
+- Token CRUD (`/users/{u}/tokens`) is **basic-auth-only**, so this model never
+  creates or revokes tokens.
 - `migrations.ALLOW_LOCALNETWORKS=false` (a common hardening) makes
   private-address mirror sources fail with HTTP 422; GitHub sources are
   unaffected.
@@ -95,8 +95,8 @@ Optional global arg: `httpTimeoutMs` (default 30000).
 **Read / audit:** `health` (version + healthz), `org_list`, `repo_list` (all
 repos or one owner's), `user_list` (admin view; never any credential),
 `mirror_status` (every mirror's last sync, interval, and a `stale` flag),
-`branch_protection_list` (what each branch actually enforces), `webhook_audit`
-(where every hook posts, and whether that is where you expected).
+`branch_protection_list` (what each branch enforces), `webhook_audit` (where
+every hook posts, and whether it matches the URL you expected).
 
 ```bash
 # Mirror fleet audit — is anything failing to sync?
@@ -146,11 +146,11 @@ swamp model method run forgejo mirror_sync_now \
   --input owner=mirrors --input name=scrappy
 ```
 
-`mirror_ensure` creates with `service=github`, `mirrorInterval=8h0m0s`, `lfs=true`,
-`private=true` unless told otherwise. On an existing mirror it reconciles
-interval/visibility/description, and only those it was passed: leaving one out
-keeps the mirror's current value (interval compare is semantic — `8h` equals
-`8h0m0s`).
+`mirror_ensure` creates with `service=github`, `mirrorInterval=8h0m0s`,
+`lfs=true`, `private=true` unless other values are passed. On an existing mirror
+it reconciles interval/visibility/description, and only those it was passed:
+leaving one out keeps the mirror's current value (intervals are compared as
+durations, so `8h` equals `8h0m0s`).
 
 **Reversible lifecycle:** `repo_archive` / `repo_unarchive`.
 
@@ -176,7 +176,7 @@ swamp model method run forgejo pr_merge \
   --input deleteBranch=true
 ```
 
-**Webhooks** — audit and repoint only; see the scope guarantee:
+**Webhooks** (audit and repoint only; see the scope guarantee):
 
 ```bash
 # Where does every repo's webhook actually post? Supply the URL you expect and
@@ -194,18 +194,17 @@ swamp model method run forgejo webhook_retarget \
 ```
 
 `expectedUrl` and `matchUrl` are matched against **scheme/host/path only**, so
-pass them query-free — you cannot know a hook's per-repo token, and comparing
-raw URLs would report every hook as drifted.
+pass them without a query string. You cannot know a hook's per-repo token, and
+comparing full URLs would report every hook as drifted.
 
 A repo with several hooks needs `matchUrl` to say which one; an ambiguous match
-is **refused, not guessed**. A repo with no hooks is an error rather than a
-create — see the scope guarantee.
+is **refused**; the model does not pick one. A repo with no hooks is an error
+rather than a create — see the scope guarantee.
 
-`mergeable` and `ciState` come from a **single-PR fetch only** — a listing
-carries neither, so `pr_list` leaves both absent rather than reporting a value
-it cannot stand behind. `ciState: "none"` means the head commit carries no
-status at all, which is **not** a pass: a repo with CI disabled and a pipeline
-that never started are indistinguishable here.
+`mergeable` and `ciState` come from a **single-PR fetch only**. The list
+endpoint returns neither, so `pr_list` leaves both absent. `ciState: "none"`
+means the head commit carries no status at all, which is **not** a pass: a repo
+with CI disabled and a pipeline that never started are indistinguishable here.
 
 ## Data model
 
@@ -229,15 +228,15 @@ Data instance names replace `/` with `:` (swamp rejects slashes), so
 
 - All listings paginate at 50 (Forgejo's search cap) until a short page.
 - Search responses (`{ok, data}`) and bare-array responses are both handled.
-- Repo paths on disk are lowercased by Forgejo while API names keep display case
-  — instance names follow the API's display case.
+- Repo paths on disk are lowercased by Forgejo while API names keep display
+  case; instance names follow the API's display case.
 - A PR's head may be qualified (`owner:branch`) for a fork; find-or-create
   matches on the bare branch name, since that is what the API reports back.
 - `webhook_audit` needs admin on a repo to read its hooks. A repo it cannot read
-  is **skipped with a log line**, not fatal — a partial audit is still worth
-  having, but do not read a clean result as "every hook is correct" unless the
-  token is site-admin.
+  is **skipped with a log line** and the audit continues. A partial audit is
+  still useful, but do not read a clean result as "every hook is correct" unless
+  the token is site-admin.
 - Push-mirrors (Forgejo → GitHub), teams, deploy keys, and PR review/comment
-  endpoints are deliberately out of scope — file an issue when a real use-case
-  lands. Webhook _creation_ is out of scope on purpose, not for lack of a
-  use-case: see the scope guarantee.
+  endpoints are out of scope; file an issue when there is a real use-case.
+  Webhook _creation_ is excluded by design (see the scope guarantee), not for
+  lack of a use-case.

@@ -1,5 +1,5 @@
 import { z } from "npm:zod@4";
-// Type-only imports — erased at compile time, never bundled. They anchor the
+// Type-only imports, erased at compile time and never bundled. They type the
 // `satisfies ModelDefinition<typeof GlobalArgs>` clause so each method's
 // `execute` is contextually typed without an explicit `any`.
 import type {
@@ -7,28 +7,26 @@ import type {
   MethodContext,
   ModelDefinition,
 } from "jsr:@systeminit/swamp-testing@0.20260521.16";
-// Transport uses the Web `fetch`/`AbortController` globals only — NO `node:`
-// import, so the extension has zero dependencies and resolves no floating
-// `@types/node` at doc-lint time.
+// The transport uses only the Web `fetch`/`AbortController` globals and no
+// `node:` import, so the extension has no dependencies and does not resolve a
+// floating `@types/node` at doc-lint time.
 
 /**
- * `@thomas/stalwart` — careful, non-destructive administration of a Stalwart
- * mail server (v0.16+) over its JMAP-over-HTTP management API.
+ * `@thomas/stalwart`: non-destructive administration of a Stalwart mail server
+ * (v0.16+) over its JMAP-over-HTTP management API.
  *
- * SCOPE GUARANTEE (the whole point): this holds a powerful mail-admin credential,
- * so its surface is deliberately narrow and reversible. It NEVER hard-deletes an
- * account, domain, group, or list — the only "off switch" is the reversible
- * set-state (deactivate ⇄ reactivate) pair. The JMAP `destroy` verb is plumbed
- * through the transport for completeness but is reachable from NO method. Every
- * secret it accepts (an account password, a certificate private key) is sent to
+ * Scope: this holds a mail-admin credential, so every method is limited and
+ * reversible. It NEVER hard-deletes an account, domain, group, or list; the only
+ * way to disable one is the reversible set-state (deactivate ⇄ reactivate) pair.
+ * No method sends the JMAP `destroy` verb. Every secret it accepts (an account password, a certificate private key) is sent to
  * Stalwart exactly once and is NEVER read back into a resource or logged.
  *
  * Transport: Stalwart 0.16 removed the legacy REST `/api/*` management tree;
- * management is now JMAP (RFC 8620) at `POST {apiUrl}/jmap` — a
- * `{ using, methodCalls }` envelope driving `Foo/get` / `Foo/query` /
- * `Foo/set` {create,update,destroy}. A small `/api/*` set survives for
+ * management is now JMAP (RFC 8620) at `POST {apiUrl}/jmap`: a
+ * `{ using, methodCalls }` envelope carrying `Foo/get` / `Foo/query` /
+ * `Foo/set` {create,update,destroy}. A few `/api/*` endpoints remain for
  * introspection (`/api/account`, `/api/schema`) and metrics
- * (`/metrics/prometheus`); those are reached over the separate REST seam.
+ * (`/metrics/prometheus`); those use the separate REST seam.
  *
  * Auth: a scoped admin API key, sent as `Authorization: Bearer <key>` on every
  * request. No long-lived token is exchanged or stored.
@@ -59,9 +57,9 @@ const GlobalArgs = z.object({
   ),
 });
 
-// Resolved global-argument shape. Kept internal: `z.infer` is a "slow type", so
-// it must not leak onto the public API (the exported seam types use the loose
-// {@link Json} instead — see below).
+// Resolved global-argument shape. Not exported: `z.infer` is a "slow type", so
+// it must not appear on the public API (the exported seam types use the loose
+// {@link Json} instead).
 type GlobalArgsT = z.infer<typeof GlobalArgs>;
 
 /** The set of outcomes a method reports in its `action` field. */
@@ -239,7 +237,7 @@ const ProbeResult = z.object({
   ids: z.array(z.string()).describe("The ids returned (first page)"),
   // A probed object may carry sensitive fields (e.g. a Principal's hashed
   // `secrets`, or key material on an api-key type). Mark sensitive so swamp
-  // masks it and never logs it, even though it is stored for shape-pinning.
+  // masks it and never logs it, even though it is stored to record the shape.
   sample: z.string().meta({ sensitive: true }).optional().describe(
     "JSON of the first object's fields — for pinning the wire shape",
   ),
@@ -247,13 +245,13 @@ const ProbeResult = z.object({
   timestamp: z.string(),
 });
 
-// ─────────────────────────── JMAP type constants (PIN IN PHASE 0) ───────────────────────────
+// ─────────────────────────── JMAP type constants ───────────────────────────
 
 /**
  * JMAP capability URIs sent in the `using` array of every envelope. `core` and
  * `principals` are RFC-standard; `mgmt` (`urn:stalwart:jmap`) is the Stalwart
- * capability that serves every registry/management object. Confirmed against the
- * live 0.16 session resource during the Phase 0 discovery spike.
+ * capability that serves every registry/management object. Confirmed against a
+ * live 0.16 session resource.
  */
 export const USING = {
   core: "urn:ietf:params:jmap:core",
@@ -262,7 +260,7 @@ export const USING = {
 } as const;
 
 /**
- * Wire type names for Stalwart's JMAP objects, confirmed live (Phase 0).
+ * Wire type names for Stalwart's JMAP objects, confirmed against a live 0.16 server.
  * The principal family of individuals uses the RFC-standard `Principal` type;
  * every registry/management object is served under `urn:stalwart:jmap` with an
  * `x:` prefix. Singletons (`x:SpamClassifier`, `x:SystemSettings`) are `/get`
@@ -289,7 +287,7 @@ export const JMAP_TYPES = {
 
 // ─────────────────────────── HTTP seams ───────────────────────────
 
-/** A JSON-ish bag — structurally the resolved global args or an API body. */
+/** A loose JSON object: the resolved global args or an API body. */
 export type Json = Record<string, unknown>;
 
 /** A JMAP request envelope: the capabilities in use and the method calls to run. */
@@ -300,7 +298,7 @@ export interface JmapCall {
   methodCalls: unknown[][];
 }
 
-/** The parsed result of a {@link JmapCall} — the raw JMAP response body. */
+/** The parsed result of a {@link JmapCall}: the raw JMAP response body. */
 export interface JmapResult {
   /** HTTP status code. */
   status: number;
@@ -309,14 +307,13 @@ export interface JmapResult {
 }
 
 /**
- * The JMAP-call seam the methods use — swappable for unit tests. The global args
- * are typed loosely as {@link Json} so this EXPORTED type stays "fast-check"
- * clean (referencing the zod-inferred globals would drag a slow type onto the
- * public API). The real implementation re-narrows.
+ * The JMAP-call seam the methods use; unit tests can replace it. The global args
+ * are typed loosely as {@link Json} so this EXPORTED type passes "fast-check"
+ * (the zod-inferred globals are a slow type). The real implementation re-narrows.
  */
 export type JmapFn = (g: Json, call: JmapCall) => Promise<JmapResult>;
 
-/** One surviving-REST request: a GET/POST against an `/api/*` or `/metrics/*` path. */
+/** A REST request: a GET/POST against an `/api/*` or `/metrics/*` path. */
 export interface RestCall {
   /** HTTP verb. */
   method: "GET" | "POST";
@@ -338,7 +335,7 @@ export interface RestResult {
   text?: string;
 }
 
-/** The surviving-REST seam — swappable for unit tests. */
+/** The REST seam; unit tests can replace it. */
 export type RestFn = (g: Json, call: RestCall) => Promise<RestResult>;
 
 let _jmapOverride: JmapFn | null = null;
@@ -352,8 +349,8 @@ export function __setJmap(fn: JmapFn | null): void {
 /** Test-only seam: substitute the REST caller. Pass `null` to restore the real one. */
 export function __setRest(fn: RestFn | null): void {
   _restOverride = fn;
-  // The cached accountId was answered by the previous transport, so a different
-  // transport (a different fake server) must not inherit it.
+  // The cached accountId came from the previous transport; a different
+  // transport (a different fake server) must not reuse it.
   _accountIdCache.clear();
 }
 
@@ -450,8 +447,7 @@ function rest(g: GlobalArgsT, c: RestCall): Promise<RestResult> {
 // ─────────────────────────── JMAP envelope helpers ───────────────────────────
 
 /**
- * Pull method-call `i` out of a JMAP response and return its arguments object,
- * throwing on a method-level `["error", {...}]` tuple. JMAP reports per-call
+ * Return the arguments object of method-call `i` in a JMAP response, throwing on a method-level `["error", {...}]` tuple. JMAP reports per-call
  * failures inside an HTTP-200 body, so this is distinct from transport errors.
  */
 function methodResponseArgs(body: Json, index = 0): Json {
@@ -483,7 +479,7 @@ function nowIso(): string {
 
 /**
  * Cache key for the resolved accountId. The session's primary account depends on
- * who is asking, so two credentials against one URL must not share an entry.
+ * the credential, so two credentials against one URL must not share an entry.
  * The key carries a digest of the token rather than the token, so the map never
  * holds the secret in clear.
  */
@@ -505,7 +501,7 @@ async function resolveAccountId(g: GlobalArgsT): Promise<string | undefined> {
   const cached = _accountIdCache.get(cacheKey);
   if (cached !== undefined) return cached;
   // The session resource lists accounts under `.accounts` and names the primary
-  // under `.primaryAccounts`. Field shapes are confirmed in the Phase 0 spike.
+  // under `.primaryAccounts`. Field shapes confirmed against a live 0.16 server.
   const r = await rest(g, { method: "GET", path: "/.well-known/jmap" });
   const accounts = (r.body.accounts ?? {}) as Json;
   const primary = (r.body.primaryAccounts ?? {}) as Json;
@@ -555,8 +551,8 @@ async function jmapQuery(
 
 /**
  * Run a `<type>/set` with `create` and/or `update` blocks and return the raw set
- * response. By design it takes NO `destroy` — the no-destroy guarantee is
- * structural: there is no code path that can ask Stalwart to delete an object.
+ * response. It takes NO `destroy` block, so no code path can ask Stalwart to
+ * delete an object.
  * Per-item failures land in `notCreated`/`notUpdated`; callers check via
  * {@link setItemError}.
  */
@@ -595,7 +591,7 @@ async function runAction(
 
 /**
  * Inspect a set response for a per-item failure under `notCreated`/
- * `notUpdated` for `key`, and return a human message (or null if it succeeded).
+ * `notUpdated` for `key`, and return its error message (or null if it succeeded).
  */
 function setItemError(setRes: Json, key: string): string | null {
   for (const bucket of ["notCreated", "notUpdated"]) {
@@ -740,14 +736,14 @@ async function buildRolesUnion(
 /**
  * Parse a Prometheus text-exposition body into a flat `{ metric: value }` map,
  * collapsing label sets (last sample wins) and skipping comments. Pure and
- * exported for tests. Phase 1 curates which gauges `health_status` surfaces.
+ * exported for tests.
  */
 export function parsePrometheus(text: string): Record<string, number> {
   const out: Record<string, number> = {};
   for (const line of text.split("\n")) {
     const s = line.trim();
     if (!s || s.startsWith("#")) continue;
-    // `name{labels} value` or `name value` — take the metric name before `{`/space.
+    // `name{labels} value` or `name value`: the metric name ends at `{` or a space.
     const m = s.match(
       /^([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{[^}]*\})?\s+([-+0-9.eE]+|NaN|[-+]Inf)\s*$/,
     );
@@ -785,7 +781,8 @@ const ReportQueryArgs = z.object({
 
 /**
  * A string array that also accepts a JSON-encoded array or a comma-separated
- * string — so list-valued method arguments survive the CLI's `--input k=v`.
+ * string, so list-valued method arguments can be passed with the CLI's
+ * `--input k=v`.
  */
 const jsonArray = z.preprocess((v) => {
   if (typeof v !== "string") return v;
@@ -800,8 +797,8 @@ const jsonArray = z.preprocess((v) => {
 }, z.array(z.string()));
 
 /**
- * A JSON object argument that also accepts a JSON-encoded string — so an
- * object-valued method argument survives the CLI's `--input k=v`.
+ * A JSON object argument that also accepts a JSON-encoded string, so an
+ * object-valued method argument can be passed with the CLI's `--input k=v`.
  */
 const jsonObject = z.preprocess((v) => {
   if (typeof v !== "string") return v;
@@ -861,7 +858,7 @@ const GroupEnsureArgs = z.object({
 });
 
 /**
- * Curated, signed-off role permission sets. `role_ensure --input preset=…`
+ * Approved role permission sets. `role_ensure --input preset=…`
  * provisions one of these without having to pass a long permission list.
  * `swamp-admin`: non-destructive management (Get/Query/Create/Update, no
  * `*Destroy`). `automated-mailbox`: send-only authenticated SMTP.
@@ -873,9 +870,9 @@ const ROLE_PRESETS: Record<string, { description: string; enabled: string[] }> =
       // NB: to ASSIGN a custom role (e.g. `automated-mailbox`), this principal must
       // itself hold every permission that role grants (Stalwart privilege
       // non-escalation). swamp-admin is granted the `User` + `Automated Mailbox`
-      // member roles out-of-band via the web-admin (a one-time fallback-admin
-      // bootstrap — swamp-admin can't self-escalate) rather than enumerating those
-      // perms here, so they are intentionally NOT in this flat list.
+      // member roles out-of-band via the web-admin (a one-time step by the
+      // fallback admin, because swamp-admin can't grant itself permissions), so
+      // those perms are NOT in this flat list.
       enabled: [
         "authenticate",
         // settings singletons the extension reads/writes (settings_get/_set)
@@ -1033,9 +1030,8 @@ function logInfo(
 
 /**
  * The `@thomas/stalwart` model definition: a `reachable` live check, the mail
- * management resource schemas, and the methods. JMAP-backed methods are added
- * after the Phase 0 discovery spike pins {@link USING} / {@link JMAP_TYPES}; the
- * REST-only `health_status` is available now.
+ * management resource schemas, and the methods. JMAP-backed methods use the
+ * {@link USING} / {@link JMAP_TYPES} constants; `health_status` uses REST only.
  */
 export const model = {
   type: "@thomas/stalwart",
@@ -1143,8 +1139,7 @@ export const model = {
       garbageCollection: 20,
     },
     "probe": {
-      description:
-        "Phase 0 discovery probe: the wire shape of one JMAP object type",
+      description: "Discovery probe: the wire shape of one JMAP object type",
       schema: ProbeResult,
       lifetime: "infinite",
       garbageCollection: 20,
@@ -1158,7 +1153,6 @@ export const model = {
     },
   },
   methods: {
-    // ───────────── read / health (REST-only; spike-independent) ─────────────
     // ───────────── read / audit (JMAP, factory) ─────────────
     domain_list: {
       description:
@@ -1428,7 +1422,7 @@ export const model = {
         const g = context.globalArgs;
         const accountId = await resolveAccountId(g);
         logInfo(context, "Listing mail queue");
-        // Field names vary; fetch the default projection and map defensively.
+        // Field names vary; fetch the default projection and tolerate missing fields.
         const rows = await listAll(g, JMAP_TYPES.queuedMessage, accountId);
         const ts = nowIso();
         const handles: DataHandle[] = [];
@@ -2245,8 +2239,8 @@ export const model = {
         const g = context.globalArgs;
         const accountId = await resolveAccountId(g);
         logInfo(context, "Installing certificate");
-        // certificate is a PublicText union, privateKey a SecretText union —
-        // both inline as `{"@type":"Text", …}` (cert uses `value`, key `secret`).
+        // certificate is a PublicText union, privateKey a SecretText union;
+        // both are sent inline as `{"@type":"Text", …}` (cert uses `value`, key `secret`).
         const payload: Json = {
           certificate: { "@type": "Text", value: a.certificate },
           privateKey: { "@type": "Text", secret: a.privateKey },
@@ -2283,7 +2277,7 @@ export const model = {
           action = "created";
         }
         if (a.reload) await runAction(g, accountId, "ReloadTlsCertificates");
-        // Best-effort enrichment: read back the parsed SANs / validity.
+        // Best effort: read back the parsed SANs / validity.
         let subject: string | undefined;
         let sans: string[] | undefined;
         let notAfter: string | undefined;
@@ -2389,12 +2383,12 @@ export const model = {
         return { dataHandles: [handle] };
       },
     },
-    // ───────────── Phase 0 discovery (read-only JMAP probe) ─────────────
+    // ───────────── discovery (read-only JMAP probe) ─────────────
     session_dump: {
       description:
         "Fetch the JMAP session resource (/.well-known/jmap) and record the " +
-        "advertised capabilities + accounts. Read-only; used to pin the " +
-        "management capability URI before the Phase 1 methods are built.",
+        "advertised capabilities + accounts. Read-only; used to check the " +
+        "management capability URI against a Stalwart version.",
       arguments: Empty,
       execute: async (
         _rawArgs,
@@ -2423,8 +2417,8 @@ export const model = {
     jmap_probe: {
       description:
         "Discovery probe: run `<type>/query` then `<type>/get` for one type and " +
-        "capture the wire shape (ids + a sample object). Read-only; used to pin " +
-        "the JMAP_TYPES constants before the Phase 1 methods are built.",
+        "capture the wire shape (ids + a sample object). Read-only; used to check " +
+        "the JMAP_TYPES constants against a Stalwart version.",
       arguments: JmapProbeArgs,
       execute: async (
         rawArgs,
@@ -2456,12 +2450,5 @@ export const model = {
         return { dataHandles: [handle] };
       },
     },
-    // ───────────── JMAP-backed methods land here AFTER the Phase 0 spike ─────────────
-    // domain_list, account_list, alias_list, group_list, report_query, queue_list,
-    // reload, reload_certificates, account_ensure, account_set_state (Phase 1);
-    // group_ensure, group_set_state, mailing_list_ensure, role_assign,
-    // spam_config_ensure, spam_train (gap-gated), certificate_install (Phase 2).
-    // They use jmapGet/jmapQuery/jmapSet + resolveAccountId with the pinned
-    // USING/JMAP_TYPES constants. None passes `destroy`.
   },
 } satisfies ModelDefinition<typeof GlobalArgs>;

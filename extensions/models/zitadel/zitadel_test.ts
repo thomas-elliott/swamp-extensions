@@ -1,10 +1,10 @@
 /**
- * Unit tests for the load-bearing, security-sensitive logic of `@thomas/zitadel`:
+ * Unit tests for the important, security-sensitive logic of `@thomas/zitadel`:
  * the JWT assertion claims, find-or-create idempotency, the friendly→Zitadel enum
  * mapping sent on the wire, the verify-first PAT-revoke guard, secret-once output
  * shape, the role/grant authorization methods (incl. project_authz_set's no-auto-
  * create), and the single-exception hard-delete guarantee (only role_remove). No
- * live server — the API caller is faked via the __setCaller seam.
+ * live server: the API caller is faked via the __setCaller seam.
  */
 import {
   __setCaller,
@@ -693,12 +693,12 @@ Deno.test("app_get: round-trips non-default OIDC enums (spa/jwt) from the wire",
     const { context, written } = makeContext();
     await method("app_get").execute({ projectId: "p1", appId: "a2" }, context);
     // USER_AGENT must read back as "spa" (the write-path friendly value), NOT
-    // friendlyState's "agent" — so a read-then-converge sees no spurious drift.
+    // friendlyState's "agent", so a read-then-converge reports no false drift.
     assertEquals(written[0].data.appType, "spa");
     assertEquals(written[0].data.accessTokenType, "jwt");
     assertEquals(written[0].data.devMode, true);
-    // ID_TOKEN / AUTHORIZATION_CODE / REFRESH_TOKEN would all collapse to the
-    // wrong friendlyState value ("token"/"code") — the reverse map fixes them.
+    // Through friendlyState, ID_TOKEN / AUTHORIZATION_CODE / REFRESH_TOKEN would
+    // all become the wrong value ("token"/"code"); the reverse map avoids that.
     assertEquals(written[0].data.responseTypes, ["code", "id_token"]);
     assertEquals(written[0].data.grantTypes, [
       "authorization_code",
@@ -1272,8 +1272,8 @@ Deno.test("grant_list: filters by user + project and is a factory", async () => 
 // ─────────────────────────── reachable check ───────────────────────────
 
 // A check receives globalArgs without the schema's defaults. An unset
-// httpTimeoutMs used to abort the token exchange at once, and an unset
-// tokenScope was sent as the literal string "undefined".
+// httpTimeoutMs must not abort the token exchange at once, and an unset
+// tokenScope must not be sent as the literal string "undefined".
 Deno.test("reachable check applies the schema defaults to globalArgs", async () => {
   const kp = await crypto.subtle.generateKey(
     {
@@ -1309,7 +1309,7 @@ Deno.test("reachable check applies the schema defaults to globalArgs", async () 
     const res = await checks.reachable.execute({
       globalArgs: {
         apiUrl: GLOBALS.apiUrl,
-        // A keyId of its own, so the module's token cache cannot answer first.
+        // A keyId of its own, so the module's token cache has no entry for it.
         keyJson: JSON.stringify({
           keyId: "check-defaults",
           key: pem,

@@ -4,19 +4,22 @@ Custom [swamp](https://github.com/systeminit/swamp) extensions by **@thomas**.
 
 ## Extensions
 
-| Extension | Type | Status | Docs |
-|---|---|---|---|
-| [`@thomas/arcane`](./extensions/models/arcane/README.md) | model | Built, live-validated, publish-ready (`2026.05.22.1`, 41 methods) | [README](./extensions/models/arcane/README.md) |
-| [`@thomas/technitium`](./extensions/models/technitium/README.md) | model | Built, unit-tested; pending live smoke test (`2026.05.23.1`, 28 methods) | [README](./extensions/models/technitium/README.md) |
+| Extension | Manages |
+|---|---|
+| [`@thomas/arcane`](./extensions/models/arcane/README.md) | An [Arcane](https://getarcane.app) Docker instance through its REST API: GitOps sync, compose projects, swarm stacks, secret/config rotation |
+| [`@thomas/forgejo`](./extensions/models/forgejo/README.md) | A [Forgejo](https://forgejo.org) (or Gitea) server: organisations, repositories, GitHub pull-mirrors, pull requests |
+| [`@thomas/garage`](./extensions/models/garage/README.md) | A [Garage](https://garagehq.deuxfleurs.fr/) object-store cluster through its Admin API: buckets, access keys, permissions |
+| [`@thomas/postgres-admin`](./extensions/models/postgres-admin/README.md) | PostgreSQL databases, roles and grants, without reading or writing table data |
+| [`@thomas/stalwart`](./extensions/models/stalwart/README.md) | A [Stalwart](https://stalw.art) mail server: domains, accounts, aliases, groups, roles, certificates |
+| [`@thomas/technitium`](./extensions/models/technitium/README.md) | A [Technitium DNS Server](https://technitium.com/dns/): blocking, zones and records, debugging, settings backup |
+| [`@thomas/truenas`](./extensions/models/truenas/README.md) | A [TrueNAS SCALE](https://www.truenas.com/) host: app port exposure, NFS/SMB share access |
+| [`@thomas/woodpecker`](./extensions/models/woodpecker/README.md) | A [Woodpecker CI](https://woodpecker-ci.org) server: repository onboarding, secrets, pipelines |
+| [`@thomas/zitadel`](./extensions/models/zitadel/README.md) | A [Zitadel](https://zitadel.com) instance: OIDC/API applications, service users, roles and grants |
 
-`@thomas/arcane` manages an [Arcane](https://getarcane.app) Docker instance entirely through Arcane's REST API.
-See its [README](./extensions/models/arcane/README.md) for installation, configuration, and every method section.
+Each extension's README covers installation, configuration and its methods. The
+current version is in its `manifest.yaml`.
 
-`@thomas/technitium` manages a [Technitium DNS Server](https://technitium.com/dns/) through its HTTP API —
-built-in blocking, zone/record lifecycle, allow/block lists, DNS-client + query-log debugging, cache, and
-settings backup/restore. See its [README](./extensions/models/technitium/README.md).
-
-## Roadmap
+## Roadmap (`@thomas/arcane`)
 
 What `@thomas/arcane` does **not** cover yet. The deploy and rotation *orchestration*
 already ship inside methods (`project_deploy`, `swarm_stack_deploy`,
@@ -29,8 +32,9 @@ rather than new workflows.
 - `swarm_cluster_` — status/info/init/join/leave/unlock/tokens
 - `container_` — list/get/start/stop/restart/redeploy/update/remove
 - `system_` — docker_info, run→compose convert, upgrade_check. (`system_prune` is
-  **deliberately skipped**: its required `mode` field is an undocumented bare string
-  with no enum — the per-type prunes cover it without guessing into a destructive call.)
+  **skipped on purpose**: its required `mode` field is an undocumented bare string
+  with no enum, so calling it means guessing a value for a destructive call. The
+  per-type prunes cover the same cleanup.)
 - `admin_` — health/version/update, notifications, users, apikeys, registries, settings
 - `env_` (fleet) — list/create/pair/remove/test additional Arcane environments
 - `gitops_author_` — write a rendered stack into the local gitops repo, commit, push
@@ -58,8 +62,8 @@ in the compose). Both are detailed in the extension README.
 ## Repository layout
 
 ```
-extensions/models/arcane/   @thomas/arcane (arcane.ts, arcane_test.ts, README.md,
-                            LICENSE.txt, manifest.yaml)
+extensions/models/<name>/   one directory per extension: <name>.ts, <name>_test.ts,
+                            README.md, LICENSE.txt, manifest.yaml
 CLAUDE.md                   repo rules + the locked guardrails & validation policy
 README.md                   this file
 LICENSE                     MIT

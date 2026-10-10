@@ -1,44 +1,45 @@
 # @thomas/zitadel
 
-Careful, non-destructive **Zitadel administration** for swamp, over the Zitadel
-**Management API (v1 REST)**. Built for the common homelab tasks — standing up a
-new application's OIDC client, wiring service accounts, and rotating credentials
-— without the console click-through.
+Non-destructive **Zitadel administration** for swamp, over the Zitadel
+**Management API (v1 REST)**. It covers common homelab tasks without using the
+console: creating a new application's OIDC client, setting up service accounts,
+and rotating credentials.
 
 ## Scope guarantee (read this first)
 
-This extension holds a powerful **IAM admin** credential, so its surface is
-deliberately narrow and **reversible**:
+This extension holds an **IAM admin** credential, so its methods are limited
+and **reversible**:
 
-- ❌ **No hard deletes** — never deletes a project, application, or user. The
-  only "off switch" is the reversible `app_set_state` / `user_set_state` /
+- ❌ **No hard deletes**: never deletes a project, application, or user. The
+  only way to disable one is the reversible `app_set_state` / `user_set_state` /
   `grant_set_state` (deactivate ⇄ reactivate). The **one** exception is
-  `role_remove`: a project role has no deactivate state in Zitadel, so retiring
-  one is a verify-first `DELETE` — bounded and effectively reversible (re-create
-  the same key), but it does cascade-revoke any grants referencing the role.
-- ❌ **Machine identities only** — manages service users + their
-  PATs/keys/secrets; it does **not** create human users or touch human
+  `role_remove`: a project role has no deactivate state in Zitadel, so removing
+  one is a verify-first `DELETE`. It affects only that role and can effectively
+  be undone by re-creating the same key, but it also revokes any grants that
+  reference the role.
+- ❌ **Machine identities only**: manages service users and their
+  PATs/keys/secrets; it does **not** create human users or change human
   passwords/MFA.
-- ✅ **Secrets once** — every credential it mints (client secret, PAT, machine
-  key) is emitted exactly once in the method output and marked `sensitive`;
+- ✅ **Secrets once**: every credential it creates (client secret, PAT, machine
+  key) is returned exactly once in the method output and marked `sensitive`;
   never logged.
-- ✅ **Verify-before-mutate** — rotations/revocations confirm the target exists
-  (and, for `pat_revoke`, that the token belongs to the user) first.
+- ✅ **Verify-before-mutate**: rotations/revocations first confirm the target
+  exists (and, for `pat_revoke`, that the token belongs to the user).
 
 If you need human-user management or destructive operations, use the Zitadel
-console — that's intentionally out of scope here.
+console. They are out of scope here.
 
 ## Authentication — JWT private-key service account
 
 The model authenticates as a **service user with a JSON private key** (not a
-long-lived bearer). Per run it signs a short-lived RS256 assertion and exchanges
-it at `/oauth/v2/token` for an access token. Bootstrap once:
+long-lived bearer token). Per run it signs a short-lived RS256 assertion and
+exchanges it at `/oauth/v2/token` for an access token. One-time setup:
 
 1. In the Zitadel console: **Users → New → Service User** (e.g. `swamp-admin`).
 2. On that user: **Keys → New → JSON** → download the key JSON (shown once).
 3. Grant it a manager role: **Org → Managers → Add** with **ORG_OWNER** (enough
    for org-scoped project/app/user management).
-4. Store the key JSON in your vault (the whole blob in one field).
+4. Store the key JSON in your vault (the whole JSON document in one field).
 
 ## Install
 
@@ -76,7 +77,7 @@ swamp model method run zitadel oidc_app_ensure \
 - `project_ensure` — find-or-create a project by name.
 - `oidc_app_ensure` — ensure an OIDC client (redirect/post-logout URIs, appType
   `web|spa|native`, authMethod `basic|post|none|jwt`, grant/response types,
-  devMode). Re-running converges only the fields it is given
+  devMode). Re-running updates only the fields it is given
   (`action: unchanged|updated`); everything else, including settings this
   method doesn't model, keeps its current value.
 - `api_app_ensure` — ensure an API app (M2M resource server).
@@ -99,17 +100,18 @@ swamp model method run zitadel project_authz_set \
   --input project=homelab --input roleAssertion=true
 ```
 
-- `role_ensure` — find-or-create a project role by `key`; converge
+- `role_ensure` — find-or-create a project role by `key`; update
   `displayName`/ `group` (`action: created|unchanged|updated`).
-- `role_remove` — verify-first `DELETE` of a role (the one hard delete; cascade-
+- `role_remove` — verify-first `DELETE` of a role (the only hard delete; also
   revokes grants that reference it).
 - `grant_ensure` — grant a user (id or loginname) a **set** of role keys on a
-  project; re-running converges the set (order-insensitive). Omit `roleKeys` to
+  project; re-running sets the grant to exactly that set (order does not
+  matter). Omit `roleKeys` to
   keep an existing grant's roles as they are.
 - `grant_set_state` — deactivate/reactivate a grant (verify-first, reversible).
 - `project_authz_set` — toggle a project's `roleAssertion` / `roleCheck` /
-  `hasProjectCheck` on an **existing** project (fetch-merge, never
-  auto-creates). Without `roleAssertion`, granted roles do **not** appear in
+  `hasProjectCheck` on an **existing** project (reads the project and merges
+  the change; never creates a project). Without `roleAssertion`, granted roles do **not** appear in
   users' tokens.
 
 **Reversible lifecycle:** `app_set_state` (active/inactive), `user_set_state`
@@ -121,9 +123,8 @@ and a `timestamp`.
 
 ## Notes
 
-- Zero dependencies and no `node:` imports — JWT signing uses the Web Crypto API
+- Zero dependencies and no `node:` imports: JWT signing uses the Web Crypto API
   (`crypto.subtle`). Zitadel issues PKCS#1 RSA keys, which are wrapped to PKCS#8
   (a fixed DER envelope) before importing, since Web Crypto imports only PKCS#8.
-- Targets the stable Management v1 API. For very large user bases the v2 User
-  API is Zitadel's recommended surface; a future version may switch user methods
-  over.
+- Targets the stable Management v1 API. For very large user bases Zitadel
+  recommends the v2 User API; a future version may switch user methods to it.

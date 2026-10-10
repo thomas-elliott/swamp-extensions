@@ -1,8 +1,8 @@
 import { z } from "npm:zod@4";
-// Type-only imports — erased at compile time, never bundled. They anchor the
+// Type-only imports, erased at compile time and never bundled. The
 // `satisfies ModelDefinition<typeof GlobalArgs>` clause on `model` (and the
-// factory return types) so every method's `execute` is contextually typed
-// without an explicit `any` on its parameters. See swamp-extension typing.md.
+// factory return types) uses them so every method's `execute` is contextually
+// typed without an explicit `any` on its parameters. See swamp-extension typing.md.
 import type {
   DataHandle,
   MethodContext,
@@ -18,9 +18,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 /**
- * `@thomas/arcane` — management of an Arcane Docker instance, fronted entirely
- * by Arcane's REST API (X-API-Key auth). Every mutation goes through Arcane; the
- * one local subprocess is read-only compose validation (`docker compose config`).
+ * `@thomas/arcane` manages an Arcane Docker instance entirely through Arcane's
+ * REST API (X-API-Key auth). Every mutation goes through Arcane; the one local
+ * subprocess is read-only compose validation (`docker compose config`).
  *
  * Method sections (by prefix):
  *   - `gitops_*` — set up + drive Arcane Git Sync (repo connection, syncs, triggers).
@@ -30,10 +30,9 @@ import { join } from "node:path";
  *   - `secret_*` / `config_*` / `swarm_service_*` — swarm secret/config CRUD and the
  *     rotation orchestrations (`secret_rotate`/`config_rotate`).
  *
- * GitOps is one supported deployment mode, not the extension's identity: direct
- * (API) mode and gitops mode are both first-class, chosen per project.
+ * Direct (API) mode and gitops mode are both fully supported, chosen per project.
  *
- * The extension only ever *consumes* an API key — it never touches the Arcane
+ * The extension only uses an API key; it never touches the Arcane
  * container. Mint the key however suits your install (`ADMIN_STATIC_API_KEY` env
  * for declarative setups, or Settings → API Keys), store it in a vault, and
  * reference it from `apiKey`.
@@ -608,7 +607,7 @@ export function __setComposeValidator(fn: ValidateFn | null): void {
 
 /**
  * Validate compose content LOCALLY with `docker compose config -q` (guardrail #9b:
- * read-only, on the swamp host, never via SSH). Fails closed — any non-zero exit
+ * read-only, on the swamp host, never via SSH). Fails closed: any non-zero exit
  * throws with the validator's stderr. Returns the local compose version so
  * version skew vs Arcane's deployer (an accepted risk, §3) stays visible. Routes
  * through the test seam when one is installed.
@@ -741,7 +740,7 @@ type HealthResult = { healthy: boolean; status: string; detail: string };
 /**
  * Pure predicate: is a compose project healthy? Status must be `running`, no runtime
  * service may report `unhealthy`, and (when Arcane reports counts) runningCount must
- * cover serviceCount. Extracted from the poller so it can be unit-tested.
+ * cover serviceCount. Separate from the poller so it can be unit-tested.
  */
 export function projectHealthy(
   status: string,
@@ -806,8 +805,8 @@ export const b64 = (s: string): string =>
 
 /**
  * Confirm the target environment is swarm-enabled before a swarm operation.
- * (Manager rights are enforced by Arcane — a non-manager mutation returns 403,
- * which `arcane()` surfaces — so this is the early, friendly guard.)
+ * Arcane also enforces manager rights (a non-manager mutation returns 403, which
+ * `arcane()` surfaces); this check fails earlier with a clearer message.
  */
 async function ensureSwarmManager(g: GlobalArgsT): Promise<void> {
   let enabled = false;
@@ -900,7 +899,7 @@ function swarmServiceResource(
 /**
  * Re-point a swarm ServiceSpec's references to a rotated object from the old name to
  * the new id+name, preserving the mount target (`File.Name`). Mutates `spec` in place.
- * Returns how many references were rewritten. Pure (no I/O) — unit-tested.
+ * Returns how many references were rewritten. Pure (no I/O); unit-tested.
  */
 export function repointServiceRefs(
   spec: Json,
@@ -1158,12 +1157,12 @@ async function stackGone(g: GlobalArgsT, path: string): Promise<boolean> {
 /**
  * Remove a swarm stack and confirm the record is actually cleared, returning the
  * number of DELETEs issued. Arcane's first DELETE tears down the running services
- * (`docker stack rm`) but RETAINS its stored stack record — `swarm_stack_get` still
- * returns it (with `services:0`) and `swarm_stack_list` still shows it — so a single
- * DELETE leaves the stack half-removed. We therefore DELETE, poll the stack GET, and
- * re-issue DELETE until the record 404s. A non-404 DELETE error (e.g. an in-use
- * conflict) propagates immediately — we never force around it (guardrail #5). If the
- * record is still present at the deadline we throw rather than silently report success.
+ * (`docker stack rm`) but RETAINS its stored stack record: `swarm_stack_get` still
+ * returns it (with `services:0`) and `swarm_stack_list` still shows it, so a single
+ * DELETE leaves the stack half-removed. This function therefore DELETEs, polls the
+ * stack GET, and re-issues DELETE until the record 404s. A non-404 DELETE error (e.g.
+ * an in-use conflict) propagates immediately and is never forced (guardrail #5). If the
+ * record is still present at the deadline it throws rather than report success.
  */
 async function pollStackRemoved(
   g: GlobalArgsT,
@@ -1191,11 +1190,10 @@ async function pollStackRemoved(
 // ---------------------------------------------------------------------------
 // Per-method argument schemas.
 //
-// Each method's `arguments` schema is named here so it is the single source of
-// truth: it is referenced both by the method's `arguments:` field and by its
-// `execute` parameter type via `z.infer<typeof ...>`. Swamp validates `args`
-// against the schema before calling `execute`, so the inferred type is an
-// accurate, zero-cost compile-time narrowing of the already-validated input.
+// Each method's `arguments` schema is named here and used for both the method's
+// `arguments:` field and its `execute` parameter type (`z.infer<typeof ...>`).
+// Swamp validates `args` against the schema before calling `execute`, so the
+// inferred type matches the validated input.
 // ---------------------------------------------------------------------------
 
 /** Shared: a single required `name`. */
@@ -2158,7 +2156,7 @@ export const model = {
           firstDeploy: isFirstDeploy,
         });
 
-        // 2a. GitOps mode — never push inline content (don't fight the sync).
+        // 2a. GitOps mode: never push inline content; the content comes from git via the sync.
         if (gitops) {
           if (
             args.composePath !== undefined || args.composeContent !== undefined
@@ -2235,8 +2233,8 @@ export const model = {
 
         // 3. Apply (create/update) → redeploy → health, capturing ANY failure. Arcane
         //    rejects a bad deploy synchronously (a container that exits is returned as
-        //    HTTP 400, not a 200 + async failure), so the redeploy can throw — that must
-        //    route to the same rollback path as a returned-unhealthy poll.
+        //    HTTP 400, not a 200 + async failure), so the redeploy can throw; the throw
+        //    takes the same rollback path as an unhealthy poll result.
         let failReason: string | undefined;
         let healthy = false;
         try {
@@ -3012,7 +3010,7 @@ function makeLifecycle(
           await deleteIfPresent(g, path);
         } else {
           // up and pull stream NDJSON: the 200 arrives before the work runs and
-          // a failure is an error line in the body, so the status proves nothing.
+          // a failure is an error line in the body, so the status alone shows nothing.
           const failure = streamError(await arcane(g, httpMethod, path));
           if (failure !== undefined) {
             throw new Error(

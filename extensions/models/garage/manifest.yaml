@@ -3,11 +3,11 @@ name: "@thomas/garage"
 version: 2026.06.24.1
 description: >-
   Control-plane administration of a Garage (S3-compatible object store) cluster
-  via its Admin API v2 (bearer token). Read/audit of cluster health, buckets,
-  access keys, and the full key×bucket permission matrix; plus management — create
-  /update/delete buckets, manage aliases, create/import/update/rotate/delete access
-  keys, and grant/revoke read/write/owner permissions. Never touches S3 object
-  data; destructive verbs verify the target by id first.
+  through its Admin API v2 (bearer token). Reads cluster health, buckets, access
+  keys, and the full key×bucket permission matrix. Creates, updates and deletes
+  buckets; manages aliases; creates, imports, updates, rotates and deletes access
+  keys; and grants or revokes read/write/owner permissions. Never touches S3
+  object data; delete and revoke methods verify the target by id first.
 repository: https://github.com/thomas-elliott/swamp-extensions
 paths:
   base: manifest

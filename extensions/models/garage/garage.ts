@@ -1,6 +1,6 @@
 import { z } from "npm:zod@4";
-// Type-only imports — erased at compile time, never bundled. They anchor the
-// `satisfies ModelDefinition<typeof GlobalArgs>` clause so each method's
+// Type-only imports, erased at compile time and never bundled. The
+// `satisfies ModelDefinition<typeof GlobalArgs>` clause uses them so each method's
 // `execute` is contextually typed without an explicit `any`.
 import type {
   DataHandle,
@@ -9,13 +9,13 @@ import type {
 } from "jsr:@systeminit/swamp-testing@0.20260521.16";
 
 /**
- * `@thomas/garage` — administration of a Garage (S3-compatible object store)
+ * `@thomas/garage`: administration of a Garage (S3-compatible object store)
  * cluster via its **Admin API v2** (`/v2/…`, bearer-token auth). Targets Garage
  * v2.1+ where bucket/key selectors are query parameters (`?id=`, `?globalAlias=`);
  * see the README for the v2.0 path-parameter caveat.
  *
- * SCOPE: this holds the cluster's `admin_token`, so the surface is deliberately
- * the *control plane only* — buckets, access keys, and key↔bucket permissions. It
+ * SCOPE: this holds the cluster's `admin_token`, so the methods cover the
+ * control plane only: buckets, access keys, and key↔bucket permissions. It
  * never touches S3 object data (no GET/PUT/list of objects), and the only
  * destructive verbs (`bucket_delete`, `key_delete`) pre-verify the target by id
  * first (CLAUDE.md rule 5). Garage itself refuses to delete a non-empty bucket.
@@ -33,7 +33,7 @@ import type {
  * Secrets: `adminToken` is supplied via a vault expression, e.g.
  * `${{ vault.get(<vault>, garage/admin_token) }}`. Newly created/rotated key
  * secrets are returned ONCE by Garage and surfaced on the `key-result` resource
- * (`secretAccessKey`, marked sensitive) — capture them and store in 1Password;
+ * (`secretAccessKey`, marked sensitive). Capture them and store in 1Password;
  * they cannot be retrieved again except via `key_get --showSecretKey`.
  */
 
@@ -57,8 +57,8 @@ const GlobalArgs = z.object({
 });
 
 // Resolved global-argument shape. Kept internal: `z.infer` is a "slow type", so it
-// must not leak onto the public API — the exported {@link ApiFn} seam uses the
-// loose {@link Json} instead (mirrors the pattern in `@thomas/postgres-admin`).
+// must not appear on the public API. The exported {@link ApiFn} seam uses the
+// loose {@link Json} instead (same pattern as `@thomas/postgres-admin`).
 type GlobalArgsT = z.infer<typeof GlobalArgs>;
 
 /** Lifecycle outcome recorded on result resources. */
@@ -183,7 +183,7 @@ const BucketResult = z.object({
 const KeyResult = z.object({
   accessKeyId: z.string().optional(),
   name: z.string().optional(),
-  /** Returned ONCE by Garage on create/rotate — sensitive; persisted here so you can
+  /** Returned ONCE by Garage on create/rotate. Sensitive; persisted here so you can
    * capture it. Move it to 1Password and GC this artifact. */
   secretAccessKey: z.string().meta({ sensitive: true }).nullable().optional(),
   action: Action,
@@ -260,13 +260,13 @@ const LayoutResult = z.object({
 
 // ─────────────────────────── api seam ───────────────────────────
 
-/** A JSON-ish bag — structurally the resolved global args / request bodies. */
+/** A JSON object: the resolved global args or a request body. */
 export type Json = Record<string, unknown>;
 
 /**
  * Low-level Admin API call seam. `g` is typed loosely as {@link Json} so this
- * EXPORTED type stays "fast-check" clean (referencing the zod-inferred global-args
- * type would drag a slow type onto the public API). Returns the parsed JSON body
+ * EXPORTED type passes "fast-check" (referencing the zod-inferred global-args
+ * type would put a slow type on the public API). Returns the parsed JSON body
  * (or `undefined` for empty 2xx responses); throws on a non-2xx status.
  */
 export type ApiFn = (

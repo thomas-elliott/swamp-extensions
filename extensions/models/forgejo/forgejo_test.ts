@@ -1,11 +1,11 @@
 /**
- * Unit tests for the load-bearing, safety-sensitive logic of `@thomas/forgejo`:
+ * Unit tests for the important, safety-sensitive logic of `@thomas/forgejo`:
  * the find-or-create idempotency of org_ensure/repo_ensure/mirror_ensure, the
  * empty-shell-repo detection (report, never delete), the mirror source-drift
- * refusal, the authToken-never-stored guarantee (sent on the wire to
- * /repos/migrate but never written to a resource), archive/unarchive
- * idempotency, pagination, and mirror staleness math. No live server — the
- * API caller is faked via the __setCaller seam.
+ * refusal, the authToken-never-stored guarantee (sent to /repos/migrate but
+ * never written to a resource), archive/unarchive idempotency, pagination,
+ * and mirror staleness math. No live server; the API caller is faked via the
+ * __setCaller seam.
  */
 import {
   __setCaller,
@@ -343,7 +343,7 @@ Deno.test("mirror_ensure migrates when absent; authToken on the wire, never stor
     assertEquals(body.service, "github");
     assertEquals(body.auth_token, "ghp_SECRET");
     assertEquals(body.lfs, true);
-    // The guarantee: the token never lands in the data model.
+    // The token is never written to the data model.
     assert(
       !JSON.stringify(written).includes("ghp_SECRET"),
       "authToken must never be written to a resource",
@@ -1495,8 +1495,8 @@ Deno.test("branch_protection_ensure creates a PR-only rule", async () => {
     const body = post?.body as Record<string, unknown>;
     assertEquals(body.rule_name, "main");
     assertEquals(body.enable_push, false);
-    // A supplied-but-false field must still be sent on create — omitting it
-    // would let the server default decide.
+    // A supplied-but-false field must still be sent on create; omitting it
+    // would apply the server default.
     assertEquals(body.apply_to_admins, false);
     assertEquals(written[0].data.action, "created");
     assertEquals(written[0].data.enablePush, false);
@@ -1577,7 +1577,7 @@ Deno.test("branch_protection_ensure is unchanged when converged", async () => {
 });
 
 // Forgejo reads enable_push_whitelist only inside its enable_push handling,
-// so a whitelist flag sent on its own is dropped and reads as drift forever.
+// so a whitelist flag sent on its own is dropped and reported as drift on every run.
 Deno.test("branch_protection_ensure sends enable_push alongside a whitelist on update", async () => {
   const { caller, calls } = makeFakeApi((c) =>
     c.method === "GET"
@@ -1723,7 +1723,7 @@ Deno.test("branch_protection_list writes one resource per rule", async () => {
 
 const FUNNEL = "https://duna.ghost-eagle.ts.net:8443/api/hook";
 // Woodpecker appends a per-repo JWT to the hook URL; the fixtures carry one
-// so the tests exercise the real shape rather than a tidied-up one.
+// so the tests use the real URL format.
 const TOKEN = "eyJhbGciOiJIUzI1NiJ9.eyJ0eXBlIjoiaG9vayJ9.sig";
 const INCLUSTER =
   "http://woodpecker-server.woodpecker.svc.cluster.local/api/hook";
@@ -1738,8 +1738,8 @@ function hookObj(over: Record<string, unknown> = {}): Record<string, unknown> {
     authorization_header: "Bearer hook-token",
     created_at: "2026-06-19T00:00:00Z",
     updated_at: "2026-06-19T00:00:00Z",
-    // The real API never returns `secret`; include it here precisely so the
-    // tests can prove we drop it even if a future version starts to.
+    // The real API never returns `secret`; it is included here so the tests
+    // check it is dropped if a future version starts to return it.
     config: { url: FUNNEL, content_type: "json", secret: "s3cr3t" },
     ...over,
   };
@@ -1796,9 +1796,9 @@ Deno.test("webhook_audit omits matchesExpected when no expectation given", async
   try {
     const { context, written } = makeContext();
     await method("webhook_audit").execute({}, context);
-    // Held as `undefined`, per the file's convention for optional fields. What
-    // matters is that it does not persist as a misleading `false` — an audit
-    // that reports drift when none was asked about is worse than silent.
+    // Held as `undefined`, per the file's convention for optional fields. It
+    // must not be stored as `false`, which would report drift that the caller
+    // did not ask about.
     const persisted = JSON.parse(JSON.stringify(written[0].data));
     assert(!("matchesExpected" in persisted), "should be absent, not false");
   } finally {
@@ -1869,7 +1869,7 @@ Deno.test("webhook_audit rejects name without owner", async () => {
 });
 
 // Forgejo's editHook resets events, branch_filter and authorization_header
-// on any PATCH that leaves them out, so they must travel with the new URL.
+// on any PATCH that leaves them out, so they must be sent with the new URL.
 Deno.test("webhook_retarget changes only the URL, carrying events, branch filter and auth header", async () => {
   const { caller, calls } = makeFakeApi((c) => {
     if (c.method === "GET" && c.path.endsWith("/hooks")) return [hookObj()];
@@ -2003,8 +2003,8 @@ Deno.test("webhook_retarget never creates a hook when none exists", async () => 
   }
 });
 
-// The query string on a CI hook URL is a credential, not metadata. These pin
-// both halves of that: it must never be emitted, and it must never be lost.
+// The query string on a CI hook URL is a credential. These tests check that
+// it is never output and never removed.
 
 Deno.test("webhook_audit redacts the access token from the URL", async () => {
   const { caller } = makeFakeApi((c) => {

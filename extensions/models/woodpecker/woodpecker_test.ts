@@ -1,10 +1,10 @@
 /**
- * Unit tests for the load-bearing, security-sensitive logic of `@thomas/woodpecker`:
+ * Unit tests for the important, security-sensitive logic of `@thomas/woodpecker`:
  * repo_enable find-or-activate idempotency, the trusted-object merge (partial
- * trust must not clobber untouched capabilities), the create-vs-update secret
+ * trust must not overwrite capabilities it omits), the create-vs-update secret
  * upsert, the secret-value-never-stored guarantee (value is sent on the wire but
- * never written to a resource), and the idempotent delete-on-404. No live server
- * — the API caller is faked via the __setCaller seam.
+ * never written to a resource), and the idempotent delete-on-404. No live
+ * server: the API caller is faked via the __setCaller seam.
  */
 import {
   __setCaller,
@@ -435,7 +435,7 @@ Deno.test("repo_available: instance names sanitize the slash in owner/name", asy
   try {
     const { context, written } = makeContext();
     await method("repo_available").execute({}, context);
-    // swamp rejects '/' in instance names — the data name must be sanitized,
+    // swamp rejects '/' in instance names, so the data name must be sanitized,
     // while the stored fullName field keeps the real slash.
     assert(
       !written[0].name.includes("/"),
@@ -615,7 +615,7 @@ Deno.test("pipeline_wait: terminal on first poll -> no wait, writes pipeline + s
       { repo: "1", number: 5, pollIntervalSec: 0 },
       context,
     );
-    // exactly one status fetch (already terminal — no re-poll)
+    // exactly one status fetch (already terminal, so no re-poll)
     assertEquals(
       calls.filter((c) => c.path === "/api/repos/1/pipelines/5").length,
       1,
@@ -823,9 +823,9 @@ Deno.test("server_info: healthz 503 -> healthy:false, version surfaced", async (
 });
 
 Deno.test("repo_enable: a cross-forge repo explains the forge binding", async () => {
-  // The blind spot this covers: /api/user/repos is scoped to the forge the
-  // token's user authenticated against, so a repo on the server's OTHER forge
-  // is absent from it and the bare symptom reads as "no such repo".
+  // /api/user/repos is scoped to the forge the token's user authenticated
+  // against, so a repo on the server's OTHER forge is absent from it and a bare
+  // not-found suggests the repo does not exist.
   const { caller } = makeFakeApi((c) => {
     if (c.path.startsWith("/api/repos/lookup/")) return undefined; // 404
     if (c.path === "/api/user/repos?all=true") {
@@ -937,7 +937,7 @@ Deno.test("repo_available: carries forge_id through to the resource", async () =
 // ─────────────────────────── reachable check ───────────────────────────
 
 // A check receives globalArgs without the schema's defaults, so an unset
-// httpTimeoutMs used to reach fetch as undefined and abort at once.
+// httpTimeoutMs must not reach fetch as undefined (that aborts at once).
 Deno.test("reachable check applies the schema defaults to globalArgs", async () => {
   let seenTimeout: unknown;
   __setCaller((g) => {

@@ -1,5 +1,5 @@
 import { z } from "npm:zod@4";
-// Type-only imports — erased at compile time, never bundled. They anchor the
+// Type-only imports, erased at compile time and never bundled. They type the
 // `satisfies ModelDefinition<typeof GlobalArgs>` clause so each method's
 // `execute` is contextually typed without an explicit `any`.
 import type {
@@ -9,25 +9,25 @@ import type {
 } from "jsr:@systeminit/swamp-testing@0.20260521.16";
 
 /**
- * `@thomas/forgejo` — careful administration of a Forgejo (or Gitea) server
+ * `@thomas/forgejo`: administration of a Forgejo (or Gitea) server
  * over its `/api/v1` REST API, authenticated with a scoped access token.
  *
- * PURPOSE (the repeatable kit): provision repositories and organizations, run
- * GitHub pull-mirrors, and drive pull requests, as repeatable idempotent
- * operations instead of one-off UI clicks — find-or-create an org, find-or-create
+ * PURPOSE: provision repositories and organizations, run GitHub pull-mirrors,
+ * and manage pull requests, as repeatable idempotent operations instead of
+ * one-off UI clicks: find-or-create an org, find-or-create
  * a repo and converge its settings, find-or-create a pull-mirror of a GitHub
  * repo, audit every mirror's sync health in one call, and open / inspect /
  * merge a pull request.
  *
  * SCOPE GUARANTEE: mutations are find-or-create (`*_ensure`) or reversible
- * (`repo_archive` / `repo_unarchive`), with ONE deliberate exception:
- * `pr_merge` writes to the base branch and cannot be undone from here. It is
- * guarded — it refuses a PR that is closed, already merged, draft, or that the
+ * (`repo_archive` / `repo_unarchive`), with ONE exception: `pr_merge` writes
+ * to the base branch and cannot be undone from here. It refuses a PR that is
+ * closed, already merged, draft, or that the
  * server does not report as mergeable, and `force` must be set explicitly to
  * merge while CI is failing.
  *
- * There are NO delete methods — removing a repo, org, or mirror stays a
- * deliberate manual act in the UI. A failed migration's empty shell repo is
+ * There are NO delete methods; removing a repo, org, or mirror is done
+ * manually in the UI. A failed migration's empty shell repo is
  * DETECTED and reported by `mirror_ensure`, never auto-deleted. Mirror source
  * credentials (`authToken` for private GitHub sources) are write-only:
  * supplied via a vault reference, sent once to `/repos/migrate`, and never
@@ -38,9 +38,9 @@ import type {
  * `write:repository, write:organization, read:admin, read:misc, read:user`
  * (`read:admin` is only exercised by `user_list`; `read:misc` by `health`).
  * The token's user must be a site admin for `user_list` and for the listing
- * methods to see private repos across all owners. NB (proven 2026-06-13):
- * token CRUD (`/users/{u}/tokens`) is basic-auth-only — this model never
- * mints or revokes tokens.
+ * methods to see private repos across all owners. NB (confirmed 2026-06-13):
+ * token CRUD (`/users/{u}/tokens`) is basic-auth-only, so this model never
+ * creates or revokes tokens.
  *
  * Method sections (by prefix):
  *   - read/audit: `health`, `org_list`, `repo_list`, `user_list`,
@@ -56,12 +56,11 @@ import type {
  * converge the supplied settings in place via PATCH) and reports an `action`
  * of created/updated/unchanged so a re-run is a no-op when nothing changed.
  *
- * WEBHOOKS are read and repointed, never created — which is why the retarget
- * method is not named `*_ensure`. A CI webhook carries a shared secret only
- * the CI server knows, so registering one belongs to that server (Woodpecker:
- * `repo_repair`). What this model adds is the part the CI server cannot:
- * telling you WHERE every hook currently points, so a stale target is visible
- * instead of silently undelivered. `webhook_retarget` therefore writes
+ * WEBHOOKS are read and repointed, never created, so the retarget method is
+ * not named `*_ensure`. A CI webhook carries a shared secret that only the CI
+ * server holds, so the CI server registers it (Woodpecker: `repo_repair`).
+ * This model reports WHERE every hook currently points, so a stale target is
+ * visible instead of failing to deliver unnoticed. `webhook_retarget` writes
  * `config.url` alone and never sends a `secret` key, which would overwrite
  * the stored one.
  */
@@ -82,8 +81,8 @@ const GlobalArgs = z.object({
 });
 
 // Resolved global-argument shape. Kept internal: `z.infer` is a "slow type",
-// so it must not leak onto the public API (the exported `CallerFn` seam uses
-// the loose `Json` instead — see below).
+// so it must not appear on the public API (the exported `CallerFn` uses
+// `Json` instead).
 type GlobalArgsT = z.infer<typeof GlobalArgs>;
 
 /** The set of outcomes a method reports in its `action` field. */
@@ -275,7 +274,7 @@ const WebhookInfo = z.object({
 
 // ─────────────────────────── HTTP / auth seam ───────────────────────────
 
-/** A JSON-ish bag — structurally the resolved global args or an API body. */
+/** A JSON object: the resolved global args or an API body. */
 export type Json = Record<string, unknown>;
 
 /** One REST request: method + path (relative to `apiUrl`) + optional JSON body. */
@@ -297,12 +296,12 @@ export interface ApiResult {
 }
 
 /**
- * The authenticated-call seam the methods use — swappable for unit tests. The
- * global args are typed loosely as {@link Json} so this EXPORTED type stays
- * "fast-check" clean (referencing the zod-inferred `GlobalArgsT` would drag a
- * slow type onto the public API). The real implementation re-narrows. It
- * returns the result for ALL HTTP statuses (it only throws on a
- * network/transport error); status-based control flow lives in
+ * The authenticated API call the methods use; unit tests can replace it. The
+ * global args are typed as {@link Json} so this exported type passes
+ * "fast-check" (referencing the zod-inferred `GlobalArgsT` would put a slow
+ * type on the public API). The real implementation narrows them again. It
+ * returns the result for ALL HTTP statuses and throws only on a
+ * network/transport error; status checks happen in
  * {@link call}/{@link callTolerant}.
  */
 export type CallerFn = (g: Json, call: ApiCall) => Promise<ApiResult>;
@@ -423,9 +422,9 @@ function asArray(v: unknown): Json[] {
 }
 
 /**
- * Make a string safe as a swamp data instance name — swamp rejects names
- * containing `/`, `\`, `..`, or null bytes (path-traversal guard), but a repo
- * full name like `owner/name` naturally contains a slash.
+ * Make a string safe as a swamp data instance name. swamp rejects names
+ * containing `/`, `\`, `..`, or null bytes (path-traversal guard), and a repo
+ * full name like `owner/name` contains a slash.
  */
 function safeName(s: string): string {
   return s.replace(/[\\/]/g, ":").replace(/\.\./g, "_").replace(/\0/g, "");
@@ -447,9 +446,9 @@ function hooksPath(owner: string, name: string): string {
  * A webhook URL split into the part that identifies the target and the part
  * that must never be shown.
  *
- * Proven against Woodpecker (2026-09-04): it registers its hooks as
- * `<host>/api/hook?access_token=<JWT>`, so the query string is a CREDENTIAL,
- * not metadata. Two consequences, and both are easy to get wrong:
+ * Confirmed against Woodpecker (2026-09-04): it registers its hooks as
+ * `<host>/api/hook?access_token=<JWT>`, so the query string is a CREDENTIAL.
+ * Two consequences:
  *   - `redacted` is the only form safe to store or print.
  *   - `target` (scheme+host+path, no query) is the only sound thing to compare
  *     an expected URL against; comparing raw URLs reports every hook as
@@ -460,8 +459,8 @@ function splitHookUrl(raw: string): { target: string; redacted: string } {
   try {
     u = new URL(raw);
   } catch {
-    // Not parseable as absolute — nothing safe to split out, so treat the
-    // whole string as opaque rather than risk printing a token inside it.
+    // Not an absolute URL, so nothing can be split out safely. Treat the
+    // whole string as opaque, since it may contain a token.
     return { target: raw, redacted: raw };
   }
   const target = `${u.origin}${u.pathname}`;
@@ -576,8 +575,8 @@ function toWebhookInfo(
       : undefined,
     events: Array.isArray(h.events) ? h.events.map(String) : [],
     active: Boolean(h.active),
-    // Compared on the target only — see splitHookUrl. The caller cannot know
-    // the per-repo token, so an expectedUrl is always query-free.
+    // Compared on the target only (see splitHookUrl). The caller does not have
+    // the per-repo token, so an expectedUrl never has a query string.
     matchesExpected: expectedUrl === undefined
       ? undefined
       : target === splitHookUrl(expectedUrl).target,
@@ -658,8 +657,8 @@ function protectionBody(
   // (create ANDs the two; edit skips the whitelist when enable_push is absent),
   // so a whitelist without enable_push is dropped and reported as drift on
   // every run. A whitelist request implies enable_push; combined with an
-  // explicit enablePush=false it is a contradiction we refuse rather than
-  // let Forgejo resolve silently.
+  // explicit enablePush=false it is a contradiction, rejected here rather
+  // than left for Forgejo to resolve silently.
   if (desired.enablePushWhitelist && desired.enablePush === false) {
     throw new Error(
       "enablePushWhitelist needs enablePush: Forgejo turns the whitelist " +
@@ -729,7 +728,7 @@ function protectionBody(
   return { body, changed: Object.keys(body).length > 0 };
 }
 
-/** A Go zero time (and absent values) — "never happened" in the API. */
+/** True for a Go zero time or an absent value, which the API uses for "never happened". */
 function isZeroTime(v: unknown): boolean {
   return v == null || String(v).startsWith("0001-01-01");
 }
@@ -795,7 +794,7 @@ function prPath(owner: string, name: string, index?: number): string {
 /**
  * Normalise a raw pull-request object into the {@link PrInfo} shape.
  * `detail` fields (`mergeable`, `ciState`) are only meaningful on a single-PR
- * fetch; pass them through explicitly rather than trusting a listing payload.
+ * fetch; pass them in explicitly rather than reading them from a listing payload.
  */
 function toPrInfo(
   p: Json,
@@ -838,8 +837,8 @@ function toPrInfo(
 
 /**
  * Combined CI state of a commit, from its statuses. Returns `"none"` when the
- * commit carries no status at all (which is NOT a pass — a repo with CI
- * disabled and a repo whose pipeline never started look identical here).
+ * commit carries no status at all. That is NOT a pass: a repo with CI
+ * disabled and a repo whose pipeline never started both return `"none"`.
  */
 async function combinedCiState(
   g: GlobalArgsT,
@@ -980,7 +979,7 @@ const OrgEnsureArgs = z.object({
   fullName: z.string().optional().describe("Display name to converge."),
 });
 
-/** The repo settings `repo_ensure` converges (all optional — only supplied ones). */
+/** The repo settings `repo_ensure` converges (all optional; only supplied ones are applied). */
 const RepoSettingsShape = {
   private: z.coerce.boolean().optional().describe("Repo visibility."),
   description: z.string().optional().describe("Repo description."),
@@ -1322,7 +1321,7 @@ export const model = {
         if (a.owner === undefined) {
           repos = await pageAll(g, "/api/v1/repos/search");
         } else {
-          // An owner is an org or a user — probe the org listing first.
+          // An owner is an org or a user; probe the org listing first.
           const org = await callTolerant(g, {
             method: "GET",
             path: `/api/v1/orgs/${enc(a.owner)}`,
@@ -1430,7 +1429,7 @@ export const model = {
         const found = await pageAll(g, "/api/v1/repos/search?mode=mirror");
         const handles: DataHandle[] = [];
         for (const m of found) {
-          // The search payload omits mirror fields — fetch the full repo.
+          // The search payload omits mirror fields, so fetch the full repo.
           const owner = String(((m.owner ?? {}) as Json).login ?? "");
           const name = String(m.name ?? "");
           const r = await call(g, {
@@ -1479,7 +1478,7 @@ export const model = {
           );
           if (a.owner) {
             // The search `owner` filter is a uid in some versions and ignored
-            // in others, so filter client-side too rather than trust it.
+            // in others, so filter client-side too rather than rely on it.
             repos = repos.filter((r) =>
               String(((r.owner ?? {}) as Json).login ?? "") === a.owner
             );
@@ -1492,8 +1491,8 @@ export const model = {
           const owner = String(((r.owner ?? {}) as Json).login ?? "");
           const name = String(r.name ?? "");
           const full = String(r.full_name ?? `${owner}/${name}`);
-          // A token without admin on a repo cannot list its hooks; that is a
-          // gap in the audit, not a failure of it — skip, having said so.
+          // A token without admin on a repo cannot list its hooks. Log and
+          // skip the repo rather than fail the whole audit.
           const res = await callTolerant(g, {
             method: "GET",
             path: hooksPath(owner, name),
@@ -1551,8 +1550,8 @@ export const model = {
           );
         }
 
-        // Match on the TARGET, never the raw URL — the query string holds a
-        // per-repo token, so matching it would be both useless and unsafe.
+        // Match on the TARGET, never the raw URL. The query string holds a
+        // per-repo token the caller does not have, and it must not be handled.
         const hookUrl = (h: Json) =>
           String(((h.config ?? {}) as Json).url ?? "");
         const candidates = a.matchUrl
@@ -1585,10 +1584,10 @@ export const model = {
         let action: z.infer<typeof Action> = "unchanged";
         let updated = hook;
         if (currentTarget !== wantTarget) {
-          // CARRY THE QUERY STRING OVER VERBATIM. Woodpecker authenticates its
-          // hooks with an `?access_token=<JWT>` on the URL, so writing the
-          // caller's query-free URL would silently de-authenticate the hook —
-          // it would still fire, and every delivery would be rejected.
+          // Copy the existing query string unchanged. Woodpecker authenticates
+          // its hooks with an `?access_token=<JWT>` on the URL, so writing the
+          // caller's query-free URL would remove the token: the hook would
+          // still fire, and every delivery would be rejected.
           const query = current.includes("?")
             ? current.slice(current.indexOf("?"))
             : "";
@@ -1809,8 +1808,8 @@ export const model = {
               "the repo owner.",
           );
         }
-        // Membership is a separate question: 204 for a collaborator, 404 for
-        // anyone else. Only a collaborator has a row to leave alone.
+        // Membership is checked separately: 204 for a collaborator, 404 for
+        // anyone else. Only an existing collaborator can be left unchanged.
         const membership = await callTolerant(g, {
           method: "GET",
           path: collabPath,
@@ -2000,8 +1999,8 @@ export const model = {
               "touch it. Pick a different name or remove the repo manually.",
           );
         } else {
-          // Existing mirror: the source URL is fixed at migration time — a
-          // different requested source is unreconcilable drift, not a PATCH.
+          // Existing mirror: the source URL is fixed at migration time, so a
+          // different requested source is drift that no PATCH can fix.
           const orig = String(existing.original_url ?? "");
           if (
             orig && normalizeCloneUrl(orig) !== normalizeCloneUrl(a.cloneAddr)
@@ -2294,8 +2293,8 @@ export const model = {
             delete_branch_after_merge: a.deleteBranch,
           },
         });
-        // Re-fetch: the merge response carries no body, and the merged PR's
-        // recorded state is the point of the data output.
+        // Re-fetch: the merge response has no body, and the data output
+        // records the merged PR's state.
         const after = await getPrOrNull(g, a.owner, a.name, a.index) ?? pr;
         const handle = await context.writeResource(
           "pull_request",
