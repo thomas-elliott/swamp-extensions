@@ -1949,3 +1949,133 @@ Deno.test("project_create always validates; validate:false is not an option", as
     __setArcaneTransport(null);
   }
 });
+
+Deno.test("project_restart sends down then up for each project", async () => {
+  const calls: Call[] = [];
+  __setArcaneTransport(
+    (_g: unknown, m: string, p: string): Promise<unknown> => {
+      calls.push({ method: m, path: p });
+      if (m === "GET" && p === "/environments/0/projects?limit=-1") {
+        return Promise.resolve({
+          success: true,
+          data: [{ id: "p1", name: "web" }],
+        });
+      }
+      return Promise.resolve('{"type":"activity","id":"a1"}\n');
+    },
+  );
+  try {
+    const { context, written } = makeContext(TEST_GLOBALS);
+    await method("project_restart").execute({ names: ["web"] }, context);
+    assertEquals(
+      calls.filter((c) => c.method === "POST").map((c) => c.path),
+      ["/environments/0/projects/p1/down", "/environments/0/projects/p1/up"],
+    );
+    assertEquals(
+      written.filter((w) => w.specName === "operation-result").length,
+      1,
+    );
+  } finally {
+    __setArcaneTransport(null);
+  }
+});
+
+/** A project_deploy update of `web` (id p1), with the redeploy and runtime answers supplied. */
+function deployTransport(
+  redeploy: (timeoutMs?: number) => Promise<unknown>,
+  health: string,
+) {
+  return (
+    _g: unknown,
+    m: string,
+    p: string,
+    _b?: unknown,
+    timeoutMs?: number,
+  ): Promise<unknown> => {
+    if (m === "GET" && p === "/environments/0/projects?limit=-1") {
+      return Promise.resolve([{ id: "p1", name: "web" }]);
+    }
+    if (m === "GET" && p === "/environments/0/projects/p1/compose") {
+      return Promise.resolve({
+        success: true,
+        data: { composeContent: "PRIOR", status: "running" },
+      });
+    }
+    if (m === "PUT" && p === "/environments/0/projects/p1") {
+      return Promise.resolve({ success: true, data: {} });
+    }
+    if (m === "POST" && p === "/environments/0/projects/p1/redeploy") {
+      return redeploy(timeoutMs);
+    }
+    if (m === "GET" && p === "/environments/0/projects/p1") {
+      return Promise.resolve({
+        success: true,
+        data: { status: "running", serviceCount: 1, runningCount: 1 },
+      });
+    }
+    if (m === "GET" && p === "/environments/0/projects/p1/runtime") {
+      return Promise.resolve({
+        success: true,
+        data: { runtimeServices: [{ health }] },
+      });
+    }
+    return Promise.reject(new Error(`unexpected ${m} ${p}`));
+  };
+}
+
+async function deployError(): Promise<string> {
+  const { context } = makeContext(TEST_GLOBALS);
+  try {
+    await method("project_deploy").execute(
+      {
+        name: "web",
+        composeContent: "NEW",
+        rollback: false,
+        healthTimeoutSec: 1,
+        pollIntervalSec: 1,
+      },
+      context,
+    );
+  } catch (e) {
+    return e instanceof Error ? e.message : String(e);
+  }
+  return "";
+}
+
+Deno.test("project_deploy does not pass a service whose healthcheck is still starting", async () => {
+  __setComposeValidator(() => Promise.resolve({ version: "v2.test" }));
+  __setArcaneTransport(
+    deployTransport(() => Promise.resolve({ success: true }), "starting"),
+  );
+  try {
+    const message = await deployError();
+    assert(/health: starting/.test(message), `got: ${message}`);
+  } finally {
+    __setArcaneTransport(null);
+    __setComposeValidator(null);
+  }
+});
+
+Deno.test("project_deploy bounds the redeploy call by healthTimeoutSec", async () => {
+  let redeployTimeout: number | undefined;
+  __setComposeValidator(() => Promise.resolve({ version: "v2.test" }));
+  __setArcaneTransport(
+    deployTransport((timeoutMs) => {
+      redeployTimeout = timeoutMs;
+      return Promise.reject(
+        new Error(`request timed out after ${timeoutMs} ms`),
+      );
+    }, "healthy"),
+  );
+  try {
+    const message = await deployError();
+    assertEquals(redeployTimeout, 1000);
+    assert(
+      /redeploy did not finish within healthTimeoutSec \(1s\)/.test(message),
+      `got: ${message}`,
+    );
+  } finally {
+    __setArcaneTransport(null);
+    __setComposeValidator(null);
+  }
+});

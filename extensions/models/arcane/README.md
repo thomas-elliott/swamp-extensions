@@ -61,8 +61,10 @@ swamp model method run arcane-prod swarm_stack_remove --input '{"name":"unifi"}'
   `lastSyncStatus` / `lastSyncError` / `lastSyncCommit` / `nextSyncAt`; use it
   to find a sync whose scheduled runs are failing without anyone noticing).
 - **`project_*`** — compose projects. Lifecycle: `project_list`, `project_get`,
-  `project_up` / `project_down` / `project_redeploy` / `project_pull` /
-  `project_destroy`. Direct (API) authoring: `project_validate`,
+  `project_up` / `project_down` / `project_redeploy` / `project_restart` /
+  `project_pull` / `project_destroy`. `project_redeploy` is pull + compose up,
+  which leaves an unchanged container running; `project_restart` is down then
+  up. Direct (API) authoring: `project_validate`,
   `project_create`, `project_update`. Orchestration: `project_deploy`
   (validated, mode-aware, rolls back by default).
 - **`secret_*` / `config_*`** — swarm secret/config CRUD plus `secret_rotate` /
@@ -75,8 +77,8 @@ swamp model method run arcane-prod swarm_stack_remove --input '{"name":"unifi"}'
   `swarm_stack_get`, `swarm_stack_validate` (render gate, fail-closed),
   `swarm_stack_deploy` (validate → deploy → poll convergence),
   `swarm_stack_remove` (DELETE then poll `GET → 404`, re-issuing DELETE until
-  Arcane's stored record is cleared, because a single DELETE leaves the record
-  behind), and `swarm_stack_tasks` (the deploy **debug view** — per-task
+  Arcane's stored record is cleared, because the first DELETE can answer 404
+  with the record still there), and `swarm_stack_tasks` (the deploy **debug view** — per-task
   `currentState` + error, with `onlyProblems` to show just the rejected/failed
   ones).
 - **`volume_*` / `*_prune`** — cleanup: `volume_list`, `volume_remove`
@@ -96,6 +98,16 @@ swamp model method run arcane-prod swarm_stack_remove --input '{"name":"unifi"}'
   the `git revert` to you.
 
 `project_deploy` detects the mode from Arcane's `gitOpsManagedBy` field.
+
+In both modes, `healthTimeoutSec` covers the redeploy and the health wait
+together. Healthy means status `running`, every service running, and no
+healthcheck reporting `unhealthy` or still `starting`. Arcane holds the
+redeploy call open until compose finishes, so if the call is what runs out of
+time, Arcane may still be working on it when the rollback starts.
+
+Swarm methods need Arcane to see the environment as swarm-enabled. Arcane
+stores that flag and refreshes it only at startup, so after `docker swarm init`
+outside Arcane, restart Arcane before using them.
 
 ## Validation gate (fail-closed)
 
@@ -202,3 +214,12 @@ rotation); the per-type prunes above cover the rest.
   `multipart/form-data` (a `project` field holding the JSON, and a `manifest`
   field listing extra files to upload, here none). It rejects a JSON body with
   422, so creating a project through the API failed before this change.
+- **`project_deploy` waits out `starting` healthchecks.** A container still at
+  `health: starting` used to count as healthy, so one crash-looping behind a
+  slow healthcheck deployed as healthy. Deploys of services with slow
+  healthchecks now take until those checks pass.
+- **`project_deploy`'s `healthTimeoutSec` bounds the redeploy call.** It used
+  to get its own 10-minute limit, so a compose `depends_on` that never became
+  healthy held the deploy (and the model lock) far past the timeout.
+- **New `project_restart`** (down then up), since `project_redeploy` does not
+  restart an unchanged project.

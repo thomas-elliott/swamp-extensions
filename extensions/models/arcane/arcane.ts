@@ -315,8 +315,8 @@ const PruneResultResource = z.object({
 const API = "/api";
 const REQUEST_TIMEOUT_MS = 30_000;
 // Up, down, redeploy, pull and destroy send nothing back until Docker has
-// finished, so a 30 s idle timeout would fail a slow redeploy that is still
-// running, and project_deploy would start a rollback on top of it.
+// finished, so a 30 s idle timeout would fail a slow one that is still running.
+// project_deploy bounds its redeploys by healthTimeoutSec instead.
 const OPERATION_TIMEOUT_MS = 10 * 60_000;
 
 type GlobalArgsT = z.infer<typeof GlobalArgs>;
@@ -766,23 +766,25 @@ type HealthResult = { healthy: boolean; status: string; detail: string };
 
 /**
  * Pure predicate: is a compose project healthy? Status must be `running`, no runtime
- * service may report `unhealthy`, and (when Arcane reports counts) runningCount must
- * cover serviceCount. Separate from the poller so it can be unit-tested.
+ * service may report `unhealthy` or `starting`, and (when Arcane reports counts)
+ * runningCount must cover serviceCount. Separate from the poller so it can be unit-tested.
  */
 export function projectHealthy(
   status: string,
   serviceCount: number,
   runningCount: number,
-  anyUnhealthy: boolean,
+  anyNotHealthy: boolean,
 ): boolean {
-  return status === "running" && !anyUnhealthy &&
+  return status === "running" && !anyNotHealthy &&
     (serviceCount === 0 || runningCount >= serviceCount);
 }
 
 /**
  * Poll a project until its containers are running (status `running` and, when
  * Arcane reports counts, runningCount >= serviceCount) or the timeout elapses.
- * No runtime service reporting `unhealthy` is tolerated. Returns the last observed state.
+ * A service whose healthcheck reports `unhealthy` or is still `starting` keeps it
+ * waiting, so a container crash-looping behind a slow healthcheck does not pass.
+ * Returns the last observed state.
  */
 async function pollProjectHealthy(
   g: GlobalArgsT,
@@ -791,17 +793,13 @@ async function pollProjectHealthy(
   intervalSec: number,
 ): Promise<HealthResult> {
   const deadline = Date.now() + timeoutSec * 1000;
-  let last: HealthResult = {
-    healthy: false,
-    status: "unknown",
-    detail: "no observation",
-  };
-  while (Date.now() < deadline) {
+  let last: HealthResult;
+  while (true) {
     const p = unwrap(await arcane(g, "GET", `${ENV(g)}/projects/${id}`));
     const status = asString(pick(p, "status", "state")) ?? "unknown";
     const serviceCount = Number(pick(p, "serviceCount") ?? 0);
     const runningCount = Number(pick(p, "runningCount") ?? 0);
-    let unhealthy = false;
+    let notHealthy: string[] = [];
     try {
       const rt = unwrap(
         await arcane(g, "GET", `${ENV(g)}/projects/${id}/runtime`),
@@ -809,21 +807,59 @@ async function pollProjectHealthy(
       const services = Array.isArray(pick(rt, "runtimeServices"))
         ? (pick(rt, "runtimeServices") as Json[])
         : [];
-      unhealthy = services.some((s) =>
-        asString(pick(s, "health")) === "unhealthy"
-      );
+      notHealthy = services
+        .map((s) => asString(pick(s, "health")) ?? "")
+        .filter((h) => h === "unhealthy" || h === "starting");
     } catch { /* runtime view is best-effort */ }
     last = {
-      healthy: projectHealthy(status, serviceCount, runningCount, unhealthy),
+      healthy: projectHealthy(
+        status,
+        serviceCount,
+        runningCount,
+        notHealthy.length > 0,
+      ),
       status,
       detail: `status=${status} running=${runningCount}/${serviceCount}${
-        unhealthy ? " (a service is unhealthy)" : ""
+        notHealthy.length > 0 ? ` (health: ${notHealthy.join(", ")})` : ""
       }`,
     };
-    if (last.healthy) return last;
+    if (last.healthy || Date.now() >= deadline) return last;
     await sleep(intervalSec * 1000);
   }
-  return last;
+}
+
+/**
+ * Redeploy a project, then poll it until healthy, all within `timeoutSec`. Arcane
+ * holds the redeploy open until compose finishes, which can be never (a
+ * `depends_on: service_healthy` that never comes), so the call shares the budget
+ * instead of getting its own. Arcane may still be running compose after the call
+ * gives up.
+ */
+async function redeployAndPoll(
+  g: GlobalArgsT,
+  id: string,
+  timeoutSec: number,
+  intervalSec: number,
+): Promise<HealthResult> {
+  const deadline = Date.now() + timeoutSec * 1000;
+  try {
+    await arcane(
+      g,
+      "POST",
+      `${ENV(g)}/projects/${id}/redeploy`,
+      undefined,
+      timeoutSec * 1000,
+    );
+  } catch (e) {
+    if (e instanceof Error && /request timed out/.test(e.message)) {
+      throw new Error(
+        `redeploy did not finish within healthTimeoutSec (${timeoutSec}s); Arcane may still be running it`,
+      );
+    }
+    throw e;
+  }
+  const leftSec = Math.max(0, (deadline - Date.now()) / 1000);
+  return await pollProjectHealthy(g, id, leftSec, intervalSec);
 }
 
 /** UTF-8 → base64, for the write-only `Data` field of a swarm secret/config spec. */
@@ -849,7 +885,8 @@ async function ensureSwarmManager(g: GlobalArgsT): Promise<void> {
   }
   if (!enabled) {
     throw new Error(
-      `environment ${g.environmentId} is not swarm-enabled — point environmentId at a swarm-manager environment`,
+      `environment ${g.environmentId} is not swarm-enabled — point environmentId at a swarm-manager environment. ` +
+        "Arcane stores this flag and refreshes it only at startup, so a swarm created outside Arcane needs an Arcane restart first.",
     );
   }
 }
@@ -1183,13 +1220,12 @@ async function stackGone(g: GlobalArgsT, path: string): Promise<boolean> {
 
 /**
  * Remove a swarm stack and confirm the record is actually cleared, returning the
- * number of DELETEs issued. Arcane's first DELETE tears down the running services
- * (`docker stack rm`) but RETAINS its stored stack record: `swarm_stack_get` still
- * returns it (with `services:0`) and `swarm_stack_list` still shows it, so a single
- * DELETE leaves the stack half-removed. This function therefore DELETEs, polls the
- * stack GET, and re-issues DELETE until the record 404s. A non-404 DELETE error (e.g.
- * an in-use conflict) propagates immediately and is never forced. If the
- * record is still present at the deadline it throws rather than report success.
+ * number of DELETEs issued. Arcane deletes its stored stack record last and answers
+ * 404 for a not-found error from any earlier step, so the first DELETE can answer
+ * 404 with the stack still listed. This function therefore DELETEs, checks the stack
+ * GET, and re-issues DELETE until the GET 404s. A non-404 DELETE error (e.g. an
+ * in-use conflict) propagates immediately and is never forced. If the record is
+ * still present at the deadline it throws rather than report success.
  */
 async function pollStackRemoved(
   g: GlobalArgsT,
@@ -1292,7 +1328,7 @@ const ProjectDeployArgs = z.object({
     "Roll back to prior state on failure (direct mode). false = stop and report, leaving the failed state for inspection.",
   ),
   healthTimeoutSec: z.number().int().default(120).describe(
-    "How long to wait for the project to become healthy",
+    "How long the redeploy and the wait for the project to become healthy may take together",
   ),
   pollIntervalSec: z.number().int().default(5),
 });
@@ -2200,14 +2236,7 @@ export const model = {
               "no matching sync found; redeploying current content",
             );
           }
-          await arcane(
-            g,
-            "POST",
-            `${ENV(g)}/projects/${id}/redeploy`,
-            undefined,
-            OPERATION_TIMEOUT_MS,
-          );
-          const health = await pollProjectHealthy(
+          const health = await redeployAndPoll(
             g,
             id,
             args.healthTimeoutSec,
@@ -2267,20 +2296,13 @@ export const model = {
             await arcane(g, "PUT", `${ENV(g)}/projects/${id}`, body);
             await record("update", true, 200, "updated compose content");
           }
-          await arcane(
-            g,
-            "POST",
-            `${ENV(g)}/projects/${id}/redeploy`,
-            undefined,
-            OPERATION_TIMEOUT_MS,
-          );
-          await record("redeploy", true, 200, "redeploy issued");
-          const health = await pollProjectHealthy(
+          const health = await redeployAndPoll(
             g,
             id,
             args.healthTimeoutSec,
             args.pollIntervalSec,
           );
+          await record("redeploy", true, 200, "redeploy completed");
           await record(
             "health",
             health.healthy,
@@ -2366,14 +2388,7 @@ export const model = {
           const rb: Json = { composeContent: priorCompose };
           if (priorEnv !== undefined) rb.envContent = priorEnv;
           await arcane(g, "PUT", `${ENV(g)}/projects/${id}`, rb);
-          await arcane(
-            g,
-            "POST",
-            `${ENV(g)}/projects/${id}/redeploy`,
-            undefined,
-            OPERATION_TIMEOUT_MS,
-          );
-          const rbHealth = await pollProjectHealthy(
+          const rbHealth = await redeployAndPoll(
             g,
             id,
             args.healthTimeoutSec,
@@ -2404,11 +2419,16 @@ export const model = {
       },
     },
 
-    project_up: makeLifecycle("up", "POST", "/up"),
-    project_down: makeLifecycle("down", "POST", "/down"),
-    project_redeploy: makeLifecycle("redeploy", "POST", "/redeploy"),
-    project_pull: makeLifecycle("pull", "POST", "/pull"),
-    project_destroy: makeLifecycle("destroy", "DELETE", "/destroy"),
+    project_up: makeLifecycle("up", [["POST", "/up"]]),
+    project_down: makeLifecycle("down", [["POST", "/down"]]),
+    project_redeploy: makeLifecycle("redeploy", [["POST", "/redeploy"]]),
+    // Redeploy is pull + compose up, which leaves an unchanged container running.
+    project_restart: makeLifecycle("restart", [["POST", "/down"], [
+      "POST",
+      "/up",
+    ]]),
+    project_pull: makeLifecycle("pull", [["POST", "/pull"]]),
+    project_destroy: makeLifecycle("destroy", [["DELETE", "/destroy"]]),
 
     // --- swarm secret_ / config_ CRUD (rotation lives in secret_rotate / config_rotate) ---
     ...makeSwarmObject("secret"),
@@ -2774,7 +2794,7 @@ export const model = {
     swarm_stack_remove: {
       description:
         "Remove a swarm stack by name (docker stack rm via Arcane) and confirm the stored record is cleared. " +
-        "Arcane's first DELETE tears down services but RETAINS the stack record, so this polls GET until 404, re-issuing DELETE until the record is gone (the teardown two-call bug). " +
+        "Arcane's first DELETE can answer 404 with the stack record still there, so this re-issues DELETE until GET answers 404. " +
         "In-use conflicts are surfaced by Arcane, never forced.",
       arguments: SwarmStackRemoveArgs,
       execute: async (
@@ -2997,13 +3017,12 @@ export const model = {
 
 /**
  * Build a fan-out project-lifecycle method. Resolves each name to a project id,
- * issues the action, and records an operation-result per target. The argument
- * schema requires at least one name, so there is no "all projects" form.
+ * issues the action's calls in order, and records an operation-result per target.
+ * The argument schema requires at least one name, so there is no "all projects" form.
  */
 function makeLifecycle(
   operation: string,
-  httpMethod: HttpMethod,
-  suffix: string,
+  steps: [HttpMethod, string][],
 ): MethodDefinition<z.ZodTypeAny, GlobalArgsT> {
   return {
     description:
@@ -3032,10 +3051,12 @@ function makeLifecycle(
       const handles: DataHandle[] = [];
       for (const name of names) {
         const id = asString(pick(byName.get(name)!, "id")) ?? "";
-        const path = `${ENV(g)}/projects/${id}${suffix}`;
-        if (httpMethod === "DELETE") {
-          await deleteIfPresent(g, path, OPERATION_TIMEOUT_MS);
-        } else {
+        for (const [httpMethod, suffix] of steps) {
+          const path = `${ENV(g)}/projects/${id}${suffix}`;
+          if (httpMethod === "DELETE") {
+            await deleteIfPresent(g, path, OPERATION_TIMEOUT_MS);
+            continue;
+          }
           // up and pull stream NDJSON: the 200 arrives before the work runs and
           // a failure is an error line in the body, so the status alone shows nothing.
           const failure = streamError(
