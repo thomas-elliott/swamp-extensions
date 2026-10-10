@@ -601,13 +601,17 @@ const LayoutAssignArgs = z.object({
   nodeId: z.string().describe(
     "Node id to assign a role to (from cluster_status)",
   ),
-  zone: z.string().default("dc1").describe(
-    "Zone/datacenter label for the node",
+  zone: z.string().optional().describe(
+    "Zone/datacenter label for the node. Omit to keep the node's current zone " +
+      "(required for a node that has no role yet).",
   ),
   capacity: z.coerce.number().int().nullable().optional().describe(
-    "Storage capacity in BYTES (e.g. 1000000000 = 1 GB). Omit/null = gateway (no storage).",
+    "Storage capacity in BYTES (e.g. 1000000000 = 1 GB). null = gateway (no storage). " +
+      "Omit to keep the node's current capacity (gateway for a node with no role yet).",
   ),
-  tags: z.array(z.string()).default([]).describe("Optional node tags"),
+  tags: z.array(z.string()).optional().describe(
+    "Node tags. Omit to keep the node's current tags (none for a node with no role yet).",
+  ),
   zoneRedundancy: z.string().optional().describe(
     'Cluster zone redundancy: "maximum" or a positive integer (atLeast N). Omit to leave unchanged.',
   ),
@@ -655,9 +659,29 @@ function zrToStr(v: unknown): string | undefined {
   return o.atLeast !== undefined ? `atLeast:${asNum(o.atLeast)}` : undefined;
 }
 
+/**
+ * Id of the node answering our requests. GetClusterStatus lists every node but
+ * does not say which one we are talking to; GetNodeInfo?node=self does, as a
+ * per-node response map keyed by node id.
+ */
+async function selfNodeId(g: GlobalArgsT): Promise<string> {
+  const raw = asObj(await api(g, "GET", "GetNodeInfo", { node: "self" }));
+  const [info] = Object.values(asObj(raw.success));
+  const id = asStr(asObj(info).nodeId);
+  if (!id) {
+    throw new Error(
+      `GetNodeInfo?node=self returned no node: ${
+        JSON.stringify(raw.error ?? raw)
+      }`,
+    );
+  }
+  return id;
+}
+
 /** Shape a raw GetClusterStatus response into a {@link ClusterStatus}. */
 function shapeStatus(
   raw: unknown,
+  node: string,
   action: z.infer<typeof Action>,
   ts: string,
 ): z.infer<typeof ClusterStatus> {
@@ -679,7 +703,7 @@ function shapeStatus(
     };
   });
   return {
-    node: String(s.node ?? ""),
+    node,
     garageVersion: asStr(s.garageVersion),
     layoutVersion: asNum(s.layoutVersion),
     nodes,
@@ -1145,24 +1169,47 @@ export const model = {
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const a = BucketUpdateArgs.parse(rawArgs);
         const g = context.globalArgs;
-        const body: Json = {};
-        if (a.maxObjects !== undefined || a.maxSize !== undefined) {
-          body.quotas = {
-            maxObjects: a.maxObjects ?? null,
-            maxSize: a.maxSize ?? null,
-          };
-        }
-        if (a.websiteEnabled !== undefined) {
-          body.websiteAccess = {
-            enabled: a.websiteEnabled,
-            indexDocument: a.indexDocument ?? null,
-            errorDocument: a.errorDocument ?? null,
-          };
-        }
-        if (Object.keys(body).length === 0) {
+        const quotaChange = a.maxObjects !== undefined ||
+          a.maxSize !== undefined;
+        const websiteChange = a.websiteEnabled !== undefined ||
+          a.indexDocument !== undefined || a.errorDocument !== undefined;
+        if (!quotaChange && !websiteChange) {
           throw new Error(
             "nothing to update: provide maxObjects/maxSize or websiteEnabled",
           );
+        }
+
+        // Garage replaces the whole quotas object and the whole websiteAccess
+        // object when either is present in the body, so an argument the caller
+        // left out has to be refilled from the bucket's current state or it is
+        // silently cleared.
+        const current = await getBucketRaw(g, { id: a.id });
+        const body: Json = {};
+        if (quotaChange) {
+          const q = asObj(current.quotas);
+          body.quotas = {
+            maxObjects: a.maxObjects !== undefined
+              ? a.maxObjects
+              : nullableNum(q.maxObjects) ?? null,
+            maxSize: a.maxSize !== undefined
+              ? a.maxSize
+              : nullableNum(q.maxSize) ?? null,
+          };
+        }
+        if (websiteChange) {
+          const enabled = a.websiteEnabled ?? asBool(current.websiteAccess);
+          if (enabled) {
+            const w = asObj(current.websiteConfig);
+            body.websiteAccess = {
+              enabled: true,
+              indexDocument: a.indexDocument ?? asStr(w.indexDocument) ?? null,
+              errorDocument: a.errorDocument ?? asStr(w.errorDocument) ?? null,
+            };
+          } else {
+            // Garage rejects documents on a disable, and there is nothing to
+            // carry over once serving is off.
+            body.websiteAccess = { enabled: false };
+          }
         }
         logInfo(context, "Updating bucket", { id: a.id });
         await api(g, "POST", "UpdateBucket", { id: a.id }, body);
@@ -1559,10 +1606,11 @@ export const model = {
         const g = context.globalArgs;
         logInfo(context, "Fetching cluster status");
         const raw = await api(g, "GET", "GetClusterStatus");
+        const node = await selfNodeId(g);
         const handle = await context.writeResource(
           "cluster-status",
           "main",
-          shapeStatus(raw, "observed", new Date().toISOString()),
+          shapeStatus(raw, node, "observed", new Date().toISOString()),
         );
         return { dataHandles: [handle] };
       },
@@ -1598,21 +1646,32 @@ export const model = {
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const a = LayoutAssignArgs.parse(rawArgs);
         const g = context.globalArgs;
+
+        // A role change replaces the node's whole role (zone, capacity and
+        // tags together), so whatever the caller left out is taken from the
+        // role the node holds now. A node with no role yet has nothing to
+        // carry over: it needs a zone, and omitted capacity means gateway.
+        const layout = asObj(await api(g, "GET", "GetClusterLayout"));
+        const role = asArr(layout.roles).map(asObj).find((r) =>
+          r.id === a.nodeId
+        );
+        const zone = a.zone ?? (role ? asStr(role.zone) : undefined);
+        if (!zone) {
+          throw new Error(
+            `node ${a.nodeId} has no role in the current layout; pass zone`,
+          );
+        }
+        const capacity = a.capacity !== undefined
+          ? a.capacity
+          : (role ? nullableNum(role.capacity) ?? null : null);
+        const tags = a.tags ?? (role ? asArr(role.tags).map(String) : []);
         const body: Json = {
-          roles: [{
-            id: a.nodeId,
-            zone: a.zone,
-            capacity: a.capacity ?? null,
-            tags: a.tags,
-          }],
+          roles: [{ id: a.nodeId, zone, capacity, tags }],
           parameters: a.zoneRedundancy
             ? { zoneRedundancy: parseZoneRedundancy(a.zoneRedundancy) }
             : null,
         };
-        logInfo(context, "Staging layout role", {
-          nodeId: a.nodeId,
-          zone: a.zone,
-        });
+        logInfo(context, "Staging layout role", { nodeId: a.nodeId, zone });
         await api(g, "POST", "UpdateClusterLayout", {}, body);
         const handle = await context.writeResource("layout-result", a.nodeId, {
           nodeId: a.nodeId,
@@ -1698,11 +1757,7 @@ export const model = {
         const g = context.globalArgs;
         const ts = new Date().toISOString();
 
-        const status = asObj(await api(g, "GET", "GetClusterStatus"));
-        const nodeId = a.nodeId ?? String(status.node ?? "");
-        if (!nodeId) {
-          throw new Error("could not determine nodeId; pass nodeId explicitly");
-        }
+        const nodeId = a.nodeId ?? await selfNodeId(g);
 
         const layout = asObj(await api(g, "GET", "GetClusterLayout"));
         if (asArr(layout.roles).length > 0 && !a.force) {
