@@ -10,13 +10,12 @@ and rotating credentials.
 This extension holds an **IAM admin** credential, so its methods are limited and
 **reversible**:
 
-- ❌ **No hard deletes**: never deletes a project, application, or user. The
-  only way to disable one is the reversible `app_set_state` / `user_set_state` /
-  `grant_set_state` (deactivate ⇄ reactivate). The **one** exception is
-  `role_remove`: a project role has no deactivate state in Zitadel, so removing
-  one is a verify-first `DELETE`. It affects only that role and can effectively
-  be undone by re-creating the same key, but it also revokes any grants that
-  reference the role.
+- ❌ **No deletes of projects, applications or users**: the only way to disable
+  one is the reversible `app_set_state` / `user_set_state` / `grant_set_state`
+  (deactivate ⇄ reactivate). Two methods do delete, both verify-first:
+  `role_remove`, because a project role has no deactivate state (it also revokes
+  any grants that use the role), and `pat_revoke`, because revoking a token
+  removes it.
 - ❌ **Machine identities only**: manages service users and their
   PATs/keys/secrets; it does **not** create human users or change human
   passwords/MFA.
@@ -102,11 +101,12 @@ swamp model method run zitadel project_authz_set \
 
 - `role_ensure` — find-or-create a project role by `key`; update `displayName`/
   `group` (`action: created|unchanged|updated`).
-- `role_remove` — verify-first `DELETE` of a role (the only hard delete; also
-  revokes grants that reference it).
-- `grant_ensure` — grant a user (id or loginname) a **set** of role keys on a
-  project; re-running sets the grant to exactly that set (order does not
-  matter). Omit `roleKeys` to keep an existing grant's roles as they are.
+- `role_remove` — verify-first `DELETE` of a role (also revokes grants that use
+  it).
+- `grant_ensure` — grant a user (id or login name, e.g. `alice@example.com`) a
+  **set** of role keys on a project; re-running sets the grant to exactly that
+  set (order does not matter). Omit `roleKeys` to keep an existing grant's roles
+  as they are.
 - `grant_set_state` — deactivate/reactivate a grant (verify-first, reversible).
 - `project_authz_set` — toggle a project's `roleAssertion` / `roleCheck` /
   `hasProjectCheck` on an **existing** project (reads the project and merges the
@@ -127,3 +127,13 @@ and a `timestamp`.
   (a fixed DER envelope) before importing, since Web Crypto imports only PKCS#8.
 - Targets the stable Management v1 API. For very large user bases Zitadel
   recommends the v2 User API; a future version may switch user methods to it.
+
+## Breaking changes
+
+- **Boolean arguments accept only `true`/`false`** (or the strings `"true"` /
+  `"false"`). Earlier versions read `"True"`, `"1"`, `"yes"` and `null` as
+  false.
+- **`machine_user_ensure`, `pat_*` and `machine_*` find machine users only.** A
+  human user with the same username is no longer taken for one.
+- **`grant_ensure` without `roleKeys` keeps the grant's roles.** It used to
+  remove them all.

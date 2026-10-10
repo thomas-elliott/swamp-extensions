@@ -18,16 +18,15 @@ import type {
  * `@thomas/zitadel`: non-destructive administration of a Zitadel instance over
  * its Management API (v1 REST).
  *
- * SCOPE GUARANTEE: this holds an IAM admin credential, so its methods are limited
- * and reversible. It NEVER hard-deletes a project, application, or user; the only
- * way to disable one is the reversible deactivate/reactivate pair. The SINGLE
- * exception is `role_remove`: a project role has no deactivate state in Zitadel,
- * so removing one is a `DELETE`. It is verify-first and can be undone by
- * re-creating the same key, but it also revokes every grant that references the
- * role. It manages MACHINE identities only (service users + their PATs / keys /
- * secrets); it does NOT create human users or touch human passwords/MFA. Every
- * secret it mints (client secret, PAT, machine key) is emitted EXACTLY ONCE in the
- * method output, marked sensitive, and never logged.
+ * Scope: this holds an IAM admin credential, so its methods are limited. It never
+ * deletes a project, application or user; those are disabled with the reversible
+ * deactivate/reactivate pair. Two methods do delete: `role_remove`, because a
+ * role has no deactivate state (it also revokes every grant that uses the role),
+ * and `pat_revoke`, because revoking a token removes it. Both verify the target
+ * first. It manages machine identities only: service users and their PATs, keys
+ * and secrets, never human users or their passwords or MFA. Every secret it
+ * creates is returned once in the method output, marked sensitive, and never
+ * logged.
  *
  * Auth: a JWT private-key service account. The model holds a machine-user key
  * JSON (`keyJson`); per run it signs a short-lived RS256 assertion and exchanges
@@ -57,6 +56,8 @@ const GlobalArgs = z.object({
   httpTimeoutMs: z.coerce.number().int().default(30000).describe(
     "Per-request timeout (ms) for token exchange and API calls",
   ),
+  // An OAuth scope string, not a secret.
+  // swamp-quality-ignore credentials-sensitive-field
   tokenScope: z.string().default(
     "openid profile urn:zitadel:iam:org:project:id:zitadel:aud",
   ).describe(
@@ -656,8 +657,7 @@ async function findProjectByName(
       }],
     },
   });
-  const result = asArray(r.body.result);
-  return result.find((p) => p.name === name) ?? result[0] ?? null;
+  return asArray(r.body.result).find((p) => p.name === name) ?? null;
 }
 
 /** Find an application by exact name within a project; returns it or null. */
@@ -688,13 +688,17 @@ async function findMachineUserByUsername(
     method: "POST",
     path: mgmt("/users/_search"),
     body: {
-      queries: [{
-        userNameQuery: { userName, method: "TEXT_QUERY_METHOD_EQUALS" },
-      }],
+      // Machine users only, so a human with the same username is never taken
+      // for one.
+      queries: [
+        { userNameQuery: { userName, method: "TEXT_QUERY_METHOD_EQUALS" } },
+        { typeQuery: { type: "TYPE_MACHINE" } },
+      ],
     },
   });
-  const result = asArray(r.body.result);
-  return result.find((u) => u.userName === userName) ?? result[0] ?? null;
+  return asArray(r.body.result).find((u) =>
+    u.userName === userName && u.machine !== undefined
+  ) ?? null;
 }
 
 /** A plain numeric Zitadel id is used as-is; anything else is treated as a username. */
@@ -703,7 +707,10 @@ function looksLikeId(s: string): boolean {
 }
 
 /** Resolve a machine-user reference (numeric id OR username) to a user id. */
-async function resolveUserId(g: GlobalArgsT, userRef: string): Promise<string> {
+async function resolveMachineUserId(
+  g: GlobalArgsT,
+  userRef: string,
+): Promise<string> {
   if (looksLikeId(userRef)) return userRef;
   const u = await findMachineUserByUsername(g, userRef);
   // ListUsers result objects use `id`; AddMachineUser returns `userId`. Accept either.
@@ -714,6 +721,41 @@ async function resolveUserId(g: GlobalArgsT, userRef: string): Promise<string> {
     );
   }
   return uid;
+}
+
+/**
+ * Resolve any user by numeric id or login name, falling back to a machine
+ * user's username, which is how the grant methods were first called.
+ */
+async function resolveUserId(g: GlobalArgsT, userRef: string): Promise<string> {
+  if (looksLikeId(userRef)) return userRef;
+  const r = await call(g, {
+    method: "POST",
+    path: mgmt("/users/_search"),
+    body: {
+      queries: [{
+        loginNameQuery: {
+          loginName: userRef,
+          method: "TEXT_QUERY_METHOD_EQUALS",
+        },
+      }],
+    },
+  });
+  const u = asArray(r.body.result).find((x) =>
+    x.preferredLoginName === userRef ||
+    (Array.isArray(x.loginNames) && x.loginNames.includes(userRef))
+  );
+  if (typeof u?.id === "string") return u.id;
+  const machine = await findMachineUserByUsername(g, userRef);
+  const machineId = machine ? (machine.id ?? machine.userId) : undefined;
+  if (typeof machineId !== "string") {
+    throw new Error(
+      `No user found with id, login name or machine username ${
+        JSON.stringify(userRef)
+      }`,
+    );
+  }
+  return machineId;
 }
 
 /** Find a project role by exact key within a project; returns it or null. */
@@ -731,7 +773,8 @@ async function findRoleByKey(
       }],
     },
   });
-  // Role-search results key on `key`; match exactly (the query is a contains-ish filter).
+  // Role-search results key on `key`; the query is already EQUALS, and this
+  // keeps the match exact if the server ever widens it.
   return asArray(r.body.result).find((ro) => ro.key === roleKey) ?? null;
 }
 
@@ -1074,7 +1117,7 @@ const RoleRemoveArgs = z.object({
 
 const GrantListArgs = z.object({
   user: z.string().optional().describe(
-    "Filter by user id or loginname (omit for all users)",
+    "Filter by user id or login name (omit for all users)",
   ),
   projectId: z.string().optional().describe(
     "Filter by project id (omit for all projects)",
@@ -1082,7 +1125,9 @@ const GrantListArgs = z.object({
 });
 
 const GrantEnsureArgs = z.object({
-  user: z.string().describe("User id or loginname to grant roles to"),
+  user: z.string().describe(
+    "User id or login name (e.g. alice@example.com) to grant roles to",
+  ),
   project: z.string().describe("Project name or project id"),
   // No default: an empty default would read as "strip every role" on a re-run.
   roleKeys: jsonArray(z.string()).optional().describe(
@@ -1092,7 +1137,7 @@ const GrantEnsureArgs = z.object({
 });
 
 const GrantSetStateArgs = z.object({
-  user: z.string().describe("User id or loginname the grant belongs to"),
+  user: z.string().describe("User id or login name the grant belongs to"),
   grantId: z.string().describe(
     "Grant id (verified to belong to the user first)",
   ),
@@ -1538,8 +1583,10 @@ export const model = {
         const existing = await findProjectByName(g, a.name);
         let id: string;
         let action: z.infer<typeof Action>;
+        let state = "active";
         if (existing && typeof existing.id === "string") {
           id = existing.id;
+          state = friendlyState(existing.state);
           action = "unchanged";
         } else {
           const r = await call(g, {
@@ -1554,7 +1601,7 @@ export const model = {
         const handle = await context.writeResource("project", id, {
           id,
           name: a.name,
-          state: "active",
+          state,
           action,
           timestamp: nowIso(),
         });
@@ -1801,7 +1848,11 @@ export const model = {
             username: a.username,
             type: "machine",
             state: friendlyState(existing.state),
-            displayName: a.name,
+            // The user as it is, not the arguments: an existing user is not
+            // updated.
+            displayName: String(
+              (existing.machine as Json | undefined)?.name ?? a.name,
+            ),
             action: "unchanged",
             timestamp: ts,
           });
@@ -1849,7 +1900,7 @@ export const model = {
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const a = PatCreateArgs.parse(rawArgs);
         const g = context.globalArgs;
-        const userId = await resolveUserId(g, a.user);
+        const userId = await resolveMachineUserId(g, a.user);
         const r = await call(g, {
           method: "POST",
           path: mgmt(`/users/${encodeURIComponent(userId)}/pats`),
@@ -1883,7 +1934,7 @@ export const model = {
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const a = PatRevokeArgs.parse(rawArgs);
         const g = context.globalArgs;
-        const userId = await resolveUserId(g, a.user);
+        const userId = await resolveMachineUserId(g, a.user);
         // Verify-first: the tokenId must exist under this user.
         const list = await call(g, {
           method: "POST",
@@ -1932,7 +1983,7 @@ export const model = {
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const a = MachineKeyCreateArgs.parse(rawArgs);
         const g = context.globalArgs;
-        const userId = await resolveUserId(g, a.user);
+        const userId = await resolveMachineUserId(g, a.user);
         const r = await call(g, {
           method: "POST",
           path: mgmt(`/users/${encodeURIComponent(userId)}/keys`),
@@ -1981,7 +2032,7 @@ export const model = {
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const a = MachineSecretArgs.parse(rawArgs);
         const g = context.globalArgs;
-        const userId = await resolveUserId(g, a.user);
+        const userId = await resolveMachineUserId(g, a.user);
         const r = await call(g, {
           method: "PUT",
           path: mgmt(`/users/${encodeURIComponent(userId)}/secret`),
@@ -2197,9 +2248,8 @@ export const model = {
     },
     role_remove: {
       description:
-        "Remove a project role (verify-first DELETE). This is the SINGLE hard-delete " +
-        "in this model — roles have no deactivate state. Cascade-revokes any grants " +
-        "that reference the role.",
+        "Remove a project role (verify-first DELETE). Roles have no deactivate " +
+        "state, so this deletes; it also revokes any grants that use the role.",
       arguments: RoleRemoveArgs,
       execute: async (
         rawArgs,
