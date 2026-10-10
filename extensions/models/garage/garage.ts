@@ -10,21 +10,20 @@ import type {
 
 /**
  * `@thomas/garage`: administration of a Garage (S3-compatible object store)
- * cluster via its **Admin API v2** (`/v2/…`, bearer-token auth). Targets Garage
- * v2.1+ where bucket/key selectors are query parameters (`?id=`, `?globalAlias=`);
- * see the README for the v2.0 path-parameter caveat.
+ * cluster via its **Admin API v2** (`/v2/…`, bearer-token auth). The README
+ * lists the Garage versions it works with.
  *
  * SCOPE: this holds the cluster's `admin_token`, so the methods cover the
  * control plane only: buckets, access keys, and key↔bucket permissions. It
  * never touches S3 object data (no GET/PUT/list of objects), and the only
- * destructive verbs (`bucket_delete`, `key_delete`) pre-verify the target by id
- * first (CLAUDE.md rule 5). Garage itself refuses to delete a non-empty bucket.
+ * destructive verbs (`bucket_delete`, `key_delete`) verify the target by id
+ * first.
  *
  * Secrets: `adminToken` is supplied via a vault expression, e.g.
  * `${{ vault.get(<vault>, garage/admin_token) }}`. Newly created/rotated key
  * secrets are returned ONCE by Garage and surfaced on the `key-result` resource
- * (`secretAccessKey`, marked sensitive). Capture them and store in 1Password;
- * they cannot be retrieved again except via `key_get --showSecretKey`.
+ * (`secretAccessKey`, marked sensitive). Store them somewhere safe; they cannot
+ * be retrieved again except via `key_get --showSecretKey`.
  */
 
 // ─────────────────────────── global arguments ───────────────────────────
@@ -330,6 +329,26 @@ async function realApi(
   } catch {
     return text;
   }
+}
+
+/**
+ * A key's permissions on a bucket, read from the bucket that AllowBucketKey and
+ * DenyBucketKey return. Those calls leave a permission unchanged when its flag
+ * is false, so the request alone does not say what the key now holds. A key
+ * missing from the bucket's list holds nothing.
+ */
+function keyPermsOn(
+  bucket: unknown,
+  accessKeyId: string,
+): { read: boolean; write: boolean; owner: boolean } {
+  const key = asArr(asObj(bucket).keys).map(asObj)
+    .find((k) => k.accessKeyId === accessKeyId);
+  const p = asObj(key?.permissions);
+  return {
+    read: asBool(p.read),
+    write: asBool(p.write),
+    owner: asBool(p.owner),
+  };
 }
 
 /** Dispatch through the test override when set, else the real transport. */
@@ -1102,9 +1121,14 @@ export const model = {
         const ts = new Date().toISOString();
 
         if (a.globalAlias) {
+          // Garage answers an unknown alias with 404 NoSuchBucket; any other
+          // error is a real failure and must not look like "free to create".
           const existing = await api(g, "GET", "GetBucketInfo", {
             globalAlias: a.globalAlias,
-          }).catch(() => undefined);
+          }).catch((e: Error) => {
+            if (/HTTP 404/.test(e.message)) return undefined;
+            throw e;
+          });
           if (existing && asObj(existing).id) {
             logInfo(context, "Bucket alias already exists; unchanged", {
               globalAlias: a.globalAlias,
@@ -1420,8 +1444,10 @@ export const model = {
     key_rotate: {
       description:
         "Rotate a key: create a NEW key, copy the OLD key's bucket grants onto it, " +
-        "and return the new secret ONCE (sensitive). Does NOT delete the old key — " +
-        "update consumers, then call key_delete on the old id. The headline method.",
+        "and return the new secret ONCE (sensitive). The new key keeps the old " +
+        "key's expiry. If a grant cannot be copied, the new key is deleted again " +
+        "and the method fails. Does NOT delete the old key: update consumers, " +
+        "then call key_delete on the old id.",
       arguments: KeyRotateArgs,
       execute: async (
         rawArgs,
@@ -1438,13 +1464,15 @@ export const model = {
         const oldName = asStr(oldKey.name);
         const oldPerm = asObj(oldKey.permissions);
 
-        // 1. create the replacement key (mirror create-bucket permission).
         logInfo(context, "Rotating key: creating replacement", { oldId: a.id });
+        const oldExpiration = asStr(oldKey.expiration);
         const created = asObj(
           await api(g, "POST", "CreateKey", {}, {
             name: a.name ?? `${oldName ?? a.id} (rotated)`,
             allow: { createBucket: asBool(oldPerm.createBucket) },
-            neverExpires: true,
+            ...(oldExpiration
+              ? { expiration: oldExpiration }
+              : { neverExpires: true }),
           }),
         );
         const newId = String(created.accessKeyId ?? "");
@@ -1452,23 +1480,38 @@ export const model = {
           throw new Error("Rotation failed: no new accessKeyId returned");
         }
 
-        // 2. copy each bucket grant from the old key to the new one.
         let copied = 0;
-        for (const b of asArr(oldKey.buckets)) {
-          const bb = asObj(b);
-          const bucketId = String(bb.id ?? "");
-          if (!bucketId) continue;
-          const p = asObj(bb.permissions);
-          await api(g, "POST", "AllowBucketKey", {}, {
-            bucketId,
-            accessKeyId: newId,
-            permissions: {
-              read: asBool(p.read),
-              write: asBool(p.write),
-              owner: asBool(p.owner),
-            },
-          });
-          copied += 1;
+        try {
+          for (const b of asArr(oldKey.buckets)) {
+            const bb = asObj(b);
+            const bucketId = String(bb.id ?? "");
+            if (!bucketId) continue;
+            const p = asObj(bb.permissions);
+            await api(g, "POST", "AllowBucketKey", {}, {
+              bucketId,
+              accessKeyId: newId,
+              permissions: {
+                read: asBool(p.read),
+                write: asBool(p.write),
+                owner: asBool(p.owner),
+              },
+            });
+            copied += 1;
+          }
+        } catch (e) {
+          // The new secret has not been returned to anyone yet, so a key left
+          // behind would be unusable. Remove it before failing.
+          const cleanup = await api(g, "POST", "DeleteKey", { id: newId })
+            .then(() => "the new key was deleted again")
+            .catch((d: Error) =>
+              `deleting the new key ${newId} also failed (${d.message}); ` +
+              "delete it by hand"
+            );
+          throw new Error(
+            `Rotation failed copying grants: ${
+              (e as Error).message
+            }; ${cleanup}`,
+          );
         }
         logInfo(context, "Rotation: copied grants", { newId, grants: copied });
 
@@ -1525,7 +1568,7 @@ export const model = {
           bucketId: a.bucketId,
           accessKeyId: a.accessKeyId,
         });
-        await api(g, "POST", "AllowBucketKey", {}, {
+        const bucket = await api(g, "POST", "AllowBucketKey", {}, {
           bucketId: a.bucketId,
           accessKeyId: a.accessKeyId,
           permissions: { read: a.read, write: a.write, owner: a.owner },
@@ -1536,9 +1579,7 @@ export const model = {
           {
             bucketId: a.bucketId,
             accessKeyId: a.accessKeyId,
-            read: a.read,
-            write: a.write,
-            owner: a.owner,
+            ...keyPermsOn(bucket, a.accessKeyId),
             action: "granted",
             timestamp: new Date().toISOString(),
           },
@@ -1562,7 +1603,7 @@ export const model = {
           bucketId: a.bucketId,
           accessKeyId: a.accessKeyId,
         });
-        await api(g, "POST", "DenyBucketKey", {}, {
+        const bucket = await api(g, "POST", "DenyBucketKey", {}, {
           bucketId: a.bucketId,
           accessKeyId: a.accessKeyId,
           permissions: { read: a.read, write: a.write, owner: a.owner },
@@ -1573,9 +1614,7 @@ export const model = {
           {
             bucketId: a.bucketId,
             accessKeyId: a.accessKeyId,
-            read: a.read,
-            write: a.write,
-            owner: a.owner,
+            ...keyPermsOn(bucket, a.accessKeyId),
             action: "denied",
             timestamp: new Date().toISOString(),
           },

@@ -98,7 +98,7 @@ cluster that is running but has no layout becomes usable with:
 
 ```bash
 # capacity is in BYTES (1000000000 = 1 GB)
-swamp model method run garage cluster_init --arg capacity=1000000000
+swamp model method run garage cluster_init --input capacity=1000000000
 swamp model method run garage cluster_status   # confirm the node is up + assigned
 ```
 
@@ -119,7 +119,7 @@ then store the result in the vault:
 
 ```bash
 # 1. create the key and read its one-time secret out of the artifact
-swamp model method run garage key_create --arg name=myapp --json
+swamp model method run garage key_create --input name=myapp --json
 AKID=$(swamp data get garage key-result --json | jq -r '.content.accessKeyId')
 SECRET=$(swamp data get garage key-result --json | jq -r '.content.secretAccessKey')
 
@@ -144,10 +144,10 @@ step.
 ```bash
 swamp model method run garage cluster_health
 swamp model method run garage permissions_audit
-swamp model method run garage bucket_create --arg globalAlias=backups
-swamp model method run garage key_create --arg name=backup-writer --arg allowCreateBucket=false
+swamp model method run garage bucket_create --input globalAlias=backups
+swamp model method run garage key_create --input name=backup-writer --input allowCreateBucket=false
 swamp model method run garage key_allow \
-  --arg bucketId=<id> --arg accessKeyId=<GK…> --arg read=true --arg write=true
+  --input bucketId=<id> --input accessKeyId=<GK…> --input read=true --input write=true
 ```
 
 ## License

@@ -175,6 +175,26 @@ Deno.test("bucket_create: new globalAlias issues CreateBucket with the alias bod
   }
 });
 
+Deno.test("bucket_create: an error other than 404 is not taken as a free alias", async () => {
+  const fake = makeFakeApi((op) => {
+    if (op === "GetBucketInfo") {
+      throw new Error("Garage GetBucketInfo failed (HTTP 403): forbidden");
+    }
+    return undefined;
+  });
+  __setGarageApi(fake.fn);
+  try {
+    const { context } = makeContext();
+    await rejects(
+      () => method("bucket_create").execute({ globalAlias: "logs" }, context),
+      /HTTP 403/,
+    );
+    assert(!call(fake.calls, "CreateBucket"), "must not create");
+  } finally {
+    __setGarageApi(null);
+  }
+});
+
 Deno.test("bucket_create: localAlias requires localAliasAccessKeyId", async () => {
   const { context } = makeContext();
   await rejects(
@@ -522,6 +542,60 @@ Deno.test("key_rotate: creates new key, copies grants, returns secret, does NOT 
   }
 });
 
+Deno.test("key_rotate: the new key keeps the old key's expiry", async () => {
+  const fake = makeFakeApi((op) => {
+    if (op === "GetKeyInfo") {
+      return {
+        accessKeyId: "OLD",
+        expiration: "2027-01-01T00:00:00Z",
+        permissions: {},
+        buckets: [],
+      };
+    }
+    if (op === "CreateKey") return { accessKeyId: "NEW", secretAccessKey: "s" };
+    return undefined;
+  });
+  __setGarageApi(fake.fn);
+  try {
+    const { context } = makeContext();
+    await method("key_rotate").execute({ id: "OLD" }, context);
+    const ck = call(fake.calls, "CreateKey")?.body as Record<string, unknown>;
+    assertEquals(ck.expiration, "2027-01-01T00:00:00Z");
+    assert(!("neverExpires" in ck), "must not override the expiry");
+  } finally {
+    __setGarageApi(null);
+  }
+});
+
+Deno.test("key_rotate: a failed grant copy deletes the new key and fails", async () => {
+  const fake = makeFakeApi((op) => {
+    if (op === "GetKeyInfo") {
+      return {
+        accessKeyId: "OLD",
+        permissions: {},
+        buckets: [{ id: "b1", permissions: { read: true } }],
+      };
+    }
+    if (op === "CreateKey") return { accessKeyId: "NEW", secretAccessKey: "s" };
+    if (op === "AllowBucketKey") {
+      throw new Error("Garage AllowBucketKey failed (HTTP 500): boom");
+    }
+    return undefined;
+  });
+  __setGarageApi(fake.fn);
+  try {
+    const { context, written } = makeContext();
+    await rejects(
+      () => method("key_rotate").execute({ id: "OLD" }, context),
+      /new key was deleted again/,
+    );
+    assertEquals(call(fake.calls, "DeleteKey")?.query, { id: "NEW" });
+    assertEquals(written.length, 0, "no secret is recorded");
+  } finally {
+    __setGarageApi(null);
+  }
+});
+
 Deno.test("key_rotate: missing old key throws before creating anything", async () => {
   const fake = makeFakeApi((op) => (op === "GetKeyInfo" ? {} : undefined));
   __setGarageApi(fake.fn);
@@ -591,8 +665,15 @@ Deno.test("key_allow: no permission set is rejected", async () => {
   );
 });
 
-Deno.test("key_deny: records denied", async () => {
-  const fake = makeFakeApi(() => undefined);
+Deno.test("key_deny: records what the key holds afterwards, not the request", async () => {
+  // Denying owner leaves read and write as they were; Garage returns the bucket.
+  const fake = makeFakeApi(() => ({
+    id: "b1",
+    keys: [{
+      accessKeyId: "GK1",
+      permissions: { read: true, write: true, owner: false },
+    }],
+  }));
   __setGarageApi(fake.fn);
   try {
     const { context, written } = makeContext();
@@ -607,6 +688,10 @@ Deno.test("key_deny: records denied", async () => {
       permissions: { read: false, write: false, owner: true },
     });
     assertEquals(written[0].data.action, "denied");
+    assertEquals(
+      [written[0].data.read, written[0].data.write, written[0].data.owner],
+      [true, true, false],
+    );
   } finally {
     __setGarageApi(null);
   }
