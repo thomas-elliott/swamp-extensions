@@ -185,3 +185,12 @@ enum), and the extension does not call a destructive endpoint with a guessed
 value. A named volume held by a _stopped_ (not removed) container therefore
 can't be cleared until that container is removed (e.g. swarm task-history
 rotation); the per-type prunes above cover the rest.
+
+## Breaking changes
+
+- **`project_create` and `project_update` no longer take `validate`.** Both
+  always validate the compose file locally and stop if validation fails or
+  cannot run. A `validate: false` still passed is ignored.
+- **`authType` accepts `none`, `http` or `ssh`, and `targetType` `project` or
+  `swarm_stack`**, the values Arcane uses. The old `token` and `swarm` were
+  never accepted by Arcane.
