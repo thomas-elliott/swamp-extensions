@@ -20,16 +20,6 @@ import type {
  * destructive verbs (`bucket_delete`, `key_delete`) pre-verify the target by id
  * first (CLAUDE.md rule 5). Garage itself refuses to delete a non-empty bucket.
  *
- * Method sections (by prefix):
- *   - read/audit: `cluster_health`, `bucket_list`, `bucket_get`, `key_list`,
- *     `key_get`, `permissions_audit` (the report data source).
- *   - buckets: `bucket_create`, `bucket_update`, `bucket_delete`,
- *     `bucket_alias_add`, `bucket_alias_remove`.
- *   - keys: `key_create`, `key_import`, `key_update`, `key_rotate`, `key_delete`.
- *   - permissions: `key_allow`, `key_deny`.
- *   - cluster/layout (first-boot lifecycle): `cluster_status`, `layout_get`,
- *     `layout_assign`, `layout_apply`, `layout_revert`, `cluster_init`.
- *
  * Secrets: `adminToken` is supplied via a vault expression, e.g.
  * `${{ vault.get(<vault>, garage/admin_token) }}`. Newly created/rotated key
  * secrets are returned ONCE by Garage and surfaced on the `key-result` resource
@@ -795,10 +785,11 @@ export const model = {
       labels: ["live"],
       execute: async (context: Pick<Ctx, "globalArgs">) => {
         // Checks get globalArgs without the schema's defaults; parse to apply them.
-        const g = GlobalArgs.parse(context.globalArgs);
-        // Older swamp left the token as an unresolved `${{ … }}` here. Skip then;
-        // the method run checks it.
-        if (/\$\{\{/.test(String(g.adminToken))) return { pass: true };
+        const parsed = GlobalArgs.safeParse(context.globalArgs);
+        if (!parsed.success) {
+          return { pass: false, errors: [z.prettifyError(parsed.error)] };
+        }
+        const g = parsed.data;
         try {
           await api(g, "GET", "GetClusterHealth");
           return { pass: true };

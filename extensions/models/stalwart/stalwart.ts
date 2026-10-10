@@ -834,12 +834,21 @@ const SettingsGetArgs = z.object({
   kind: z.enum(SETTINGS_KINDS).describe("Which settings singleton to read"),
 });
 
+/**
+ * A strict boolean. `z.coerce.boolean()` runs `Boolean(v)`, so `"0"` and
+ * `"False"` become true; this accepts only true/false and their strings.
+ */
+const StrictBool = z.union(
+  [z.boolean(), z.literal("true"), z.literal("false")],
+  { error: 'expected true or false (or the strings "true" / "false")' },
+).transform((v) => v === true || v === "true");
+
 const SettingsSetArgs = z.object({
   kind: z.enum(SETTINGS_KINDS).describe("Which settings singleton to update"),
   patch: jsonObject.describe(
     'Fields to set, e.g. {"usePermissiveCors":true}. Merged into the singleton.',
   ),
-  reload: z.coerce.boolean().default(true).describe(
+  reload: StrictBool.default(true).describe(
     "Run a settings reload after the change so it takes effect",
   ),
 });
@@ -999,7 +1008,7 @@ const CertificateInstallArgs = z.object({
   certificateId: z.string().optional().describe(
     "Update a specific certificate id; otherwise update the sole existing cert, or create one",
   ),
-  reload: z.coerce.boolean().default(true).describe(
+  reload: StrictBool.default(true).describe(
     "Run reload-certificates after install so the new cert is served",
   ),
 });
@@ -1044,10 +1053,11 @@ export const model = {
       labels: ["live"],
       execute: async (context: Pick<Ctx, "globalArgs">) => {
         // Checks get globalArgs without the schema's defaults; parse to apply them.
-        const g = GlobalArgs.parse(context.globalArgs);
-        // Older swamp left apiKey as an unresolved `${{ … }}` here. Skip then;
-        // the method run checks it.
-        if (/\$\{\{/.test(String(g.apiKey))) return { pass: true };
+        const parsed = GlobalArgs.safeParse(context.globalArgs);
+        if (!parsed.success) {
+          return { pass: false, errors: [z.prettifyError(parsed.error)] };
+        }
+        const g = parsed.data;
         try {
           await rest(g, { method: "GET", path: "/api/account" });
           return { pass: true };

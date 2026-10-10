@@ -35,16 +35,6 @@ import type {
  * scope) for an access token, then sends that as a Bearer token to the Management
  * API. No long-lived bearer token is stored.
  *
- * Method sections (by prefix):
- *   - read/audit: `org_get`, `project_list`, `app_list`, `app_get`, `user_list`,
- *     `manager_audit`, `role_list`, `grant_list`.
- *   - provision: `project_ensure`, `oidc_app_ensure`, `api_app_ensure`.
- *   - rotate: `app_secret_rotate`, `machine_user_ensure`, `pat_create`,
- *     `pat_revoke`, `machine_key_create`, `machine_secret_generate`.
- *   - authorization: `role_ensure`, `role_remove`, `grant_ensure`,
- *     `grant_set_state`, `project_authz_set`.
- *   - reversible lifecycle: `app_set_state`, `user_set_state`.
- *
  * Idempotency: provision/ensure methods find-or-create by human name (project
  * name, app name, username) and converge config in place, returning an `action`
  * of created/updated/unchanged. They accept friendly names, not just opaque IDs.
@@ -898,6 +888,15 @@ const ProjectEnsureArgs = z.object({
   name: z.string().describe("Project name (find-or-create by exact name)"),
 });
 
+/**
+ * A strict boolean. `z.coerce.boolean()` runs `Boolean(v)`, so `"0"` and
+ * `"False"` become true; this accepts only true/false and their strings.
+ */
+const StrictBool = z.union(
+  [z.boolean(), z.literal("true"), z.literal("false")],
+  { error: 'expected true or false (or the strings "true" / "false")' },
+).transform((v) => v === true || v === "true");
+
 const OidcAppEnsureArgs = z.object({
   project: z.string().describe(
     "Project name (created if absent) or project id",
@@ -924,7 +923,7 @@ const OidcAppEnsureArgs = z.object({
   responseTypes: jsonArray(z.enum(["code", "id_token", "id_token_token"]))
     .optional(),
   accessTokenType: z.enum(["bearer", "jwt"]).optional(),
-  devMode: optBoolArg().describe(
+  devMode: StrictBool.optional().describe(
     "Relax redirect-URI checks (non-https/localhost). Test only.",
   ),
 });
@@ -1055,18 +1054,6 @@ const UserSetStateArgs = z.object({
   state: z.enum(["active", "inactive"]),
 });
 
-/**
- * A tri-state boolean argument: accepts true/false (and the strings "true"/
- * "false" from the raw CLI) but leaves `undefined` as `undefined` — so an omitted
- * flag means "leave as-is" rather than "set false".
- */
-function optBoolArg(): z.ZodType<boolean | undefined> {
-  return z.preprocess(
-    (v) => v === undefined ? undefined : v === true || v === "true",
-    z.boolean().optional(),
-  ) as z.ZodType<boolean | undefined>;
-}
-
 const RoleListArgs = z.object({
   projectId: z.string().describe("Project id to list roles for"),
 });
@@ -1114,13 +1101,13 @@ const GrantSetStateArgs = z.object({
 
 const ProjectAuthzSetArgs = z.object({
   project: z.string().describe("Project name or project id"),
-  roleAssertion: optBoolArg().describe(
+  roleAssertion: StrictBool.optional().describe(
     "Assert project roles into tokens/userinfo (the flag that surfaces grants)",
   ),
-  roleCheck: optBoolArg().describe(
+  roleCheck: StrictBool.optional().describe(
     "Require a project role to authenticate",
   ),
-  hasProjectCheck: optBoolArg().describe(
+  hasProjectCheck: StrictBool.optional().describe(
     "Require the user's org to have the project granted",
   ),
 });
@@ -1144,10 +1131,11 @@ export const model = {
       labels: ["live"],
       execute: async (context: Pick<Ctx, "globalArgs">) => {
         // Checks get globalArgs without the schema's defaults; parse to apply them.
-        const g = GlobalArgs.parse(context.globalArgs);
-        // Older swamp left keyJson as an unresolved `${{ … }}` here. Skip then;
-        // the method run checks it.
-        if (/\$\{\{/.test(String(g.keyJson))) return { pass: true };
+        const parsed = GlobalArgs.safeParse(context.globalArgs);
+        if (!parsed.success) {
+          return { pass: false, errors: [z.prettifyError(parsed.error)] };
+        }
+        const g = parsed.data;
         try {
           await getToken(g);
           return { pass: true };

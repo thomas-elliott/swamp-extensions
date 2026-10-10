@@ -375,7 +375,10 @@ Deno.test("web_service_set_tls maps args to webService* params and emits setting
     });
     assertEquals(written[0].specName, "settings");
     assertEquals(written[0].data.webServiceUseSelfSignedTlsCertificate, false);
-    assertEquals(written[0].data.webServiceTlsCertificatePath, "wildcard.example.com.pfx");
+    assertEquals(
+      written[0].data.webServiceTlsCertificatePath,
+      "wildcard.example.com.pfx",
+    );
   } finally {
     __setTechnitiumTransport(null);
   }
@@ -982,7 +985,10 @@ Deno.test("reachable check applies the schema defaults to globalArgs", async () 
       >;
     }).checks;
     const res = await checks.reachable.execute({
-      globalArgs: { baseUrl: TEST_GLOBALS.baseUrl, apiToken: TEST_GLOBALS.apiToken },
+      globalArgs: {
+        baseUrl: TEST_GLOBALS.baseUrl,
+        apiToken: TEST_GLOBALS.apiToken,
+      },
     });
     assertEquals(res.pass, true);
     assertEquals(seenSkipTls, false);
@@ -1006,6 +1012,52 @@ Deno.test("allowed_list factory writes one listEntry per domain", async () => {
       "allowed-track-example-com",
     ]);
     assertEquals(written[0].data.list, "allowed");
+  } finally {
+    __setTechnitiumTransport(null);
+  }
+});
+
+// ─────────────────────────── reachable check ───────────────────────────
+
+type CheckDef = {
+  execute: (c: unknown) => Promise<{ pass: boolean; errors?: string[] }>;
+};
+const reachable = (model.checks as unknown as Record<string, CheckDef>)
+  .reachable;
+
+Deno.test("reachable check: applies the schema defaults to globalArgs", async () => {
+  let seen: Record<string, unknown> = {};
+  const paths: string[] = [];
+  __setTechnitiumTransport((g, _method, path) => {
+    seen = g;
+    paths.push(path);
+    return Promise.resolve({});
+  });
+  try {
+    // Checks get globalArgs without the schema's defaults.
+    const res = await reachable.execute({
+      globalArgs: { baseUrl: "https://dns.test:53443", apiToken: "t" },
+    });
+    assertEquals(res.pass, true);
+    assertEquals(paths, ["/settings/get"]);
+    assertEquals(seen.skipTlsVerify, false);
+  } finally {
+    __setTechnitiumTransport(null);
+  }
+});
+
+Deno.test("reachable check: a definition that fails the schema fails without probing", async () => {
+  let called = false;
+  __setTechnitiumTransport(() => {
+    called = true;
+    return Promise.resolve({});
+  });
+  try {
+    const res = await reachable.execute({
+      globalArgs: { baseUrl: "https://dns.test:53443" },
+    });
+    assertEquals(res.pass, false);
+    assert(!called, "must not probe with an invalid definition");
   } finally {
     __setTechnitiumTransport(null);
   }

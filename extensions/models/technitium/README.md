@@ -1,7 +1,7 @@
 # @thomas/technitium
 
-Manages a [Technitium DNS Server](https://technitium.com/dns/) through its
-HTTP API. Every operation goes through the API; the extension never touches the
+Manages a [Technitium DNS Server](https://technitium.com/dns/) through its HTTP
+API. Every operation goes through the API; the extension never touches the
 server host.
 
 Covers built-in ad-blocking control, authoritative zone + record lifecycle, the
@@ -81,18 +81,17 @@ swamp model method run dns-home cache_flush
   `{cname}` for CNAME, `{exchange, preference}` for MX). Updates carry the new
   values in `newRData`. For **APP** records, put the application payload in
   `rData.data` (the same key `record_list`/`record_get` read it back under). It
-  is written via Technitium's `recordData` param, and updates set the new payload
-  directly (APP records have no `new*` scheme and only one exists per name).
-  `record_update` reads the record first and sends its current `ttl`, `disable`,
-  `comments` and `expiryTtl` back unless you pass new ones, because Technitium
-  resets any of those it is not sent (TTL to the server default, a disabled
-  record back to enabled).
-  `record_get` reads a **single** domain's records live from the server (use it
-  for the current server state; `record_list` reads the whole zone). Every
-  `record_add` / `record_update` / `record_delete` **reads the record back and
-  checks the live state** afterwards, and fails with an error if Technitium
-  reported success but the change was not applied (e.g. an APP record left with
-  empty data).
+  is written via Technitium's `recordData` param, and updates set the new
+  payload directly (APP records have no `new*` scheme and only one exists per
+  name). `record_update` reads the record first and sends its current `ttl`,
+  `disable`, `comments` and `expiryTtl` back unless you pass new ones, because
+  Technitium resets any of those it is not sent (TTL to the server default, a
+  disabled record back to enabled). `record_get` reads a **single** domain's
+  records live from the server (use it for the current server state;
+  `record_list` reads the whole zone). Every `record_add` / `record_update` /
+  `record_delete` **reads the record back and checks the live state**
+  afterwards, and fails with an error if Technitium reported success but the
+  change was not applied (e.g. an APP record left with empty data).
 - **`allowed_*` / `blocked_*`** — manage the built-in Allowed/Blocked zones:
   `_add`, `_delete`, `_list`, `_flush`.
 - **`client_resolve`** — resolve a name through the server's DNS client for
@@ -108,8 +107,8 @@ swamp model method run dns-home cache_flush
   upload of a local zip; verify the file first). Both send every section flag
   the API knows explicitly (`authConfig`, `clusterConfig`, `webServiceSettings`,
   `dnsSettings`, `logSettings`, `zones`, `allowedZones`, `blockedZones`,
-  `blockLists`, `apps`, `scopes`, `stats`, `logs`); an unknown name in
-  `options` is rejected with an error rather than ignored. Backup defaults to every
+  `blockLists`, `apps`, `scopes`, `stats`, `logs`); an unknown name in `options`
+  is rejected with an error rather than ignored. Backup defaults to every
   configuration section (logs and stats off). Restore defaults leave
   `authConfig`, `clusterConfig` and `webServiceSettings` off, because those
   replace the users and tokens (including the one making the call), the web
@@ -125,17 +124,18 @@ are stored. The full settings object is not stored, so secrets such as TLS
 certificate passwords are not persisted.
 
 `zoneRecord` instances are a **copy of live server state, refreshed on each
-read**. The Technitium server holds the authoritative state. Every record method — `record_add`,
-`record_update`, `record_delete`, `record_list`, `record_get` — addresses a
-record by a deterministic identity name derived from `(zone, name, type, rData)`,
-so the same record is one instance regardless of which method wrote it, and two
-records at one name (e.g. two A records) stay distinct. A re-`record_list` writes
-a **new version** of an unchanged record rather than a duplicate. Because swamp
-does not auto-prune instances, `zoneRecord` carries a finite **30-day lifetime**:
-records that still exist refresh their timer on each list/get, while records that
-were deleted or had their value changed stop being refreshed and expire. For
-the current state of a single name, use `record_get` (a live read);
-`swamp data gc` / `swamp data delete` clean up persisted entries on demand.
+read**. The Technitium server holds the authoritative state. Every record method
+— `record_add`, `record_update`, `record_delete`, `record_list`, `record_get` —
+addresses a record by a deterministic identity name derived from
+`(zone, name, type, rData)`, so the same record is one instance regardless of
+which method wrote it, and two records at one name (e.g. two A records) stay
+distinct. A re-`record_list` writes a **new version** of an unchanged record
+rather than a duplicate. Because swamp does not auto-prune instances,
+`zoneRecord` carries a finite **30-day lifetime**: records that still exist
+refresh their timer on each list/get, while records that were deleted or had
+their value changed stop being refreshed and expire. For the current state of a
+single name, use `record_get` (a live read); `swamp data gc` /
+`swamp data delete` clean up persisted entries on demand.
 
 ## License
 

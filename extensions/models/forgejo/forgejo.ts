@@ -42,16 +42,6 @@ import type {
  * token CRUD (`/users/{u}/tokens`) is basic-auth-only, so this model never
  * creates or revokes tokens.
  *
- * Method sections (by prefix):
- *   - read/audit: `health`, `org_list`, `repo_list`, `user_list`,
- *     `mirror_status`, `pr_list`, `pr_get`, `branch_protection_list`,
- *     `webhook_audit`.
- *   - idempotent provisioning: `org_ensure`, `repo_ensure`,
- *     `collaborator_ensure`, `branch_protection_ensure`, `mirror_ensure`,
- *     `mirror_sync_now`, `pr_ensure`, `webhook_retarget`.
- *   - reversible lifecycle: `repo_archive`, `repo_unarchive`.
- *   - irreversible: `pr_merge`.
- *
  * Idempotency: every `*_ensure` probes by name first (404 ⇒ create, else
  * converge the supplied settings in place via PATCH) and reports an `action`
  * of created/updated/unchanged so a re-run is a no-op when nothing changed.
@@ -979,17 +969,26 @@ const OrgEnsureArgs = z.object({
   fullName: z.string().optional().describe("Display name to converge."),
 });
 
+/**
+ * A strict boolean. `z.coerce.boolean()` runs `Boolean(v)`, so `"0"` and
+ * `"False"` become true; this accepts only true/false and their strings.
+ */
+const StrictBool = z.union(
+  [z.boolean(), z.literal("true"), z.literal("false")],
+  { error: 'expected true or false (or the strings "true" / "false")' },
+).transform((v) => v === true || v === "true");
+
 /** The repo settings `repo_ensure` converges (all optional; only supplied ones are applied). */
 const RepoSettingsShape = {
-  private: z.coerce.boolean().optional().describe("Repo visibility."),
+  private: StrictBool.optional().describe("Repo visibility."),
   description: z.string().optional().describe("Repo description."),
   defaultBranch: z.string().optional().describe("Default branch name."),
-  hasWiki: z.coerce.boolean().optional().describe("Enable the wiki unit."),
-  hasIssues: z.coerce.boolean().optional().describe("Enable the issues unit."),
-  hasPullRequests: z.coerce.boolean().optional().describe(
+  hasWiki: StrictBool.optional().describe("Enable the wiki unit."),
+  hasIssues: StrictBool.optional().describe("Enable the issues unit."),
+  hasPullRequests: StrictBool.optional().describe(
     "Enable the pull-requests unit.",
   ),
-  hasReleases: z.coerce.boolean().optional().describe(
+  hasReleases: StrictBool.optional().describe(
     "Enable the releases unit.",
   ),
 };
@@ -1016,10 +1015,10 @@ const CollaboratorEnsureArgs = z.object({
 
 /** The branch-protection settings the ensure method converges. */
 const ProtectionSettingsShape = {
-  enablePush: z.coerce.boolean().optional().describe(
+  enablePush: StrictBool.optional().describe(
     "Allow direct pushes. False makes the branch PR-only.",
   ),
-  enablePushWhitelist: z.coerce.boolean().optional().describe(
+  enablePushWhitelist: StrictBool.optional().describe(
     "Limit direct push to the whitelist (requires enablePush).",
   ),
   pushWhitelistUsernames: z.array(z.string()).optional().describe(
@@ -1028,13 +1027,13 @@ const ProtectionSettingsShape = {
   requiredApprovals: z.coerce.number().int().optional().describe(
     "Approving reviews required before merge.",
   ),
-  requireSignedCommits: z.coerce.boolean().optional(),
-  applyToAdmins: z.coerce.boolean().optional().describe(
+  requireSignedCommits: StrictBool.optional(),
+  applyToAdmins: StrictBool.optional().describe(
     "Bind repo admins to the rule too. Without this an admin bypasses it.",
   ),
-  blockOnRejectedReviews: z.coerce.boolean().optional(),
-  blockOnOutdatedBranch: z.coerce.boolean().optional(),
-  enableStatusCheck: z.coerce.boolean().optional(),
+  blockOnRejectedReviews: StrictBool.optional(),
+  blockOnOutdatedBranch: StrictBool.optional(),
+  enableStatusCheck: StrictBool.optional(),
   statusCheckContexts: z.array(z.string()).optional(),
   protectedFilePatterns: z.string().optional().describe(
     "Semicolon-separated globs that may not be changed on this branch, e.g. " +
@@ -1092,8 +1091,8 @@ const MirrorEnsureArgs = z.object({
       'periodic sync). Defaults to "8h0m0s" on create; when omitted, an ' +
       "existing mirror keeps its interval.",
   ),
-  lfs: z.coerce.boolean().default(true).describe("Mirror LFS objects too."),
-  private: z.coerce.boolean().optional().describe(
+  lfs: StrictBool.default(true).describe("Mirror LFS objects too."),
+  private: StrictBool.optional().describe(
     "Mirror visibility. Defaults to private on create; when omitted, an " +
       "existing mirror keeps its visibility.",
   ),
@@ -1141,10 +1140,10 @@ const PrMergeArgs = z.object({
   ).describe("Merge strategy (Forgejo's `Do`)."),
   title: z.string().optional().describe("Merge commit title override."),
   message: z.string().optional().describe("Merge commit message override."),
-  deleteBranch: z.coerce.boolean().default(false).describe(
+  deleteBranch: StrictBool.default(false).describe(
     "Delete the head branch after a successful merge.",
   ),
-  force: z.coerce.boolean().default(false).describe(
+  force: StrictBool.default(false).describe(
     "Merge even when the head commit's combined CI state is failure/error/" +
       "pending. Without this, a non-green PR is refused.",
   ),
@@ -1171,10 +1170,11 @@ export const model = {
       labels: ["live"],
       execute: async (context: Pick<Ctx, "globalArgs">) => {
         // Checks get globalArgs without the schema's defaults; parse to apply them.
-        const g = GlobalArgs.parse(context.globalArgs);
-        // Older swamp left the token as an unresolved `${{ … }}` here. Skip then;
-        // the method run checks it.
-        if (/\$\{\{/.test(String(g.token))) return { pass: true };
+        const parsed = GlobalArgs.safeParse(context.globalArgs);
+        if (!parsed.success) {
+          return { pass: false, errors: [z.prettifyError(parsed.error)] };
+        }
+        const g = parsed.data;
         try {
           const r = await rawCall(g, { method: "GET", path: "/api/v1/user" });
           if (r.status === 403 && /scope/i.test(errMsg(r))) {

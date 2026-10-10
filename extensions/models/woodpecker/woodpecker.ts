@@ -28,21 +28,6 @@ import type {
  * it is sent as `Authorization: Bearer <token>`. No token is minted or stored by
  * the model beyond the global argument (resolved from a vault).
  *
- * Method sections (by prefix):
- *   - read/audit: `repo_list`, `repo_get`, `forge_list`, `repo_available`,
- *     `org_get`, `org_secret_list`, `repo_secret_list`, `pipeline_list`,
- *     `pipeline_last`.
- *   - observability: `pipeline_steps`, `pipeline_logs`, `pipeline_wait`,
- *     `status_all` (fleet dashboard).
- *   - provision: `repo_enable`, `repo_update`, `repo_repair`,
- *     `org_secret_set`, `repo_secret_set`.
- *   - reversible lifecycle: `repo_disable`, `org_secret_delete`,
- *     `repo_secret_delete`, `cron_delete`.
- *   - run control: `pipeline_trigger`, `pipeline_restart`, `pipeline_cancel`,
- *     `pipeline_approve`, `pipeline_decline`.
- *   - infra/health: `agent_list`, `queue_info`, `server_info`.
- *   - scheduled pipelines: `cron_list`, `cron_set`, `cron_delete`.
- *
  * Idempotency: `repo_enable` finds-or-activates by `owner/name` and converges
  * the supplied settings in place; the `*_secret_set` methods create-or-update by
  * name. Each reports an `action` of created/updated/unchanged/… so a re-run is a
@@ -1117,10 +1102,11 @@ export const model = {
       labels: ["live"],
       execute: async (context: Pick<Ctx, "globalArgs">) => {
         // Checks get globalArgs without the schema's defaults; parse to apply them.
-        const g = GlobalArgs.parse(context.globalArgs);
-        // Older swamp versions pass the token as an unresolved `${{ … }}` here.
-        // Skip the check then; the method run validates the token.
-        if (/\$\{\{/.test(String(g.token))) return { pass: true };
+        const parsed = GlobalArgs.safeParse(context.globalArgs);
+        if (!parsed.success) {
+          return { pass: false, errors: [z.prettifyError(parsed.error)] };
+        }
+        const g = parsed.data;
         try {
           const r = await rawCall(g, { method: "GET", path: "/api/user" });
           if (r.status >= 400) {

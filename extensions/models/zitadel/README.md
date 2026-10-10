@@ -7,8 +7,8 @@ and rotating credentials.
 
 ## Scope guarantee (read this first)
 
-This extension holds an **IAM admin** credential, so its methods are limited
-and **reversible**:
+This extension holds an **IAM admin** credential, so its methods are limited and
+**reversible**:
 
 - ❌ **No hard deletes**: never deletes a project, application, or user. The
   only way to disable one is the reversible `app_set_state` / `user_set_state` /
@@ -78,12 +78,12 @@ swamp model method run zitadel oidc_app_ensure \
 - `oidc_app_ensure` — ensure an OIDC client (redirect/post-logout URIs, appType
   `web|spa|native`, authMethod `basic|post|none|jwt`, grant/response types,
   devMode). Re-running updates only the fields it is given
-  (`action: unchanged|updated`); everything else, including settings this
-  method doesn't model, keeps its current value.
+  (`action: unchanged|updated`); everything else, including settings this method
+  doesn't model, keeps its current value.
 - `api_app_ensure` — ensure an API app (M2M resource server).
 - `oidc_app_redirect_set` — add/remove redirect URIs on an existing OIDC app
-  (set-based, idempotent), preserving every other field of its OIDC config
-  (auth method, response/grant types, PKCE, devMode).
+  (set-based, idempotent), preserving every other field of its OIDC config (auth
+  method, response/grant types, PKCE, devMode).
 
 **Rotate:** `app_secret_rotate`, `machine_user_ensure`, `pat_create`,
 `pat_revoke`, `machine_key_create`, `machine_secret_generate`.
@@ -100,19 +100,18 @@ swamp model method run zitadel project_authz_set \
   --input project=homelab --input roleAssertion=true
 ```
 
-- `role_ensure` — find-or-create a project role by `key`; update
-  `displayName`/ `group` (`action: created|unchanged|updated`).
+- `role_ensure` — find-or-create a project role by `key`; update `displayName`/
+  `group` (`action: created|unchanged|updated`).
 - `role_remove` — verify-first `DELETE` of a role (the only hard delete; also
   revokes grants that reference it).
 - `grant_ensure` — grant a user (id or loginname) a **set** of role keys on a
   project; re-running sets the grant to exactly that set (order does not
-  matter). Omit `roleKeys` to
-  keep an existing grant's roles as they are.
+  matter). Omit `roleKeys` to keep an existing grant's roles as they are.
 - `grant_set_state` — deactivate/reactivate a grant (verify-first, reversible).
 - `project_authz_set` — toggle a project's `roleAssertion` / `roleCheck` /
-  `hasProjectCheck` on an **existing** project (reads the project and merges
-  the change; never creates a project). Without `roleAssertion`, granted roles do **not** appear in
-  users' tokens.
+  `hasProjectCheck` on an **existing** project (reads the project and merges the
+  change; never creates a project). Without `roleAssertion`, granted roles do
+  **not** appear in users' tokens.
 
 **Reversible lifecycle:** `app_set_state` (active/inactive), `user_set_state`
 (active/inactive), `grant_set_state` (active/inactive).

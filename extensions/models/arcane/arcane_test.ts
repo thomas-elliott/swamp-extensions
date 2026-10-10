@@ -10,12 +10,12 @@ import {
   b64,
   coerceList,
   model,
-  streamError,
   projectHealthy,
   pruneResult,
   renderNames,
   repointServiceRefs,
   serviceConvergence,
+  streamError,
   swarmStackResource,
   swarmTaskResource,
   unwrap,
@@ -951,7 +951,9 @@ Deno.test("swarm_stack_remove re-issues DELETE until the record clears (teardown
       c.method === "DELETE" && c.path === "/environments/0/swarm/stacks/two"
     ).length;
     assertEquals(stackDeletes, 2, "issues a second DELETE to clear the record");
-    const rec = written.find((w) => w.specName === "swarm-stack");
+    const rec = written.find((w) =>
+      w.specName === "swarm-stack"
+    );
     assert(rec, "records the removed stack");
     assertEquals(rec!.data.action, "deleted");
     assertEquals(rec!.data.deletes, 2);
@@ -1027,9 +1029,22 @@ Deno.test("swarm_stack_tasks: factory + onlyProblems filter", async () => {
           return Promise.resolve({
             success: true,
             data: [
-              { id: "ok1", serviceName: "unifi_unifi-db", currentState: "running" },
-              { id: "bad1", serviceName: "unifi_unifi", currentState: "rejected", error: "no /docker/unifi" },
-              { id: "old1", serviceName: "unifi_unifi", currentState: "shutdown" },
+              {
+                id: "ok1",
+                serviceName: "unifi_unifi-db",
+                currentState: "running",
+              },
+              {
+                id: "bad1",
+                serviceName: "unifi_unifi",
+                currentState: "rejected",
+                error: "no /docker/unifi",
+              },
+              {
+                id: "old1",
+                serviceName: "unifi_unifi",
+                currentState: "shutdown",
+              },
             ],
           });
         }
@@ -1213,7 +1228,10 @@ Deno.test("image_prune sends dangling flag + records result", async () => {
       if (m === "POST" && p === "/environments/0/images/prune") {
         return Promise.resolve({
           success: true,
-          data: { spaceReclaimed: 500, imagesDeleted: [{ Deleted: "sha256:z" }] },
+          data: {
+            spaceReclaimed: 500,
+            imagesDeleted: [{ Deleted: "sha256:z" }],
+          },
         });
       }
       return Promise.reject(new Error(`unexpected ${m} ${p}`));
@@ -1241,7 +1259,8 @@ Deno.test("version reads the flat /version body (no envelope) into arcane-versio
           currentVersion: "v1.19.4",
           newestVersion: "v2.0.3",
           updateAvailable: true,
-          releaseUrl: "https://github.com/getarcaneapp/arcane/releases/tag/v2.0.3",
+          releaseUrl:
+            "https://github.com/getarcaneapp/arcane/releases/tag/v2.0.3",
         });
       }
       return Promise.reject(new Error(`unexpected ${m} ${p}`));
@@ -1352,7 +1371,7 @@ Deno.test("gitops_sync_status names a missing sync instead of silently skipping 
 
 // ─────────────────────────── reachable check ───────────────────────────
 
-Deno.test("reachable check: skips (pass) when the apiKey is still a vault expression", async () => {
+Deno.test("reachable check: a definition that fails the schema fails without probing", async () => {
   let called = false;
   __setArcaneTransport(() => {
     called = true;
@@ -1366,13 +1385,10 @@ Deno.test("reachable check: skips (pass) when the apiKey is still a vault expres
       >;
     }).checks;
     const res = await checks.reachable.execute({
-      globalArgs: {
-        baseUrl: "https://arcane.example:8443",
-        apiKey: "${{ vault.get(myvault, arcane/api_key) }}",
-      },
+      globalArgs: { baseUrl: "https://arcane.example:8443" },
     });
-    assertEquals(res.pass, true);
-    assert(!called, "must not probe when the apiKey is unresolved");
+    assertEquals(res.pass, false);
+    assert(!called, "must not probe with an invalid definition");
   } finally {
     __setArcaneTransport(null);
   }

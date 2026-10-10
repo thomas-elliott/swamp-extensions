@@ -24,12 +24,6 @@ import pg from "npm:pg@8.21.0";
  * information_schema) only. Read methods additionally run under
  * `default_transaction_read_only = on`, so the server rejects any write.
  *
- * Method sections (by prefix):
- *   - read/audit: `database_list`, `role_list`, `permissions_audit`,
- *     `table_inspect`, `connections_list`, `extension_list`.
- *   - mutating (admin DDL): `database_create`, `role_create`, `grant`, `revoke`,
- *     `role_password_set`, and the composite `app_provision`.
- *
  * Connection: one short-lived `pg.Client` per method run (connect → work →
  * `end()` in a `finally`); no pool, because swamp already serialises runs per model.
  *
@@ -509,8 +503,17 @@ function privList(privs: string[]): string {
 
 // ─────────────────────────── method argument schemas ───────────────────────────
 
+/**
+ * A strict boolean. `z.coerce.boolean()` runs `Boolean(v)`, so `"0"` and
+ * `"False"` become true; this accepts only true/false and their strings.
+ */
+const StrictBool = z.union(
+  [z.boolean(), z.literal("true"), z.literal("false")],
+  { error: 'expected true or false (or the strings "true" / "false")' },
+).transform((v) => v === true || v === "true");
+
 const DatabaseListArgs = z.object({
-  includeTemplates: z.preprocess((v) => v === true || v === "true", z.boolean())
+  includeTemplates: StrictBool
     .default(false)
     .describe("Include template databases (template0/template1)"),
 });
@@ -530,7 +533,7 @@ const TableInspectArgs = z.object({
 
 const ConnectionsListArgs = z.object({
   database: z.string().optional().describe("Filter to one database's backends"),
-  includeQuery: z.preprocess((v) => v === true || v === "true", z.boolean())
+  includeQuery: StrictBool
     .default(false)
     .describe(
       "Include the current `query` text. OFF by default — query text can contain " +
@@ -556,10 +559,7 @@ const DatabaseCreateArgs = z.object({
 
 const RoleCreateArgs = z.object({
   name: z.string(),
-  login: z.preprocess(
-    (v) => v === undefined ? true : v === true || v === "true",
-    z.boolean(),
-  )
+  login: StrictBool
     .default(true),
   password: z.string().optional().meta({ sensitive: true }).describe(
     "Supply via vault expression; embedded via escapeLiteral, never logged/echoed",
@@ -568,9 +568,9 @@ const RoleCreateArgs = z.object({
   validUntil: z.string().optional().describe(
     "e.g. 2027-01-01 (a timestamp literal)",
   ),
-  createDb: z.preprocess((v) => v === true || v === "true", z.boolean())
+  createDb: StrictBool
     .default(false),
-  createRole: z.preprocess((v) => v === true || v === "true", z.boolean())
+  createRole: StrictBool
     .default(false),
   memberOf: z.array(z.string()).default([]).describe(
     "Parent roles to GRANT to this role",
@@ -590,9 +590,9 @@ const GrantArgs = z.object({
   objects: z.array(z.string()).default([]).describe(
     "Specific table/sequence names; empty + allInSchema=true targets ALL in schema",
   ),
-  allInSchema: z.preprocess((v) => v === true || v === "true", z.boolean())
+  allInSchema: StrictBool
     .default(false),
-  includeFuture: z.preprocess((v) => v === true || v === "true", z.boolean())
+  includeFuture: StrictBool
     .default(false)
     .describe("Also ALTER DEFAULT PRIVILEGES for future objects in the schema"),
   defaultForRole: z.string().optional().describe(
@@ -618,7 +618,7 @@ const AppProvisionArgs = z.object({
     "Database/schema owner; defaults to `role`",
   ),
   schema: z.string().default("public"),
-  createSchema: z.preprocess((v) => v === true || v === "true", z.boolean())
+  createSchema: StrictBool
     .default(false),
   // No schema defaults: GRANT only adds, so a default re-applied on a re-run
   // would widen a role provisioned with less. The method applies them only
@@ -628,10 +628,7 @@ const AppProvisionArgs = z.object({
       "until the role holds the schema grant; omitted on a later run, table " +
       "grants are left as they are.",
   ),
-  includeFuture: z.preprocess(
-    (v) => v === undefined ? undefined : v === true || v === "true",
-    z.boolean().optional(),
-  ).describe(
+  includeFuture: StrictBool.optional().describe(
     "Also grant on future tables and sequences. Defaults to true until the " +
       "role holds the schema grant; omitted on a later run, default " +
       "privileges are left as they are.",
@@ -658,10 +655,11 @@ export const model = {
       labels: ["live"],
       execute: async (context: Pick<Ctx, "globalArgs">) => {
         // Checks get globalArgs without the schema's defaults; parse to apply them.
-        const g = GlobalArgs.parse(context.globalArgs);
-        // Older swamp left the password as an unresolved `${{ … }}` here. Skip then;
-        // the method run checks it.
-        if (/\$\{\{/.test(String(g.adminPassword))) return { pass: true };
+        const parsed = GlobalArgs.safeParse(context.globalArgs);
+        if (!parsed.success) {
+          return { pass: false, errors: [z.prettifyError(parsed.error)] };
+        }
+        const g = parsed.data;
         try {
           await withConn(g, g.maintenanceDb, true, async (q) => {
             await q.query("SELECT 1");

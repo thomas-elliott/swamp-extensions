@@ -101,8 +101,8 @@ keep this risk visible — do not "fix" it by adding server-side validation.
 
 ## Authoring conventions (all extensions in this repo)
 
-These keep `swamp extension quality` at **14/14 (100%)** — proven on `@thomas/arcane`,
-`@thomas/technitium`, and `@thomas/postgres-admin`. Apply them to every new extension.
+These keep `swamp extension quality` at 100% (`allPassed: true`; the two provisional points
+are scored by the registry, not locally). Apply them to every new extension.
 
 1. **zod + `fast-check` — never leak a `z.infer` type onto the public API.** The
    `fast-check` ("no slow types") factor FAILS if an **exported** symbol references a

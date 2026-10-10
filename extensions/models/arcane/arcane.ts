@@ -22,14 +22,6 @@ import { join } from "node:path";
  * REST API (X-API-Key auth). Every mutation goes through Arcane; the one local
  * subprocess is read-only compose validation (`docker compose config`).
  *
- * Method sections (by prefix):
- *   - `gitops_*` — set up + drive Arcane Git Sync (repo connection, syncs, triggers).
- *   - `project_*` — compose projects: list/lifecycle plus direct-API authoring
- *     (`project_create`/`project_update` push compose content) and a validated,
- *     mode-aware `project_deploy` orchestration.
- *   - `secret_*` / `config_*` / `swarm_service_*` — swarm secret/config CRUD and the
- *     rotation orchestrations (`secret_rotate`/`config_rotate`).
- *
  * Direct (API) mode and gitops mode are both fully supported, chosen per project.
  *
  * The extension only uses an API key; it never touches the Arcane
@@ -1346,13 +1338,13 @@ export const model = {
       execute: async (
         context: Pick<MethodContext<GlobalArgsT>, "globalArgs">,
       ) => {
-        const baseUrl = String(context.globalArgs?.baseUrl ?? "");
+        // Checks get globalArgs without the schema's defaults; parse to apply them.
+        const parsed = GlobalArgs.safeParse(context.globalArgs);
+        if (!parsed.success) {
+          return { pass: false, errors: [z.prettifyError(parsed.error)] };
+        }
+        const g = parsed.data;
         try {
-          // Checks get globalArgs without the schema's defaults; parse to apply them.
-          const g = GlobalArgs.parse(context.globalArgs);
-          // Older swamp left the key as an unresolved `${{ … }}` here. Skip then;
-          // the method run checks it.
-          if (/\$\{\{/.test(g.apiKey)) return { pass: true };
           // /version is registered without security in Arcane, so it would pass
           // with a wrong key. /auth/me needs a valid key and no permission.
           await arcane(g, "GET", "/auth/me");
@@ -1361,7 +1353,7 @@ export const model = {
           return {
             pass: false,
             errors: [
-              `Cannot reach Arcane at ${baseUrl}: ${(e as Error).message}`,
+              `Cannot reach Arcane at ${g.baseUrl}: ${(e as Error).message}`,
             ],
           };
         }
