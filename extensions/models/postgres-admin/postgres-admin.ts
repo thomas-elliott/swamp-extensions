@@ -9,7 +9,7 @@ import type {
 } from "jsr:@systeminit/swamp-testing@0.20260521.16";
 // `pg` ships no bundled types; point the type-checker (and `deno doc`, which the
 // quality scorer runs) at the DefinitelyTyped package so it can resolve them.
-// @ts-types="npm:@types/pg@8.20.0"
+// @ts-types="npm:@types/pg@8.21.0"
 import pg from "npm:pg@8.21.0";
 
 /**
@@ -46,7 +46,7 @@ const SslConfig = z.object({
   mode: z.enum(["disable", "require", "verify-ca", "verify-full"]).default(
     "disable",
   ).describe(
-    "disable = plaintext TCP (homelab tailnet default). require = encrypt, no " +
+    "disable = plaintext TCP (the default). require = encrypt, no " +
       "cert verify. verify-ca/verify-full = encrypt + verify (needs `ca`).",
   ),
   ca: z.string().optional().describe(
@@ -1304,7 +1304,9 @@ export const model = {
 
     revoke: {
       description:
-        "REVOKE privileges (mirror of grant). Idempotent (revoking an absent grant is a no-op).",
+        "REVOKE privileges (mirror of grant). Idempotent (revoking an absent grant is a no-op). " +
+        "With includeFuture it removes only default privileges set for this schema and " +
+        "defaultForRole; a default set without IN SCHEMA, or for another role, is left in place.",
       arguments: GrantArgs,
       execute: async (
         rawArgs,
@@ -1319,8 +1321,8 @@ export const model = {
       description:
         "Composite, idempotent 'new application' setup: create database + login role (vault password) + " +
         "grant CONNECT, schema USAGE/CREATE, table/sequence privileges, and (default) future-object " +
-        "privileges. Re-running re-issues the grants it is given and never " +
-        "widens a role with defaults. The headline method. Never drops.",
+        "privileges. A re-run grants only the table privileges and future-object privileges it is " +
+        "given, so it never widens a role, including one narrowed by hand. Never drops.",
       arguments: AppProvisionArgs,
       execute: async (
         rawArgs,
@@ -1338,7 +1340,7 @@ export const model = {
         checkIdent(g, owner, "owner");
         checkIdent(g, a.schema, "schema");
 
-        // Phase A: role + database + CONNECT, on the maintenance DB.
+        // Phase A: role + database, on the maintenance DB.
         const phaseA = await withConn(g, g.maintenanceDb, false, async (q) => {
           let roleAction: z.infer<typeof Action> = "unchanged";
           if (!(await roleExists(q, a.role))) {
@@ -1366,11 +1368,6 @@ export const model = {
             );
             dbAction = "created";
           }
-          await q.query(
-            `GRANT CONNECT ON DATABASE ${
-              ident(g, q, a.database, "database")
-            } TO ${ident(g, q, a.role, "role")}`,
-          );
           return { roleAction, dbAction };
         });
 
@@ -1383,9 +1380,9 @@ export const model = {
           // role and database in place, and keying on creation would then
           // grant nothing on every re-run. The schema USAGE grant is the
           // marker because Phase B is one transaction, so it is present only
-          // after the whole set of grants was applied. A role provisioned with less
-          // (say read-only) already holds it, so a re-run with the arguments
-          // omitted leaves its grants alone instead of widening them.
+          // after the whole set of grants was applied. CONNECT and the schema
+          // grants are issued only before that point, so a re-run cannot put
+          // back a privilege someone revoked to narrow the role.
           const provisioned = await holdsSchemaUsage(q, a.schema, a.role);
           const tablePrivs = a.tablePrivs ??
             (provisioned ? [] : ["SELECT", "INSERT", "UPDATE", "DELETE"]);
@@ -1401,16 +1398,25 @@ export const model = {
                 }`,
               );
             }
-            await q.query(`GRANT USAGE, CREATE ON SCHEMA ${sc} TO ${ro}`);
+            if (!provisioned) {
+              // Database privileges are cluster-wide, so this works from here.
+              await q.query(
+                `GRANT CONNECT ON DATABASE ${
+                  ident(g, q, a.database, "database")
+                } TO ${ro}`,
+              );
+              await q.query(`GRANT USAGE, CREATE ON SCHEMA ${sc} TO ${ro}`);
+            }
             const tp = privList(tablePrivs);
             if (tablePrivs.length > 0) {
               await q.query(
                 `GRANT ${tp} ON ALL TABLES IN SCHEMA ${sc} TO ${ro}`,
               );
+              // Inserting into a serial column needs the sequence too.
+              await q.query(
+                `GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA ${sc} TO ${ro}`,
+              );
             }
-            await q.query(
-              `GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA ${sc} TO ${ro}`,
-            );
             if (includeFuture) {
               // FOR ROLE owner: the owner creates the tables, so its defaults
               // are the ones that decide what the app role gets on them.
@@ -1429,9 +1435,7 @@ export const model = {
             provisioned,
             includeFuture,
             privsGranted: [
-              "CONNECT",
-              "USAGE",
-              "CREATE",
+              ...(provisioned ? [] : ["CONNECT", "USAGE", "CREATE"]),
               ...tablePrivs.map((p) => String(p)),
             ],
           };

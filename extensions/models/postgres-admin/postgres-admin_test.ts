@@ -461,7 +461,7 @@ const existsUnprovisioned = (sql: string) =>
     ? [{ x: 1 }]
     : undefined;
 
-Deno.test("app_provision: idempotent — existing role+db ⇒ no CREATE, grants still issued, two-phase routing", async () => {
+Deno.test("app_provision: idempotent — a provisioned role gets only the grants passed, two-phase routing", async () => {
   const fake = makeFakeDb(everythingExists);
   __setPgConnect(fake.connect);
   try {
@@ -481,14 +481,10 @@ Deno.test("app_provision: idempotent — existing role+db ⇒ no CREATE, grants 
         !hasSql(fake.queries, /CREATE DATABASE/),
       "nothing created when both exist",
     );
-    assert(
-      hasSql(fake.queries, /GRANT CONNECT ON DATABASE "myapp" TO "myapp"/),
-      "CONNECT",
-    );
-    assert(
-      hasSql(fake.queries, /GRANT USAGE, CREATE ON SCHEMA "public" TO "myapp"/),
-      "schema",
-    );
+    // CONNECT and the schema grants are not issued again, so a privilege
+    // revoked by hand stays revoked.
+    assert(!hasSql(fake.queries, /GRANT CONNECT/), "no CONNECT");
+    assert(!hasSql(fake.queries, /ON SCHEMA/), "no schema grant");
     assert(
       hasSql(
         fake.queries,
@@ -547,6 +543,10 @@ Deno.test("app_provision: creates role+db when absent ⇒ action=created", async
       ),
       "default future privs",
     );
+    assert(
+      hasSql(fake.queries, /GRANT CONNECT ON DATABASE "fresh" TO "fresh"/),
+      "CONNECT on a first run",
+    );
     assertEquals(written[0].data.action, "created");
   } finally {
     __setPgConnect(null);
@@ -555,7 +555,7 @@ Deno.test("app_provision: creates role+db when absent ⇒ action=created", async
 
 // Same bug class as forgejo issue #4: GRANT only adds, so a re-run that
 // re-applied the default privileges would widen a read-only role.
-Deno.test("app_provision: re-run without tablePrivs/includeFuture leaves table grants alone", async () => {
+Deno.test("app_provision: re-run without tablePrivs/includeFuture grants nothing", async () => {
   const fake = makeFakeDb(everythingExists);
   __setPgConnect(fake.connect);
   try {
@@ -564,7 +564,7 @@ Deno.test("app_provision: re-run without tablePrivs/includeFuture leaves table g
       database: "reports",
       role: "reader",
     }, context);
-    assert(!hasSql(fake.queries, /ON ALL TABLES/), "no table grant");
+    assert(!hasSql(fake.queries, /\bGRANT\b/), "no grant of any kind");
     assert(
       !hasSql(fake.queries, /ALTER DEFAULT PRIVILEGES/),
       "no default privileges",
