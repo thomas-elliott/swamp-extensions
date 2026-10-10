@@ -891,3 +891,30 @@ Deno.test("repo_available: carries forge_id through to the resource", async () =
     __setCaller(null);
   }
 });
+
+// ─────────────────────────── reachable check ───────────────────────────
+
+// A check receives globalArgs without the schema's defaults, so an unset
+// httpTimeoutMs used to reach fetch as undefined and abort at once.
+Deno.test("reachable check applies the schema defaults to globalArgs", async () => {
+  let seenTimeout: unknown;
+  __setCaller((g) => {
+    seenTimeout = g.httpTimeoutMs;
+    return Promise.resolve({ status: 200, body: { login: "bot" } });
+  });
+  try {
+    const checks = (model as unknown as {
+      checks: Record<
+        string,
+        { execute: (c: unknown) => Promise<{ pass: boolean }> }
+      >;
+    }).checks;
+    const res = await checks.reachable.execute({
+      globalArgs: { apiUrl: GLOBALS.apiUrl, token: GLOBALS.token },
+    });
+    assertEquals(res.pass, true);
+    assertEquals(seenTimeout, 30000);
+  } finally {
+    __setCaller(null);
+  }
+});

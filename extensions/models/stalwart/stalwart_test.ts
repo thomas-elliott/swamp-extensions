@@ -1207,3 +1207,25 @@ Deno.test("no-destroy guarantee: no method execute body references the destroy v
   // Keep the JMAP seam import live so an unused-import doesn't mask a regression.
   __setJmap(null);
 });
+
+// A check receives globalArgs without the schema's defaults, so an unset
+// httpTimeoutMs used to reach fetch as undefined and abort at once.
+Deno.test("reachable: applies the schema defaults to globalArgs", async () => {
+  let seenTimeout: unknown;
+  __setRest((g) => {
+    seenTimeout = g.httpTimeoutMs;
+    return Promise.resolve({ status: 200, body: {} });
+  });
+  try {
+    const check = (model.checks as unknown as Record<string, {
+      execute: (c: unknown) => Promise<{ pass: boolean }>;
+    }>).reachable;
+    const res = await check.execute({
+      globalArgs: { apiUrl: GLOBALS.apiUrl, apiKey: GLOBALS.apiKey },
+    });
+    assertEquals(res.pass, true);
+    assertEquals(seenTimeout, 30000);
+  } finally {
+    __setRest(null);
+  }
+});

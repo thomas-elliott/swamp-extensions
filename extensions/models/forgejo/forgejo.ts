@@ -1145,10 +1145,10 @@ export const model = {
         "accepted, it merely lacks read:user.",
       labels: ["live"],
       execute: async (context: Pick<Ctx, "globalArgs">) => {
-        const g = context.globalArgs;
-        // `swamp model validate` does not resolve vault expressions, so token
-        // is still a literal `${{ … }}` there. Skip; the real check runs at
-        // method time when the secret is resolved.
+        // Checks get globalArgs without the schema's defaults; parse to apply them.
+        const g = GlobalArgs.parse(context.globalArgs);
+        // Older swamp left the token as an unresolved `${{ … }}` here. Skip then;
+        // the method run checks it.
         if (/\$\{\{/.test(String(g.token))) return { pass: true };
         try {
           const r = await rawCall(g, { method: "GET", path: "/api/v1/user" });

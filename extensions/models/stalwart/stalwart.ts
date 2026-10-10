@@ -1007,10 +1007,10 @@ export const model = {
         "Verify Stalwart is reachable and the API key authenticates (GET /api/account)",
       labels: ["live"],
       execute: async (context: Pick<Ctx, "globalArgs">) => {
-        const g = context.globalArgs;
-        // `swamp model validate` does not resolve vault expressions, so apiKey is
-        // still a literal `${{ … }}` there and can't authenticate. Skip; the real
-        // check runs at method-run time when the secret is resolved.
+        // Checks get globalArgs without the schema's defaults; parse to apply them.
+        const g = GlobalArgs.parse(context.globalArgs);
+        // Older swamp left apiKey as an unresolved `${{ … }}` here. Skip then;
+        // the method run checks it.
         if (/\$\{\{/.test(String(g.apiKey))) return { pass: true };
         try {
           await rest(g, { method: "GET", path: "/api/account" });
