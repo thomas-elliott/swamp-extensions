@@ -343,7 +343,10 @@ Deno.test("org_secret_set: PATCH sends only the fields that were passed", async 
       return Promise.resolve({ status: 200, body: { id: 1 } });
     }
     if (c.method === "PATCH") patches.push(c.body);
-    return Promise.resolve({ status: 200, body: { id: 9, name: "ghcr_token" } });
+    return Promise.resolve({
+      status: 200,
+      body: { id: 9, name: "ghcr_token" },
+    });
   };
   __setCaller(caller);
   try {
@@ -1007,7 +1010,10 @@ Deno.test("pipeline_list: limit above 50 spans pages and is trimmed exactly", as
       const page = Number(m[1]);
       const perPage = Number(m[2]);
       const start = (page - 1) * 50;
-      const body = Array.from({ length: perPage }, (_, i) => pipe(start + i + 1));
+      const body = Array.from(
+        { length: perPage },
+        (_, i) => pipe(start + i + 1),
+      );
       return { status: 200, body: body as unknown as Record<string, unknown> };
     }
     return undefined;

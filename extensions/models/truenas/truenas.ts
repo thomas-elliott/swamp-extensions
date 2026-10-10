@@ -33,13 +33,6 @@ import type {
  * the set-access verbs are reversible (re-run with the prior values) and the delete
  * verbs record the removed config so the share can be re-created.
  *
- * Method sections (by prefix):
- *   - read/audit: `system_info`, `app_list`, `nfs_share_list`, `smb_share_list`,
- *     `service_list`, `network_info`, `filesystem_list`, `app_storage`,
- *     `replication_list`, `exposure_audit` (the R28 report data source).
- *   - mutate: `app_set_port_bind`, `app_set_networks`, `nfs_share_set_access`,
- *     `smb_share_set_access`, `nfs_share_delete`, `smb_share_delete`.
- *
  * TRANSPORT SAFETY: TrueNAS **permanently revokes an API key the instant it is sent
  * over a non-TLS transport** (plain `ws://`/`http://`). This model therefore refuses
  * any non-`wss` endpoint: {@link websocketUrl} throws before a socket is opened, and
@@ -1124,15 +1117,14 @@ export const model = {
         "Verify the TrueNAS API authenticates (wss login + system.info)",
       labels: ["live"],
       execute: async (context: Pick<Ctx, "globalArgs">) => {
+        // Checks get globalArgs without the schema's defaults; parse to apply them.
+        const parsed = GlobalArgs.safeParse(context.globalArgs);
+        if (!parsed.success) {
+          return { pass: false, errors: [z.prettifyError(parsed.error)] };
+        }
+        const g = parsed.data;
         let session: RpcSession | undefined;
         try {
-          // Checks get globalArgs without the schema's defaults; parse to apply
-          // them. Inside the try so a definition that fails the schema reports
-          // as a failed check rather than an unhandled throw.
-          const g = GlobalArgs.parse(context.globalArgs);
-          // Older swamp left the key as an unresolved `${{ … }}` here. Skip then;
-          // the method run checks it.
-          if (/\$\{\{/.test(g.apiKey)) return { pass: true };
           session = await openSession(g);
           await session.call("system.info", []);
           return { pass: true };
@@ -1140,9 +1132,7 @@ export const model = {
           return {
             pass: false,
             errors: [
-              `Cannot reach TrueNAS at ${
-                String(context.globalArgs?.endpoint)
-              }: ${(e as Error).message}`,
+              `Cannot reach TrueNAS at ${g.endpoint}: ${(e as Error).message}`,
             ],
           };
         } finally {

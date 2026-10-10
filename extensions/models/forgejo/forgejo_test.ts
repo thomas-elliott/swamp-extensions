@@ -1189,11 +1189,13 @@ Deno.test("pr_merge sends the strategy as Do and records merged", async () => {
 
 type CheckDef = {
   execute: (
-    context: { globalArgs: typeof GLOBALS },
+    context: { globalArgs: Record<string, unknown> },
   ) => Promise<{ pass: boolean; errors?: string[] }>;
 };
 const check = (name: string): CheckDef =>
   (model.checks as unknown as Record<string, CheckDef>)[name];
+// Checks get globalArgs without the schema's defaults, so these leave them out.
+const CHECK_GLOBALS = { apiUrl: GLOBALS.apiUrl, token: GLOBALS.token };
 
 Deno.test("reachable: a scope-rejection 403 passes — the token authenticated", async () => {
   const { caller } = makeFakeApi(() => ({
@@ -1205,7 +1207,7 @@ Deno.test("reachable: a scope-rejection 403 passes — the token authenticated",
   }));
   __setCaller(caller);
   try {
-    const r = await check("reachable").execute({ globalArgs: GLOBALS });
+    const r = await check("reachable").execute({ globalArgs: CHECK_GLOBALS });
     assertEquals(r.pass, true);
   } finally {
     __setCaller(null);
@@ -1219,7 +1221,7 @@ Deno.test("reachable: a 401 still fails — a bad token must not pass", async ()
   }));
   __setCaller(caller);
   try {
-    const r = await check("reachable").execute({ globalArgs: GLOBALS });
+    const r = await check("reachable").execute({ globalArgs: CHECK_GLOBALS });
     assertEquals(r.pass, false);
     assert(
       /401/.test((r.errors ?? []).join(" ")),
@@ -1237,7 +1239,7 @@ Deno.test("reachable: a non-scope 403 still fails", async () => {
   }));
   __setCaller(caller);
   try {
-    const r = await check("reachable").execute({ globalArgs: GLOBALS });
+    const r = await check("reachable").execute({ globalArgs: CHECK_GLOBALS });
     assertEquals(r.pass, false);
   } finally {
     __setCaller(null);
@@ -2169,5 +2171,34 @@ Deno.test("reachable check applies the schema defaults to globalArgs", async () 
     assertEquals(seenTimeout, 30000);
   } finally {
     __setCaller(null);
+  }
+});
+
+// ─────────────────────────── strict booleans ───────────────────────────
+
+Deno.test("boolean arguments reject anything but true/false", () => {
+  const schema = (model.methods as unknown as Record<string, {
+    arguments: {
+      safeParse: (v: unknown) => {
+        success: boolean;
+        error?: { issues: { path: PropertyKey[] }[] };
+      };
+    };
+  }>)["branch_protection_ensure"].arguments;
+  const fieldFails = (v: unknown) => {
+    const r = schema.safeParse({ enablePush: v });
+    return (r.error?.issues ?? []).some((i) => i.path[0] === "enablePush");
+  };
+  for (const bad of ["0", "1", "False", "True", "yes", null]) {
+    assert(
+      fieldFails(bad),
+      `enablePush=${JSON.stringify(bad)} must be rejected`,
+    );
+  }
+  for (const good of [true, false, "true", "false"]) {
+    assert(
+      !fieldFails(good),
+      `enablePush=${JSON.stringify(good)} must be accepted`,
+    );
   }
 });

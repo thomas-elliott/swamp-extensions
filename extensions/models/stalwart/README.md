@@ -18,8 +18,8 @@ change it makes is **reversible**:
 - ✅ **Secrets once.** Account passwords and certificate private keys are write-
   only method arguments: sent to Stalwart exactly once, never read back into a
   resource, never logged.
-- ✅ **Idempotent.** `*_ensure` methods find or create by name and update
-  config in place, reporting `action: created | updated | unchanged`.
+- ✅ **Idempotent.** `*_ensure` methods find or create by name and update config
+  in place, reporting `action: created | updated | unchanged`.
 - ✅ **Verify-before-mutate.** Every mutating method resolves the target first.
 
 > **Stalwart 0.16 note.** 0.16 removed the legacy REST `/api/*` management tree;
@@ -29,8 +29,9 @@ change it makes is **reversible**:
 
 ## Authentication — scoped API key
 
-Stalwart 0.16 supports API keys scoped to specific management permissions. Create
-one with the fallback admin account, store it in a vault, and never inline it:
+Stalwart 0.16 supports API keys scoped to specific management permissions.
+Create one with the fallback admin account, store it in a vault, and never
+inline it:
 
 ```bash
 swamp model create @thomas/stalwart stalwart \
@@ -38,12 +39,12 @@ swamp model create @thomas/stalwart stalwart \
   --global-arg 'apiKey=${{ vault.get(op-homelab, stalwart/api_key) }}'
 ```
 
-| Global arg | Required | Notes |
-| --- | --- | --- |
-| `apiUrl` | yes | Base URL, e.g. `https://mail.example.com` (no trailing `/jmap`). |
-| `apiKey` | yes | Scoped admin API key (Bearer). Supply via vault. |
-| `accountId` | no | JMAP management accountId; omit to use the session's primary. |
-| `httpTimeoutMs` | no | Per-request timeout (default 30000). |
+| Global arg      | Required | Notes                                                            |
+| --------------- | -------- | ---------------------------------------------------------------- |
+| `apiUrl`        | yes      | Base URL, e.g. `https://mail.example.com` (no trailing `/jmap`). |
+| `apiKey`        | yes      | Scoped admin API key (Bearer). Supply via vault.                 |
+| `accountId`     | no       | JMAP management accountId; omit to use the session's primary.    |
+| `httpTimeoutMs` | no       | Per-request timeout (default 30000).                             |
 
 ## Methods
 
@@ -54,10 +55,10 @@ swamp model create @thomas/stalwart stalwart \
   each member's account, not on the group.
 - `queue_list`: queued outbound messages.
 - `report_query`: received DMARC/TLS aggregate reports.
-- `settings_get`: one server settings singleton (http, system,
-  spam-classifier, …).
-- `health_status`: edition / version / permissions (`/api/account`) plus selected
-  gauges (`/metrics/prometheus`).
+- `settings_get`: one server settings singleton (http, system, spam-classifier,
+  …).
+- `health_status`: edition / version / permissions (`/api/account`) plus
+  selected gauges (`/metrics/prometheus`).
 - `session_dump` and `jmap_probe`: discovery tools. `session_dump` records the
   JMAP session's capabilities and accounts; `jmap_probe` runs `<type>/query`
   then `<type>/get` for one JMAP object type and records the response shape
@@ -66,9 +67,9 @@ swamp model create @thomas/stalwart stalwart \
 
 **Create or update (idempotent, never delete):**
 
-- `account_ensure`: an individual mailbox with its `aliases`, role,
-  group membership (`memberOf`) and description. An optional password is
-  set once, on create.
+- `account_ensure`: an individual mailbox with its `aliases`, role, group
+  membership (`memberOf`) and description. An optional password is set once, on
+  create.
 - `group_ensure`, `mailing_list_ensure`: by address.
 - `role_ensure`: by name, from a `preset` (`swamp-admin` | `automated-mailbox`)
   or an explicit permission list.

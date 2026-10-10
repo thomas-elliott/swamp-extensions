@@ -18,17 +18,6 @@ import { readFile } from "node:fs/promises";
  * and as the legacy `?token=` query param) is the only credential; the extension
  * never touches the server host directly. Every mutation goes through the API.
  *
- * Method sections (by prefix):
- *   - `blocking_*` — built-in ad-blocking: enable/disable, temporary disable,
- *     allow/block list URLs, force list update. (NOT the Advanced Blocking app.)
- *   - `zone_*` / `record_*` — authoritative zone + record lifecycle.
- *   - `allowed_*` / `blocked_*` — the built-in Allowed/Blocked custom-domain zones.
- *   - `client_*` — the DNS client resolver, for debugging queries (ephemeral output).
- *   - `logs_*` — structured query-log retrieval (requires the Query Logs (Sqlite) app).
- *   - `cache_*` — DNS cache flush / list / delete.
- *   - `dashboard_*` — query statistics.
- *   - `settings_*` — full settings backup (zip) and restore (multipart upload).
- *
  * Only blocking-relevant fields of the server settings are stored as data. The
  * full settings object is NOT passed through, so it cannot leak
  * secrets (e.g. TLS certificate passwords) into the data model.
@@ -1080,10 +1069,11 @@ export const model = {
         context: Pick<MethodContext<GlobalArgsT>, "globalArgs">,
       ) => {
         // Checks get globalArgs without the schema's defaults; parse to apply them.
-        const g = GlobalArgs.parse(context.globalArgs);
-        // Older swamp left the token as an unresolved `${{ ... }}` here. Skip then;
-        // the method run checks it.
-        if (/\$\{\{/.test(String(g.apiToken))) return { pass: true };
+        const parsed = GlobalArgs.safeParse(context.globalArgs);
+        if (!parsed.success) {
+          return { pass: false, errors: [z.prettifyError(parsed.error)] };
+        }
+        const g = parsed.data;
         try {
           await apiCall(g, "GET", "/settings/get");
           return { pass: true };

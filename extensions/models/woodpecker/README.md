@@ -1,15 +1,14 @@
 # @thomas/woodpecker
 
-Administration of a self-hosted
-**[Woodpecker CI](https://woodpecker-ci.org)** server for swamp, over its **REST
-API**. It moves repos onto a self-hosted Woodpecker without using the UI for
-each repo: enable a repo, mark it trusted, set its timeout, and promote shared
-CI credentials to org-level secrets.
+Administration of a self-hosted **[Woodpecker CI](https://woodpecker-ci.org)**
+server for swamp, over its **REST API**. It moves repos onto a self-hosted
+Woodpecker without using the UI for each repo: enable a repo, mark it trusted,
+set its timeout, and promote shared CI credentials to org-level secrets.
 
 ## Scope guarantee (read this first)
 
-This extension holds an **admin PAT**, so it has few methods, and every change it
-makes is additive or **reversible**:
+This extension holds an **admin PAT**, so it has few methods, and every change
+it makes is additive or **reversible**:
 
 - ✅ **Write-only secrets.** Secret values are supplied via a vault reference,
   sent to the server once, and **never read back, stored in the data model, or
@@ -21,8 +20,8 @@ makes is additive or **reversible**:
 - ✅ **Idempotent.** `repo_enable` activates the repo if needed and updates its
   settings in place; `*_secret_set` create-or-update by name. Re-runs report
   `action: unchanged` when nothing differs, so they're safe in a pipeline.
-- ✅ **Verify-before-mutate.** `repo_disable` fetches the repo first; the
-  secret deletes probe for existence first.
+- ✅ **Verify-before-mutate.** `repo_disable` fetches the repo first; the secret
+  deletes probe for existence first.
 
 ## Authentication — personal access token
 
@@ -73,14 +72,14 @@ swamp model method run woodpecker pipeline_logs \
   --input '{"repo":"thomas-elliott/taskmanager","step":"dotnet","tailLines":50}'
 ```
 
-- `status_all`: one `repo-status` per enabled repo (`status`, last
-  number/event/ branch; `none` if it never ran). Optional `match` substring
-  filter.
+- `status_all`: one `repo-status` per enabled repo (`status`, last number/event/
+  branch; `none` if it never ran). Optional `match` substring filter.
 - `pipeline_steps`: `{workflow, name, state, exitCode, error}` per step.
 - `pipeline_logs`: fetches and **decodes** a step's logs (base64 handled
   server-side), returning the last `tailLines` (default 200; `0` = all).
-- `pipeline_wait`: polls until the pipeline finishes (success/failure/error/killed/declined/
-  blocked); `timeoutSec` (default 600) and `pollIntervalSec` (default 5).
+- `pipeline_wait`: polls until the pipeline finishes
+  (success/failure/error/killed/declined/ blocked); `timeoutSec` (default 600)
+  and `pollIntervalSec` (default 5).
 
 **Run control:**
 
@@ -105,8 +104,8 @@ specific run.
 **Scheduled pipelines (cron):**
 
 - `cron_list`: a repo's cron jobs.
-- `cron_set`: create-or-update a cron by name (idempotent). `schedule` is a
-  cron expression or an `@daily`/`@hourly`/… macro; optional `branch`.
+- `cron_set`: create-or-update a cron by name (idempotent). `schedule` is a cron
+  expression or an `@daily`/`@hourly`/… macro; optional `branch`.
 - `cron_delete`: delete a cron by name (reversible: re-create with `cron_set`;
   already-absent is a no-op).
 
@@ -123,12 +122,13 @@ swamp model method run woodpecker repo_enable \
 - `repo_enable`: activate (if needed) and update settings. `trusted=true` sets
   all three trust capabilities; `trustedNetwork` / `trustedVolumes` /
   `trustedSecurity` override individually (merged with the current values, so a
-  partial change keeps the capabilities it does not mention). Also accepts `timeout` (minutes),
-  `visibility` (`public|private|internal`), `requireApproval`
-  (`none|forks|pull_requests|all`), `cancelPreviousPipelineEvents`.
+  partial change keeps the capabilities it does not mention). Also accepts
+  `timeout` (minutes), `visibility` (`public|private|internal`),
+  `requireApproval` (`none|forks|pull_requests|all`),
+  `cancelPreviousPipelineEvents`.
 - `repo_update`: same settings on an already-enabled repo.
-- `repo_repair`: repair an outdated forge webhook (for example after the
-  server URL changes).
+- `repo_repair`: repair an outdated forge webhook (for example after the server
+  URL changes).
 
 **Promote shared credentials to org-level secrets:**
 
@@ -140,10 +140,10 @@ swamp model method run woodpecker org_secret_set \
 ```
 
 - `org_secret_set` / `repo_secret_set`: create-or-update a secret (value
-  write-only). `images` restricts the secret to named step images. A new
-  secret gets `events: ["push","tag"]` and all images unless the call sets
-  them; an existing secret keeps whichever of the two you leave out, so
-  rotating a value never extends it to more events or images.
+  write-only). `images` restricts the secret to named step images. A new secret
+  gets `events: ["push","tag"]` and all images unless the call sets them; an
+  existing secret keeps whichever of the two you leave out, so rotating a value
+  never extends it to more events or images.
 
 **Reversible lifecycle:** `repo_disable`, `org_secret_delete`,
 `repo_secret_delete`.
@@ -163,15 +163,15 @@ and a `timestamp`.
   `forge_remote_id` by name from `/api/user/repos?all=true`.
 - **On a multi-forge server, onboarding is single-forge.** A Woodpecker user
   record is bound to the forge it authenticated against, so `/api/user/*` (and
-  therefore `repo_available` and the activation half of `repo_enable`) only
-  sees that forge. No argument changes this; the token determines the forge.
-  Use a token created while logged in to the other forge (a second model
-  instance is the simplest way), or enable the repo in the UI. `forge_list`
-  shows which forges exist and which one the current token belongs to, and
-  `repo_enable` includes this in its error instead of only "not found".
-  Everything after onboarding (`repo_list`, `repo_get`, `repo_update`,
-  `repo_secret_*`, every `pipeline_*`) goes through the admin `/api/repos`
-  endpoints and already works across forges with one token.
+  therefore `repo_available` and the activation half of `repo_enable`) only sees
+  that forge. No argument changes this; the token determines the forge. Use a
+  token created while logged in to the other forge (a second model instance is
+  the simplest way), or enable the repo in the UI. `forge_list` shows which
+  forges exist and which one the current token belongs to, and `repo_enable`
+  includes this in its error instead of only "not found". Everything after
+  onboarding (`repo_list`, `repo_get`, `repo_update`, `repo_secret_*`, every
+  `pipeline_*`) goes through the admin `/api/repos` endpoints and already works
+  across forges with one token.
 - **Method arguments go through `--input`** (a `key=value` pair or a JSON
   object), not `--arg`. `${{ vault.get(...) }}` references inside an `--input`
   value resolve server-side, so secret values never reach the command line.

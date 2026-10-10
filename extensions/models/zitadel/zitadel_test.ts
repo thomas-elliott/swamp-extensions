@@ -384,7 +384,12 @@ Deno.test("oidc_app_redirect_set: read-modify-write adds/removes, preserves othe
       const uris = gets >= 2
         ? ["https://b/cb", "https://c/cb"]
         : oidcConfig.redirectUris;
-      return { app: { name: "shared", oidcConfig: { ...oidcConfig, redirectUris: uris } } };
+      return {
+        app: {
+          name: "shared",
+          oidcConfig: { ...oidcConfig, redirectUris: uris },
+        },
+      };
     }
     if (c.method === "PUT" && c.path.endsWith("/oidc_config")) {
       putBody = c.body as Record<string, unknown>;
@@ -419,7 +424,9 @@ Deno.test("oidc_app_redirect_set: no-op when add present & remove absent", async
   let putCalled = false;
   const { caller } = makeFakeApi((c) => {
     if (c.method === "GET" && c.path.includes("/apps/")) {
-      return { app: { name: "x", oidcConfig: { redirectUris: ["https://a/cb"] } } };
+      return {
+        app: { name: "x", oidcConfig: { redirectUris: ["https://a/cb"] } },
+      };
     }
     if (c.method === "PUT") {
       putCalled = true;
@@ -678,7 +685,10 @@ Deno.test("app_get: round-trips non-default OIDC enums (spa/jwt) from the wire",
             appType: "OIDC_APP_TYPE_USER_AGENT",
             accessTokenType: "OIDC_TOKEN_TYPE_JWT",
             devMode: true,
-            responseTypes: ["OIDC_RESPONSE_TYPE_CODE", "OIDC_RESPONSE_TYPE_ID_TOKEN"],
+            responseTypes: [
+              "OIDC_RESPONSE_TYPE_CODE",
+              "OIDC_RESPONSE_TYPE_ID_TOKEN",
+            ],
             grantTypes: [
               "OIDC_GRANT_TYPE_AUTHORIZATION_CODE",
               "OIDC_GRANT_TYPE_REFRESH_TOKEN",
@@ -1322,5 +1332,31 @@ Deno.test("reachable check applies the schema defaults to globalArgs", async () 
     assert(scope?.startsWith("openid"), `default scope expected, got ${scope}`);
   } finally {
     globalThis.fetch = realFetch;
+  }
+});
+
+// ─────────────────────────── strict booleans ───────────────────────────
+
+Deno.test("boolean arguments reject anything but true/false", () => {
+  const schema = (model.methods as unknown as Record<string, {
+    arguments: {
+      safeParse: (v: unknown) => {
+        success: boolean;
+        error?: { issues: { path: PropertyKey[] }[] };
+      };
+    };
+  }>)["oidc_app_ensure"].arguments;
+  const fieldFails = (v: unknown) => {
+    const r = schema.safeParse({ devMode: v });
+    return (r.error?.issues ?? []).some((i) => i.path[0] === "devMode");
+  };
+  for (const bad of ["0", "1", "False", "True", "yes", null]) {
+    assert(fieldFails(bad), `devMode=${JSON.stringify(bad)} must be rejected`);
+  }
+  for (const good of [true, false, "true", "false"]) {
+    assert(
+      !fieldFails(good),
+      `devMode=${JSON.stringify(good)} must be accepted`,
+    );
   }
 });

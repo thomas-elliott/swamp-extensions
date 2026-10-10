@@ -223,10 +223,12 @@ Deno.test("app_list: factory shapes one app per result, sorted port bindings", a
 
 Deno.test("filesystem_list: shapes entries, sorts them, flags truncation", async () => {
   const fake = makeFakeSession((m) =>
-    m === "filesystem.listdir" ? [
-      { name: "offsite", type: "DIRECTORY", size: 4096, is_mountpoint: true },
-      { name: "app-config", type: "DIRECTORY", size: 4096 },
-    ] : undefined
+    m === "filesystem.listdir"
+      ? [
+        { name: "offsite", type: "DIRECTORY", size: 4096, is_mountpoint: true },
+        { name: "app-config", type: "DIRECTORY", size: 4096 },
+      ]
+      : undefined
   );
   __setTruenasSession(fake.factory);
   try {
@@ -275,7 +277,9 @@ Deno.test("filesystem_list: an absent path is data (exists=false), not a failure
 });
 
 Deno.test("filesystem_list: a JSON-string path list is decoded (CLI --input form)", async () => {
-  const fake = makeFakeSession((m) => (m === "filesystem.listdir" ? [] : undefined));
+  const fake = makeFakeSession((
+    m,
+  ) => (m === "filesystem.listdir" ? [] : undefined));
   __setTruenasSession(fake.factory);
   try {
     const { context, written } = makeContext();
@@ -295,28 +299,30 @@ Deno.test("filesystem_list: a JSON-string path list is decoded (CLI --input form
 
 Deno.test("app_storage: finds host paths wherever the app config puts them", async () => {
   const fake = makeFakeSession((m) =>
-    m === "app.query" ? [{
-      name: "kopia",
-      config: {
-        storage: {
-          config: {
-            type: "host_path",
-            mount_path: "/app/config",
-            host_path_config: { path: "/mnt/Primary/apps/kopia" },
-          },
-          additional_storage: [
-            {
+    m === "app.query"
+      ? [{
+        name: "kopia",
+        config: {
+          storage: {
+            config: {
               type: "host_path",
-              mount_path: "/data/backup",
-              read_only: true,
-              host_path_config: { path: "/mnt/Backup" },
+              mount_path: "/app/config",
+              host_path_config: { path: "/mnt/Primary/apps/kopia" },
             },
-          ],
+            additional_storage: [
+              {
+                type: "host_path",
+                mount_path: "/data/backup",
+                read_only: true,
+                host_path_config: { path: "/mnt/Backup" },
+              },
+            ],
+          },
+          // A non-host_path entry must not be collected.
+          cache: { type: "ix_volume", mount_path: "/app/cache" },
         },
-        // A non-host_path entry must not be collected.
-        cache: { type: "ix_volume", mount_path: "/app/cache" },
-      },
-    }] : undefined
+      }]
+      : undefined
   );
   __setTruenasSession(fake.factory);
   try {
@@ -330,7 +336,10 @@ Deno.test("app_storage: finds host paths wherever the app config puts them", asy
     );
     assertEquals(written[0].data.mountCount, 2, "ix_volume is not a host path");
     const mounts = written[0].data.mounts as Array<Record<string, unknown>>;
-    assertEquals(mounts.map((m) => m.mountPath), ["/app/config", "/data/backup"]);
+    assertEquals(mounts.map((m) => m.mountPath), [
+      "/app/config",
+      "/data/backup",
+    ]);
     assertEquals(mounts[1].hostPath, "/mnt/Backup");
     assertEquals(mounts[1].readOnly, true);
     assertEquals(mounts[1].configPath, "storage.additional_storage[0]");
@@ -360,27 +369,33 @@ Deno.test("app_storage: unknown app is an error, not an empty result", async () 
 
 Deno.test("replication_list: instance names are PREFIXED (no nfs/smb id collision)", async () => {
   const fake = makeFakeSession((m) =>
-    m === "replication.query" ? [{
-      id: 3,
-      name: "Apps - Backup",
-      direction: "PUSH",
-      transport: "LOCAL",
-      enabled: true,
-      auto: true,
-      recursive: true,
-      source_datasets: ["Primary/apps"],
-      target_dataset: "Backup/apps",
-      readonly: "SET",
-      properties: true,
-      state: { state: "FINISHED", datetime: { $date: 1785585769000 } },
-    }] : undefined
+    m === "replication.query"
+      ? [{
+        id: 3,
+        name: "Apps - Backup",
+        direction: "PUSH",
+        transport: "LOCAL",
+        enabled: true,
+        auto: true,
+        recursive: true,
+        source_datasets: ["Primary/apps"],
+        target_dataset: "Backup/apps",
+        readonly: "SET",
+        properties: true,
+        state: { state: "FINISHED", datetime: { $date: 1785585769000 } },
+      }]
+      : undefined
   );
   __setTruenasSession(fake.factory);
   try {
     const { context, written } = makeContext();
     await method("replication_list").execute({}, context);
     assertEquals(written[0].specName, "replication-task");
-    assertEquals(written[0].name, "repl-3", "a bare id would clobber nfs-share 3");
+    assertEquals(
+      written[0].name,
+      "repl-3",
+      "a bare id would clobber nfs-share 3",
+    );
     const t = written[0].data;
     assertEquals(t.recursive, true);
     assertEquals(t.sendsProperties, true);
@@ -412,7 +427,11 @@ Deno.test("filesystem_list: a LIST of paths fans out over one session", async ()
       "mnt-Backup-nope",
     ]);
     assertEquals(written[0].data.exists, true);
-    assertEquals(written[1].data.exists, false, "ENOENT doesn't abort the fan-out");
+    assertEquals(
+      written[1].data.exists,
+      false,
+      "ENOENT doesn't abort the fan-out",
+    );
     assertEquals(
       fake.calls.filter((c) => c.method === "filesystem.listdir").length,
       2,
@@ -584,7 +603,9 @@ Deno.test("app_set_port_bind: handles the config.ports LIST form (e.g. kopia)", 
       sentPorts = (params[1] as { values: { ports: unknown } }).values.ports;
       return 7;
     }
-    if (m === "core.get_jobs") return [{ id: 7, state: "SUCCESS", result: null }];
+    if (m === "core.get_jobs") {
+      return [{ id: 7, state: "SUCCESS", result: null }];
+    }
     return undefined;
   });
   __setTruenasSession(fake.factory);
@@ -880,7 +901,9 @@ Deno.test("nfs_share_delete: removes the export and records its prior config", a
 Deno.test("nfs_share_delete: refuses when confirmPath mismatches", async () => {
   let deleteCalled = false;
   const fake = makeFakeSession((m) => {
-    if (m === "sharing.nfs.query") return [{ id: 9, path: "/mnt/Primary/apps/git" }];
+    if (m === "sharing.nfs.query") {
+      return [{ id: 9, path: "/mnt/Primary/apps/git" }];
+    }
     if (m === "sharing.nfs.delete") {
       deleteCalled = true;
       return true;
@@ -898,7 +921,11 @@ Deno.test("nfs_share_delete: refuses when confirmPath mismatches", async () => {
         ),
       /does not match/,
     );
-    assertEquals(deleteCalled, false, "must NOT delete on a confirmPath mismatch");
+    assertEquals(
+      deleteCalled,
+      false,
+      "must NOT delete on a confirmPath mismatch",
+    );
   } finally {
     __setTruenasSession(null);
   }
@@ -918,22 +945,35 @@ Deno.test("nfs_share_delete: already-absent share succeeds with action=absent (i
   try {
     const { context, written } = makeContext();
     await method("nfs_share_delete").execute({ id: 9 }, context);
-    assertEquals(deleteCalled, false, "must NOT call delete when nothing matches");
+    assertEquals(
+      deleteCalled,
+      false,
+      "must NOT call delete when nothing matches",
+    );
     const r = written[0].data;
     assertEquals(r.action, "absent");
     assertEquals(r.id, 9);
-    assertEquals(written[0].name, "9", "by id: named after the id, as a real delete is");
+    assertEquals(
+      written[0].name,
+      "9",
+      "by id: named after the id, as a real delete is",
+    );
   } finally {
     __setTruenasSession(null);
   }
 });
 
 Deno.test("nfs_share_delete: absent share selected by path gets a slash-free instance name", async () => {
-  const fake = makeFakeSession((m) => (m === "sharing.nfs.query" ? [] : undefined));
+  const fake = makeFakeSession((
+    m,
+  ) => (m === "sharing.nfs.query" ? [] : undefined));
   __setTruenasSession(fake.factory);
   try {
     const { context, written } = makeContext();
-    await method("nfs_share_delete").execute({ path: "/mnt/tank/old" }, context);
+    await method("nfs_share_delete").execute(
+      { path: "/mnt/tank/old" },
+      context,
+    );
     assertEquals(written[0].name, "mnt-tank-old");
     assertEquals(written[0].data.path, "/mnt/tank/old");
     assertEquals(written[0].data.action, "absent");
@@ -981,7 +1021,9 @@ Deno.test("smb_share_delete: removes the share and records its prior config", as
 Deno.test("smb_share_delete: refuses when confirmName mismatches", async () => {
   let deleteCalled = false;
   const fake = makeFakeSession((m) => {
-    if (m === "sharing.smb.query") return [{ id: 6, name: "Music", path: "/mnt/Primary/Music" }];
+    if (m === "sharing.smb.query") {
+      return [{ id: 6, name: "Music", path: "/mnt/Primary/Music" }];
+    }
     if (m === "sharing.smb.delete") {
       deleteCalled = true;
       return true;
@@ -999,7 +1041,11 @@ Deno.test("smb_share_delete: refuses when confirmName mismatches", async () => {
         ),
       /does not match/,
     );
-    assertEquals(deleteCalled, false, "must NOT delete on a confirmName mismatch");
+    assertEquals(
+      deleteCalled,
+      false,
+      "must NOT delete on a confirmName mismatch",
+    );
   } finally {
     __setTruenasSession(null);
   }
@@ -1019,7 +1065,11 @@ Deno.test("smb_share_delete: already-absent share succeeds with action=absent (i
   try {
     const { context, written } = makeContext();
     await method("smb_share_delete").execute({ name: "Music" }, context);
-    assertEquals(deleteCalled, false, "must NOT call delete when nothing matches");
+    assertEquals(
+      deleteCalled,
+      false,
+      "must NOT call delete when nothing matches",
+    );
     const r = written[0].data;
     assertEquals(r.action, "absent");
     assertEquals(r.name, "Music");
@@ -1029,18 +1079,27 @@ Deno.test("smb_share_delete: already-absent share succeeds with action=absent (i
 });
 
 Deno.test("smb_share_delete: absent share selected by name gets a safe instance name", async () => {
-  const fake = makeFakeSession((m) => (m === "sharing.smb.query" ? [] : undefined));
+  const fake = makeFakeSession((
+    m,
+  ) => (m === "sharing.smb.query" ? [] : undefined));
   __setTruenasSession(fake.factory);
   try {
     const { context, written } = makeContext();
-    await method("smb_share_delete").execute({ name: "Old Media/2019" }, context);
+    await method("smb_share_delete").execute(
+      { name: "Old Media/2019" },
+      context,
+    );
     assertEquals(written[0].name, "Old-Media-2019");
     assertEquals(written[0].data.name, "Old Media/2019");
     assertEquals(written[0].data.action, "absent");
 
     const byId = makeContext();
     await method("smb_share_delete").execute({ id: 6 }, byId.context);
-    assertEquals(byId.written[0].name, "6", "by id: named after the id, as a real delete is");
+    assertEquals(
+      byId.written[0].name,
+      "6",
+      "by id: named after the id, as a real delete is",
+    );
   } finally {
     __setTruenasSession(null);
   }
@@ -1168,7 +1227,11 @@ Deno.test("smb_share_set_access: leaves a non-locking preset untouched", async (
       id: 9,
       hostsallow: ["192.0.2.101"],
     }, context);
-    assertEquals(purposeKeyPresent, false, "must not send purpose for a non-locking preset");
+    assertEquals(
+      purposeKeyPresent,
+      false,
+      "must not send purpose for a non-locking preset",
+    );
     const r = written[0].data;
     assertEquals(r.previousPurpose, "MULTI_PROTOCOL_NFS");
     assertEquals(r.purpose, "MULTI_PROTOCOL_NFS");

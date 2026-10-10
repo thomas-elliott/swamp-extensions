@@ -192,19 +192,21 @@ Deno.test("parsePrometheus: labels collapse, comments skipped, non-numeric dropp
   assert(!("garbage" in m), "non-metric line ignored");
 });
 
-Deno.test("reachable: skips when apiKey is an unresolved vault expression", async () => {
-  // No caller set; a network call here would use realRest.
-  __setRest(null);
-  const check = (model.checks as unknown as Record<string, {
-    execute: (c: unknown) => Promise<{ pass: boolean }>;
-  }>).reachable;
-  const res = await check.execute({
-    globalArgs: {
-      ...GLOBALS,
-      apiKey: "${{ vault.get(op-homelab, stalwart/api_key) }}",
-    },
-  });
-  assertEquals(res.pass, true, "unresolved secret → skip (pass)");
+Deno.test("reachable: a definition that fails the schema fails without probing", async () => {
+  const { caller, calls } = makeFakeRest(() => ({ body: {} }));
+  __setRest(caller);
+  try {
+    const check = (model.checks as unknown as Record<string, {
+      execute: (c: unknown) => Promise<{ pass: boolean }>;
+    }>).reachable;
+    const res = await check.execute({
+      globalArgs: { apiUrl: GLOBALS.apiUrl },
+    });
+    assertEquals(res.pass, false);
+    assertEquals(calls.length, 0, "must not probe with an invalid definition");
+  } finally {
+    __setRest(null);
+  }
 });
 
 Deno.test("reachable: fails with a clear error when the API is unreachable", async () => {
@@ -216,7 +218,9 @@ Deno.test("reachable: fails with a clear error when the API is unreachable", asy
     const check = (model.checks as unknown as Record<string, {
       execute: (c: unknown) => Promise<{ pass: boolean; errors?: string[] }>;
     }>).reachable;
-    const res = await check.execute({ globalArgs: GLOBALS });
+    const res = await check.execute({
+      globalArgs: { apiUrl: GLOBALS.apiUrl, apiKey: GLOBALS.apiKey },
+    });
     assertEquals(res.pass, false);
     assert(
       (res.errors?.[0] ?? "").includes("Cannot reach Stalwart"),
@@ -1313,5 +1317,31 @@ Deno.test("reachable: applies the schema defaults to globalArgs", async () => {
     assertEquals(seenTimeout, 30000);
   } finally {
     __setRest(null);
+  }
+});
+
+// ─────────────────────────── strict booleans ───────────────────────────
+
+Deno.test("boolean arguments reject anything but true/false", () => {
+  const schema = (model.methods as unknown as Record<string, {
+    arguments: {
+      safeParse: (v: unknown) => {
+        success: boolean;
+        error?: { issues: { path: PropertyKey[] }[] };
+      };
+    };
+  }>)["settings_set"].arguments;
+  const fieldFails = (v: unknown) => {
+    const r = schema.safeParse({ reload: v });
+    return (r.error?.issues ?? []).some((i) => i.path[0] === "reload");
+  };
+  for (const bad of ["0", "1", "False", "True", "yes", null]) {
+    assert(fieldFails(bad), `reload=${JSON.stringify(bad)} must be rejected`);
+  }
+  for (const good of [true, false, "true", "false"]) {
+    assert(
+      !fieldFails(good),
+      `reload=${JSON.stringify(good)} must be accepted`,
+    );
   }
 });
