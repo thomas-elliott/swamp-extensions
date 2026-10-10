@@ -115,35 +115,35 @@ swamp model method run forgejo org_ensure \
 
 # Find-or-create a repo and converge its settings.
 swamp model method run forgejo repo_ensure \
-  --input owner=apps --input name=damson \
+  --input owner=apps --input name=web \
   --input private=true --input hasWiki=false
 
 # Grant a user access to a repo (never removes a collaborator; refuses the owner).
 swamp model method run forgejo collaborator_ensure \
-  --input owner=apps --input name=damson \
+  --input owner=apps --input name=web \
   --input user=ci-bot --input permission=write
 
 # Make a branch PR-only, and bind admins to the rule too.
 swamp model method run forgejo branch_protection_ensure \
-  --input owner=apps --input name=damson --input rule=main \
+  --input owner=apps --input name=web --input rule=main \
   --input enablePush=false --input applyToAdmins=true
 
 # Let one account push to a namespace, but never to the CI config.
 swamp model method run forgejo branch_protection_ensure \
-  --input owner=apps --input name=damson --input 'rule=agents/*' \
+  --input owner=apps --input name=web --input 'rule=agents/*' \
   --input enablePush=true --input enablePushWhitelist=true \
   --input 'pushWhitelistUsernames=["ci-bot"]' \
   --input 'protectedFilePatterns=.woodpecker.yml;.woodpecker/**'
 
 # Find-or-create a GitHub pull-mirror (the workhorse).
 swamp model method run forgejo mirror_ensure \
-  --input owner=mirrors --input name=scrappy \
-  --input cloneAddr=https://github.com/me/scrappy.git \
+  --input owner=mirrors --input name=widget \
+  --input cloneAddr=https://github.com/octo-org/widget.git \
   --input 'authToken=${{ vault.get(<vault>, github/mirror_pat) }}'
 
 # Queue an immediate pull-sync.
 swamp model method run forgejo mirror_sync_now \
-  --input owner=mirrors --input name=scrappy
+  --input owner=mirrors --input name=widget
 ```
 
 `mirror_ensure` creates with `service=github`, `mirrorInterval=8h0m0s`,
@@ -160,19 +160,19 @@ durations, so `8h` equals `8h0m0s`).
 # Open a PR — find-or-create on the head→base pair, so a re-run converges the
 # title/body instead of failing on a duplicate.
 swamp model method run forgejo pr_ensure \
-  --input owner=apps --input name=damson \
+  --input owner=apps --input name=web \
   --input head=feat/thing --input base=main --input title='Add the thing'
 
 # List open PRs (state: open | closed | all).
-swamp model method run forgejo pr_list --input owner=apps --input name=damson
+swamp model method run forgejo pr_list --input owner=apps --input name=web
 
 # One PR, with the mergeable verdict and the head commit's CI state.
 swamp model method run forgejo pr_get \
-  --input owner=apps --input name=damson --input index=4
+  --input owner=apps --input name=web --input index=4
 
 # Merge (strategy: squash | merge | rebase | rebase-merge; squash is default).
 swamp model method run forgejo pr_merge \
-  --input owner=apps --input name=damson --input index=4 \
+  --input owner=apps --input name=web --input index=4 \
   --input deleteBranch=true
 ```
 
@@ -182,13 +182,13 @@ swamp model method run forgejo pr_merge \
 # Where does every repo's webhook actually post? Supply the URL you expect and
 # each hook comes back with matchesExpected — false is the drift.
 swamp model method run forgejo webhook_audit \
-  --input owner=telliott \
+  --input owner=alice \
   --input expectedUrl=http://ci.internal.example/api/hook
 
 # Repoint one hook that drifted. Converge-only: it never creates a hook, and it
 # writes config.url alone so the shared secret survives untouched.
 swamp model method run forgejo webhook_retarget \
-  --input owner=telliott --input name=scrappy \
+  --input owner=alice --input name=widget \
   --input matchUrl=old-ci.example \
   --input url=http://ci.internal.example/api/hook
 ```
@@ -221,12 +221,13 @@ with CI disabled and a pipeline that never started are indistinguishable here.
 | `webhook`           | Hook target URL, events, active, `matchesExpected`. Never the secret. |
 
 Data instance names replace `/` with `:` (swamp rejects slashes), so
-`mirrors/scrappy` is stored as `mirrors:scrappy` and PR 4 on `apps/damson` as
-`apps:damson#4`.
+`mirrors/widget` is stored as `mirrors:widget` and PR 4 on `apps/web` as
+`apps:web#4`.
 
 ## Design notes
 
-- All listings paginate at 50 (Forgejo's search cap) until a short page.
+- All listings read page after page until an empty one, so a server with a lower
+  `MAX_RESPONSE_ITEMS` is still read in full.
 - Search responses (`{ok, data}`) and bare-array responses are both handled.
 - Repo paths on disk are lowercased by Forgejo while API names keep display
   case; instance names follow the API's display case.

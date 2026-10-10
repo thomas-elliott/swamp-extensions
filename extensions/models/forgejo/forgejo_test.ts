@@ -69,6 +69,18 @@ function makeFakeApi(
     calls.push({ method: c.method, path: c.path, body: c.body });
     const r = respond?.(c);
     if (r === undefined) return Promise.resolve({ status: 404, body: {} });
+    // Every list fits on page 1; later pages are empty, as a real server's
+    // are once the items run out. Lists come bare or wrapped as {data: [...]}.
+    const page = Number(/[?&]page=(\d+)/.exec(c.path)?.[1] ?? 1);
+    if (page > 1 && Array.isArray(r)) {
+      return Promise.resolve({
+        status: 200,
+        body: [] as unknown as Record<string, unknown>,
+      });
+    }
+    if (page > 1 && Array.isArray((r as Record<string, unknown>).data)) {
+      return Promise.resolve({ status: 200, body: { ...r, data: [] } });
+    }
     if (
       !Array.isArray(r) && typeof r === "object" && r !== null &&
       "status" in r && "body" in r
@@ -116,8 +128,8 @@ const method = (name: string): MethodDef =>
 function repoObj(over: Record<string, unknown> = {}): Record<string, unknown> {
   return {
     id: 7,
-    name: "damson",
-    full_name: "apps/damson",
+    name: "web",
+    full_name: "apps/web",
     owner: { login: "apps" },
     private: true,
     archived: false,
@@ -126,7 +138,7 @@ function repoObj(over: Record<string, unknown> = {}): Record<string, unknown> {
     fork: false,
     default_branch: "main",
     description: "",
-    html_url: "https://git.test.example.com/apps/damson",
+    html_url: "https://git.test.example.com/apps/web",
     size: 1024,
     has_wiki: true,
     has_issues: true,
@@ -142,11 +154,11 @@ function mirrorObj(over: Record<string, unknown> = {}): Record<
 > {
   return repoObj({
     id: 9,
-    name: "scrappy",
-    full_name: "mirrors/scrappy",
+    name: "widget",
+    full_name: "mirrors/widget",
     owner: { login: "mirrors" },
     mirror: true,
-    original_url: "https://github.com/thomas-elliott/scrappy.git",
+    original_url: "https://github.com/octo-org/widget.git",
     mirror_interval: "8h0m0s",
     mirror_updated: new Date(Date.now() - 3600 * 1000).toISOString(),
     ...over,
@@ -234,7 +246,7 @@ Deno.test("org_ensure patches only the drifted field", async () => {
 
 Deno.test("repo_ensure creates under the org namespace", async () => {
   const { caller, calls } = makeFakeApi((c) => {
-    if (c.method === "GET" && c.path === "/api/v1/repos/apps/damson") {
+    if (c.method === "GET" && c.path === "/api/v1/repos/apps/web") {
       return undefined; // 404
     }
     if (c.method === "GET" && c.path === "/api/v1/user") {
@@ -246,7 +258,7 @@ Deno.test("repo_ensure creates under the org namespace", async () => {
   try {
     const { context, written } = makeContext();
     await method("repo_ensure").execute(
-      { owner: "apps", name: "damson", private: true },
+      { owner: "apps", name: "web", private: true },
       context,
     );
     const post = calls.find((c) => c.method === "POST");
@@ -271,7 +283,7 @@ Deno.test("repo_ensure creates under /user/repos for the token user", async () =
   try {
     const { context } = makeContext();
     await method("repo_ensure").execute(
-      { owner: "swamp-admin", name: "damson" },
+      { owner: "swamp-admin", name: "web" },
       context,
     );
     const post = calls.find((c) => c.method === "POST");
@@ -287,7 +299,7 @@ Deno.test("repo_ensure is unchanged when settings match", async () => {
   try {
     const { context, written } = makeContext();
     await method("repo_ensure").execute(
-      { owner: "apps", name: "damson", private: true, hasWiki: true },
+      { owner: "apps", name: "web", private: true, hasWiki: true },
       context,
     );
     assert(!calls.some((c) => c.method !== "GET"), "no mutation expected");
@@ -306,7 +318,7 @@ Deno.test("repo_ensure patches only drifted settings", async () => {
   try {
     const { context, written } = makeContext();
     await method("repo_ensure").execute(
-      { owner: "apps", name: "damson", private: true, hasWiki: false },
+      { owner: "apps", name: "web", private: true, hasWiki: false },
       context,
     );
     const patch = calls.find((c) => c.method === "PATCH");
@@ -330,8 +342,8 @@ Deno.test("mirror_ensure migrates when absent; authToken on the wire, never stor
     await method("mirror_ensure").execute(
       {
         owner: "mirrors",
-        name: "scrappy",
-        cloneAddr: "https://github.com/thomas-elliott/scrappy.git",
+        name: "widget",
+        cloneAddr: "https://github.com/octo-org/widget.git",
         authToken: "ghp_SECRET",
       },
       context,
@@ -366,8 +378,8 @@ Deno.test("mirror_ensure omits auth_token when not supplied", async () => {
     await method("mirror_ensure").execute(
       {
         owner: "mirrors",
-        name: "scrappy",
-        cloneAddr: "https://github.com/thomas-elliott/scrappy.git",
+        name: "widget",
+        cloneAddr: "https://github.com/octo-org/widget.git",
       },
       context,
     );
@@ -393,8 +405,8 @@ Deno.test("mirror_ensure reports the empty shell repo and never deletes", async 
         method("mirror_ensure").execute(
           {
             owner: "apps",
-            name: "damson",
-            cloneAddr: "https://github.com/x/damson.git",
+            name: "web",
+            cloneAddr: "https://github.com/x/web.git",
           },
           context,
         ),
@@ -419,8 +431,8 @@ Deno.test("mirror_ensure refuses a non-mirror name collision", async () => {
         method("mirror_ensure").execute(
           {
             owner: "apps",
-            name: "damson",
-            cloneAddr: "https://github.com/x/damson.git",
+            name: "web",
+            cloneAddr: "https://github.com/x/web.git",
           },
           context,
         ),
@@ -441,8 +453,8 @@ Deno.test("mirror_ensure refuses source-URL drift", async () => {
         method("mirror_ensure").execute(
           {
             owner: "mirrors",
-            name: "scrappy",
-            cloneAddr: "https://github.com/someone-else/scrappy.git",
+            name: "widget",
+            cloneAddr: "https://github.com/someone-else/widget.git",
           },
           context,
         ),
@@ -461,8 +473,8 @@ Deno.test("mirror_ensure tolerates equivalent source URLs (.git / case)", async 
     await method("mirror_ensure").execute(
       {
         owner: "mirrors",
-        name: "scrappy",
-        cloneAddr: "https://github.com/Thomas-Elliott/scrappy",
+        name: "widget",
+        cloneAddr: "https://github.com/Octo-Org/widget",
       },
       context,
     );
@@ -484,8 +496,8 @@ Deno.test("mirror_ensure creates private with an 8h interval when neither is pas
     await method("mirror_ensure").execute(
       {
         owner: "mirrors",
-        name: "scrappy",
-        cloneAddr: "https://github.com/thomas-elliott/scrappy.git",
+        name: "widget",
+        cloneAddr: "https://github.com/octo-org/widget.git",
       },
       context,
     );
@@ -519,8 +531,8 @@ Deno.test("mirror_ensure leaves visibility and interval alone when not passed", 
     await method("mirror_ensure").execute(
       {
         owner: "mirrors",
-        name: "scrappy",
-        cloneAddr: "https://github.com/thomas-elliott/scrappy.git",
+        name: "widget",
+        cloneAddr: "https://github.com/octo-org/widget.git",
         description: "new",
       },
       context,
@@ -543,8 +555,8 @@ Deno.test("mirror_ensure still converges visibility when it is passed", async ()
     await method("mirror_ensure").execute(
       {
         owner: "mirrors",
-        name: "scrappy",
-        cloneAddr: "https://github.com/thomas-elliott/scrappy.git",
+        name: "widget",
+        cloneAddr: "https://github.com/octo-org/widget.git",
         private: true,
       },
       context,
@@ -567,8 +579,8 @@ Deno.test("mirror_ensure reconciles a drifted interval (semantic compare)", asyn
     await method("mirror_ensure").execute(
       {
         owner: "mirrors",
-        name: "scrappy",
-        cloneAddr: "https://github.com/thomas-elliott/scrappy.git",
+        name: "widget",
+        cloneAddr: "https://github.com/octo-org/widget.git",
         mirrorInterval: "24h",
       },
       context,
@@ -592,8 +604,8 @@ Deno.test("mirror_ensure treats 8h == 8h0m0s as unchanged", async () => {
     await method("mirror_ensure").execute(
       {
         owner: "mirrors",
-        name: "scrappy",
-        cloneAddr: "https://github.com/thomas-elliott/scrappy.git",
+        name: "widget",
+        cloneAddr: "https://github.com/octo-org/widget.git",
         mirrorInterval: "8h",
       },
       context,
@@ -613,11 +625,11 @@ Deno.test("mirror_sync_now posts mirror-sync for a mirror", async () => {
   try {
     const { context, written } = makeContext();
     await method("mirror_sync_now").execute(
-      { owner: "mirrors", name: "scrappy" },
+      { owner: "mirrors", name: "widget" },
       context,
     );
     const post = calls.find((c) => c.method === "POST");
-    assertEquals(post?.path, "/api/v1/repos/mirrors/scrappy/mirror-sync");
+    assertEquals(post?.path, "/api/v1/repos/mirrors/widget/mirror-sync");
     assertEquals(written[0].data.action, "triggered");
   } finally {
     __setCaller(null);
@@ -632,7 +644,7 @@ Deno.test("mirror_sync_now refuses a non-mirror", async () => {
     await rejects(
       () =>
         method("mirror_sync_now").execute(
-          { owner: "apps", name: "damson" },
+          { owner: "apps", name: "web" },
           context,
         ),
       /not a mirror/,
@@ -654,7 +666,7 @@ Deno.test("repo_archive patches archived=true and is idempotent", async () => {
   try {
     const { context, written } = makeContext();
     await method("repo_archive").execute(
-      { owner: "apps", name: "damson" },
+      { owner: "apps", name: "web" },
       context,
     );
     const patch = fake.calls.find((c) => c.method === "PATCH");
@@ -669,7 +681,7 @@ Deno.test("repo_archive patches archived=true and is idempotent", async () => {
   try {
     const { context, written } = makeContext();
     await method("repo_archive").execute(
-      { owner: "apps", name: "damson" },
+      { owner: "apps", name: "web" },
       context,
     );
     assert(!fake.calls.some((c) => c.method === "PATCH"), "no second PATCH");
@@ -688,7 +700,7 @@ Deno.test("repo_unarchive reverses repo_archive", async () => {
   try {
     const { context, written } = makeContext();
     await method("repo_unarchive").execute(
-      { owner: "apps", name: "damson" },
+      { owner: "apps", name: "web" },
       context,
     );
     const patch = calls.find((c) => c.method === "PATCH");
@@ -701,7 +713,9 @@ Deno.test("repo_unarchive reverses repo_archive", async () => {
 
 // ─────────────────────────── listings / pagination ───────────────────────────
 
-Deno.test("repo_list paginates the search endpoint and unwraps {data}", async () => {
+// The server caps `limit` at its MAX_RESPONSE_ITEMS (30 here), so a short page
+// is not the last one; only an empty page is.
+Deno.test("repo_list reads every page, past a capped one, and unwraps {data}", async () => {
   const pageOf = (n: number, count: number) =>
     Array.from({ length: count }, (_, i) => ({
       id: n * 1000 + i,
@@ -709,20 +723,23 @@ Deno.test("repo_list paginates the search endpoint and unwraps {data}", async ()
       full_name: `apps/r${n}-${i}`,
       owner: { login: "apps" },
     }));
-  const { caller, calls } = makeFakeApi((c) => {
+  // Its own fake: the shared one serves every list on page 1 only.
+  const calls: string[] = [];
+  __setCaller((_g, c) => {
+    calls.push(c.path);
     const page = Number(new URLSearchParams(c.path.split("?")[1]).get("page"));
-    return {
-      ok: true,
-      data: page === 1 ? pageOf(1, 50) : pageOf(2, 3),
-    } as unknown as Record<string, unknown>;
+    const items = page === 1 ? pageOf(1, 30) : page === 2 ? pageOf(2, 5) : [];
+    return Promise.resolve({
+      status: 200,
+      body: { ok: true, data: items } as unknown as Record<string, unknown>,
+    });
   });
-  __setCaller(caller);
   try {
     const { context, written } = makeContext();
     await method("repo_list").execute({}, context);
-    assertEquals(calls.length, 2, "fetches until a short page");
-    assert(calls[0].path.startsWith("/api/v1/repos/search?"));
-    assertEquals(written.length, 53);
+    assertEquals(calls.length, 3, "stops at the first empty page");
+    assert(calls[0].startsWith("/api/v1/repos/search?"));
+    assertEquals(written.length, 35);
   } finally {
     __setCaller(null);
   }
@@ -897,8 +914,8 @@ function prObj(over: Record<string, unknown> = {}): Record<string, unknown> {
     draft: false,
     merged: false,
     mergeable: true,
-    html_url: "https://git.test.example.com/apps/damson/pulls/4",
-    user: { login: "telliott" },
+    html_url: "https://git.test.example.com/apps/web/pulls/4",
+    user: { login: "alice" },
     head: { ref: "feat/thing", sha: "abc123def456", repo: repoObj() },
     base: { ref: "main", sha: "999", repo: repoObj() },
     comments: 0,
@@ -945,7 +962,7 @@ Deno.test("pr_ensure opens a PR when no matching open one exists", async () => {
     await method("pr_ensure").execute(
       {
         owner: "apps",
-        name: "damson",
+        name: "web",
         head: "feat/thing",
         base: "main",
         title: "Add the thing",
@@ -953,10 +970,10 @@ Deno.test("pr_ensure opens a PR when no matching open one exists", async () => {
       context,
     );
     const post = calls.find((c) => c.method === "POST");
-    assertEquals(post?.path, "/api/v1/repos/apps/damson/pulls");
+    assertEquals(post?.path, "/api/v1/repos/apps/web/pulls");
     assertEquals((post?.body as Record<string, unknown>).base, "main");
     assertEquals(written[0].data.action, "created");
-    assertEquals(written[0].name, "apps:damson#4");
+    assertEquals(written[0].name, "apps:web#4");
   } finally {
     __setCaller(null);
   }
@@ -970,7 +987,7 @@ Deno.test("pr_ensure is a no-op when an identical open PR exists", async () => {
     await method("pr_ensure").execute(
       {
         owner: "apps",
-        name: "damson",
+        name: "web",
         head: "feat/thing",
         base: "main",
         title: "Add the thing",
@@ -996,7 +1013,7 @@ Deno.test("pr_ensure converges the title of an existing open PR", async () => {
     await method("pr_ensure").execute(
       {
         owner: "apps",
-        name: "damson",
+        name: "web",
         head: "feat/thing",
         base: "main",
         title: "Renamed",
@@ -1004,7 +1021,7 @@ Deno.test("pr_ensure converges the title of an existing open PR", async () => {
       context,
     );
     const patch = calls.find((c) => c.method === "PATCH");
-    assertEquals(patch?.path, "/api/v1/repos/apps/damson/pulls/4");
+    assertEquals(patch?.path, "/api/v1/repos/apps/web/pulls/4");
     assertEquals((patch?.body as Record<string, unknown>).title, "Renamed");
     assertEquals(written[0].data.action, "updated");
   } finally {
@@ -1020,7 +1037,7 @@ Deno.test("pr_ensure matches a fork head (owner:branch) against the bare ref", a
     await method("pr_ensure").execute(
       {
         owner: "apps",
-        name: "damson",
+        name: "web",
         head: "someone:feat/thing",
         base: "main",
         title: "Add the thing",
@@ -1044,7 +1061,7 @@ Deno.test("pr_get reports ciState none when the head carries no status", async (
   try {
     const { context, written } = makeContext();
     await method("pr_get").execute(
-      { owner: "apps", name: "damson", index: 4 },
+      { owner: "apps", name: "web", index: 4 },
       context,
     );
     assertEquals(written[0].data.ciState, "none");
@@ -1069,7 +1086,7 @@ Deno.test("pr_merge refuses a draft, a closed PR, and an already-merged PR", asy
       await rejects(
         () =>
           method("pr_merge").execute(
-            { owner: "apps", name: "damson", index: 4 },
+            { owner: "apps", name: "web", index: 4 },
             context,
           ),
         re,
@@ -1095,7 +1112,7 @@ Deno.test("pr_merge refuses a PR the server says is not mergeable", async () => 
     await rejects(
       () =>
         method("pr_merge").execute(
-          { owner: "apps", name: "damson", index: 4, force: true },
+          { owner: "apps", name: "web", index: 4, force: true },
           context,
         ),
       /not mergeable/,
@@ -1117,7 +1134,7 @@ Deno.test("pr_merge refuses a non-green head unless forced", async () => {
     await rejects(
       () =>
         method("pr_merge").execute(
-          { owner: "apps", name: "damson", index: 4 },
+          { owner: "apps", name: "web", index: 4 },
           context,
         ),
       /CI state "failure"/,
@@ -1136,7 +1153,7 @@ Deno.test("pr_merge with no CI status at all is refused unless forced", async ()
     await rejects(
       () =>
         method("pr_merge").execute(
-          { owner: "apps", name: "damson", index: 4 },
+          { owner: "apps", name: "web", index: 4 },
           context,
         ),
       /CI state "none"/,
@@ -1167,7 +1184,7 @@ Deno.test("pr_merge sends the strategy as Do and records merged", async () => {
     await method("pr_merge").execute(
       {
         owner: "apps",
-        name: "damson",
+        name: "web",
         index: 4,
         strategy: "squash",
         deleteBranch: true,
@@ -1175,7 +1192,7 @@ Deno.test("pr_merge sends the strategy as Do and records merged", async () => {
       context,
     );
     const merge = calls.find((c) => c.path.endsWith("/merge"));
-    assertEquals(merge?.path, "/api/v1/repos/apps/damson/pulls/4/merge");
+    assertEquals(merge?.path, "/api/v1/repos/apps/web/pulls/4/merge");
     const body = merge?.body as Record<string, unknown>;
     assertEquals(body.Do, "squash");
     assertEquals(body.delete_branch_after_merge, true);
@@ -1248,7 +1265,7 @@ Deno.test("reachable: a non-scope 403 still fails", async () => {
 
 Deno.test("repo_list: a refused org probe falls through to the user path", async () => {
   const { caller, calls } = makeFakeApi((c) => {
-    if (c.path.startsWith("/api/v1/orgs/telliott")) {
+    if (c.path.startsWith("/api/v1/orgs/alice")) {
       return {
         status: 403,
         body: {
@@ -1257,9 +1274,9 @@ Deno.test("repo_list: a refused org probe falls through to the user path", async
         },
       };
     }
-    if (c.path.startsWith("/api/v1/users/telliott/repos")) {
+    if (c.path.startsWith("/api/v1/users/alice/repos")) {
       return [
-        repoObj({ full_name: "telliott/swamp", owner: { login: "telliott" } }),
+        repoObj({ full_name: "alice/swamp", owner: { login: "alice" } }),
       ];
     }
     return undefined;
@@ -1267,11 +1284,11 @@ Deno.test("repo_list: a refused org probe falls through to the user path", async
   const { context, written } = makeContext();
   __setCaller(caller);
   try {
-    await method("repo_list").execute({ owner: "telliott" }, context);
+    await method("repo_list").execute({ owner: "alice" }, context);
     assertEquals(written.length, 1);
-    assertEquals(written[0].data.fullName, "telliott/swamp");
+    assertEquals(written[0].data.fullName, "alice/swamp");
     assert(
-      calls.some((c) => c.path.startsWith("/api/v1/orgs/telliott")),
+      calls.some((c) => c.path.startsWith("/api/v1/orgs/alice")),
       "the org probe must still be attempted first",
     );
   } finally {
@@ -1291,7 +1308,7 @@ Deno.test("repo_list: names the missing scopes when both probes are refused", as
   __setCaller(caller);
   try {
     await rejects(
-      () => method("repo_list").execute({ owner: "telliott" }, context),
+      () => method("repo_list").execute({ owner: "alice" }, context),
       /read:organization nor read:user/,
     );
   } finally {
@@ -1316,7 +1333,7 @@ Deno.test("repo_list: a genuinely absent owner is still a 404, not a scope error
 // ───────────── collaborator_ensure ─────────────
 
 const COLLAB_ARGS = {
-  owner: "telliott",
+  owner: "alice",
   name: "agent-scratch",
   user: "factory-agents",
   permission: "write",
@@ -1334,7 +1351,7 @@ Deno.test("collaborator_ensure grants access when the user has none", async () =
     const put = calls.find((c) => c.method === "PUT");
     assertEquals(
       put?.path,
-      "/api/v1/repos/telliott/agent-scratch/collaborators/factory-agents",
+      "/api/v1/repos/alice/agent-scratch/collaborators/factory-agents",
     );
     assertEquals((put?.body as Record<string, unknown>).permission, "write");
     assertEquals(written[0].data.action, "created");
@@ -1420,7 +1437,7 @@ Deno.test("collaborator_ensure adds a non-collaborator who can already read a pu
     const put = calls.find((c) => c.method === "PUT");
     assertEquals(
       put?.path,
-      "/api/v1/repos/telliott/agent-scratch/collaborators/factory-agents",
+      "/api/v1/repos/alice/agent-scratch/collaborators/factory-agents",
     );
     assertEquals(put?.body, { permission: "write" });
     assertEquals(written[0].data.action, "created");
@@ -1458,10 +1475,10 @@ Deno.test("collaborator_ensure refuses to touch the repo owner", async () => {
     await rejects(
       () =>
         method("collaborator_ensure").execute(
-          { ...COLLAB_ARGS, user: "telliott" },
+          { ...COLLAB_ARGS, user: "alice" },
           context,
         ),
-      /owns telliott\/agent-scratch/,
+      /owns alice\/agent-scratch/,
     );
     assert(!calls.some((c) => c.method !== "GET"), "must not mutate");
   } finally {
@@ -1481,7 +1498,7 @@ Deno.test("branch_protection_ensure creates a PR-only rule", async () => {
     const { context, written } = makeContext();
     await method("branch_protection_ensure").execute(
       {
-        owner: "telliott",
+        owner: "alice",
         name: "agent-scratch",
         rule: "main",
         enablePush: false,
@@ -1492,7 +1509,7 @@ Deno.test("branch_protection_ensure creates a PR-only rule", async () => {
     const post = calls.find((c) => c.method === "POST");
     assertEquals(
       post?.path,
-      "/api/v1/repos/telliott/agent-scratch/branch_protections",
+      "/api/v1/repos/alice/agent-scratch/branch_protections",
     );
     const body = post?.body as Record<string, unknown>;
     assertEquals(body.rule_name, "main");
@@ -1528,7 +1545,7 @@ Deno.test("branch_protection_ensure patches only what differs", async () => {
     const { context, written } = makeContext();
     await method("branch_protection_ensure").execute(
       {
-        owner: "telliott",
+        owner: "alice",
         name: "agent-scratch",
         rule: "agents/*",
         enablePush: true,
@@ -1541,7 +1558,7 @@ Deno.test("branch_protection_ensure patches only what differs", async () => {
     const patch = calls.find((c) => c.method === "PATCH");
     assertEquals(
       patch?.path,
-      "/api/v1/repos/telliott/agent-scratch/branch_protections/agents%2F*",
+      "/api/v1/repos/alice/agent-scratch/branch_protections/agents%2F*",
     );
     assertEquals(Object.keys(patch?.body as Record<string, unknown>), [
       "protected_file_patterns",
@@ -1563,7 +1580,7 @@ Deno.test("branch_protection_ensure is unchanged when converged", async () => {
     const { context, written } = makeContext();
     await method("branch_protection_ensure").execute(
       {
-        owner: "telliott",
+        owner: "alice",
         name: "agent-scratch",
         rule: "main",
         enablePush: false,
@@ -1596,7 +1613,7 @@ Deno.test("branch_protection_ensure sends enable_push alongside a whitelist on u
     const { context } = makeContext();
     await method("branch_protection_ensure").execute(
       {
-        owner: "telliott",
+        owner: "alice",
         name: "agent-scratch",
         rule: "agents/*",
         enablePushWhitelist: true,
@@ -1626,7 +1643,7 @@ Deno.test("branch_protection_ensure implies enable_push when creating with a whi
     const { context } = makeContext();
     await method("branch_protection_ensure").execute(
       {
-        owner: "telliott",
+        owner: "alice",
         name: "agent-scratch",
         rule: "agents/*",
         enablePushWhitelist: true,
@@ -1654,7 +1671,7 @@ Deno.test("branch_protection_ensure refuses a whitelist with enablePush=false", 
       () =>
         method("branch_protection_ensure").execute(
           {
-            owner: "telliott",
+            owner: "alice",
             name: "agent-scratch",
             rule: "main",
             enablePush: false,
@@ -1684,7 +1701,7 @@ Deno.test("branch_protection_ensure converges a whitelist as an exact set", asyn
     const { context } = makeContext();
     await method("branch_protection_ensure").execute(
       {
-        owner: "telliott",
+        owner: "alice",
         name: "agent-scratch",
         rule: "agents/*",
         pushWhitelistUsernames: ["factory-agents"],
@@ -1710,11 +1727,11 @@ Deno.test("branch_protection_list writes one resource per rule", async () => {
   try {
     const { context, written } = makeContext();
     await method("branch_protection_list").execute(
-      { owner: "telliott", name: "agent-scratch" },
+      { owner: "alice", name: "agent-scratch" },
       context,
     );
     assertEquals(written.length, 2);
-    assertEquals(written[0].name, "telliott:agent-scratch:main");
+    assertEquals(written[0].name, "alice:agent-scratch:main");
     assertEquals(written[1].data.action, "observed");
   } finally {
     __setCaller(null);
@@ -1723,7 +1740,7 @@ Deno.test("branch_protection_list writes one resource per rule", async () => {
 
 // ─────────────────────────── webhooks ───────────────────────────
 
-const FUNNEL = "https://duna.ghost-eagle.ts.net:8443/api/hook";
+const FUNNEL = "https://ci.example.ts.net:8443/api/hook";
 // Woodpecker appends a per-repo JWT to the hook URL; the fixtures carry one
 // so the tests use the real URL format.
 const TOKEN = "eyJhbGciOiJIUzI1NiJ9.eyJ0eXBlIjoiaG9vayJ9.sig";
@@ -1753,9 +1770,9 @@ Deno.test("webhook_audit flags drift against expectedUrl", async () => {
       return c.path.includes("page=1")
         ? [
           repoObj({
-            full_name: "telliott/scrappy",
-            owner: { login: "telliott" },
-            name: "scrappy",
+            full_name: "alice/widget",
+            owner: { login: "alice" },
+            name: "widget",
           }),
         ]
         : [];
@@ -1780,7 +1797,7 @@ Deno.test("webhook_audit flags drift against expectedUrl", async () => {
       true,
       "in-cluster hook matches",
     );
-    assertEquals(written[0].name, "telliott:scrappy:3");
+    assertEquals(written[0].name, "alice:widget:3");
   } finally {
     __setCaller(null);
   }
@@ -1856,13 +1873,38 @@ Deno.test("webhook_audit skips a repo whose hooks it may not read", async () => 
   }
 });
 
+Deno.test("webhook_audit --owner lists that owner's repos, not the whole server", async () => {
+  const { caller, calls } = makeFakeApi((c) => {
+    if (c.path === "/api/v1/orgs/a") return { username: "a" };
+    if (c.path.startsWith("/api/v1/orgs/a/repos")) {
+      return [
+        repoObj({ full_name: "a/one", owner: { login: "a" }, name: "one" }),
+      ];
+    }
+    if (c.path === "/api/v1/repos/a/one/hooks") return [hookObj()];
+    return undefined;
+  });
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("webhook_audit").execute({ owner: "a" }, context);
+    assertEquals(written.length, 1);
+    assert(
+      !calls.some((c) => c.path.startsWith("/api/v1/repos/search")),
+      "must not search every repo",
+    );
+  } finally {
+    __setCaller(null);
+  }
+});
+
 Deno.test("webhook_audit rejects name without owner", async () => {
   const { caller } = makeFakeApi(() => undefined);
   __setCaller(caller);
   try {
     const { context } = makeContext();
     await rejects(
-      () => method("webhook_audit").execute({ name: "scrappy" }, context),
+      () => method("webhook_audit").execute({ name: "widget" }, context),
       /requires `owner`/,
     );
   } finally {
@@ -1882,11 +1924,11 @@ Deno.test("webhook_retarget changes only the URL, carrying events, branch filter
   try {
     const { context, written } = makeContext();
     await method("webhook_retarget").execute(
-      { owner: "telliott", name: "scrappy", url: INCLUSTER },
+      { owner: "alice", name: "widget", url: INCLUSTER },
       context,
     );
     const patch = calls.find((c) => c.method === "PATCH");
-    assertEquals(patch?.path, "/api/v1/repos/telliott/scrappy/hooks/3");
+    assertEquals(patch?.path, "/api/v1/repos/alice/widget/hooks/3");
     assertEquals(patch?.body, {
       config: { url: INCLUSTER },
       events: ["push", "pull_request"],
@@ -1915,7 +1957,7 @@ Deno.test("webhook_retarget is a no-op when already correct", async () => {
   try {
     const { context, written } = makeContext();
     await method("webhook_retarget").execute(
-      { owner: "telliott", name: "scrappy", url: INCLUSTER },
+      { owner: "alice", name: "widget", url: INCLUSTER },
       context,
     );
     assertEquals(calls.filter((c) => c.method === "PATCH").length, 0);
@@ -1941,7 +1983,7 @@ Deno.test("webhook_retarget refuses to guess between several hooks", async () =>
     await rejects(
       () =>
         method("webhook_retarget").execute(
-          { owner: "telliott", name: "scrappy", url: INCLUSTER },
+          { owner: "alice", name: "widget", url: INCLUSTER },
           context,
         ),
       /refusing to guess/,
@@ -1967,16 +2009,16 @@ Deno.test("webhook_retarget picks the one hook matchUrl identifies", async () =>
     const { context } = makeContext();
     await method("webhook_retarget").execute(
       {
-        owner: "telliott",
-        name: "scrappy",
+        owner: "alice",
+        name: "widget",
         url: INCLUSTER,
-        matchUrl: "ghost-eagle.ts.net",
+        matchUrl: "example.ts.net",
       },
       context,
     );
     assertEquals(
       calls.find((c) => c.method === "PATCH")?.path,
-      "/api/v1/repos/telliott/scrappy/hooks/3",
+      "/api/v1/repos/alice/widget/hooks/3",
     );
   } finally {
     __setCaller(null);
@@ -1994,7 +2036,7 @@ Deno.test("webhook_retarget never creates a hook when none exists", async () => 
     await rejects(
       () =>
         method("webhook_retarget").execute(
-          { owner: "telliott", name: "scrappy", url: INCLUSTER },
+          { owner: "alice", name: "widget", url: INCLUSTER },
           context,
         ),
       /does not create one/,
@@ -2075,7 +2117,7 @@ Deno.test("webhook_retarget carries the access token over to the new host", asyn
   try {
     const { context } = makeContext();
     await method("webhook_retarget").execute(
-      { owner: "telliott", name: "scrappy", url: INCLUSTER },
+      { owner: "alice", name: "widget", url: INCLUSTER },
       context,
     );
     const body = calls.find((c) => c.method === "PATCH")?.body as
@@ -2104,7 +2146,7 @@ Deno.test("webhook_retarget is a no-op when only the token differs", async () =>
   try {
     const { context, written } = makeContext();
     await method("webhook_retarget").execute(
-      { owner: "telliott", name: "scrappy", url: INCLUSTER },
+      { owner: "alice", name: "widget", url: INCLUSTER },
       context,
     );
     assertEquals(calls.filter((c) => c.method === "PATCH").length, 0);
@@ -2133,7 +2175,7 @@ Deno.test("webhook_retarget error messages never show the token", async () => {
     let msg = "";
     try {
       await method("webhook_retarget").execute(
-        { owner: "telliott", name: "scrappy", url: INCLUSTER },
+        { owner: "alice", name: "widget", url: INCLUSTER },
         context,
       );
     } catch (e) {
