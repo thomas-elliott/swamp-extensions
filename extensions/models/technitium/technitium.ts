@@ -607,6 +607,8 @@ type LiveRecord = {
   type: string;
   ttl?: number;
   disabled?: boolean;
+  comments?: string;
+  expiryTtl?: number;
   rData?: Record<string, unknown>;
 };
 
@@ -628,6 +630,8 @@ async function getDomainRecords(
     type: asString(pick(rec, "type")) ?? "UNKNOWN",
     ttl: asNumber(pick(rec, "ttl")),
     disabled: pick(rec, "disabled") as boolean | undefined,
+    comments: asString(pick(rec, "comments")),
+    expiryTtl: asNumber(pick(rec, "expiryTtl")),
     rData: (pick(rec, "rData") as Record<string, unknown> | undefined) ??
       undefined,
   }));
@@ -883,7 +887,18 @@ const RecordUpdateArgs = z.object({
   zone: z.string().optional(),
   domain: z.string(),
   type: z.string(),
-  ttl: z.number().int().optional(),
+  ttl: z.number().int().optional().describe(
+    "New TTL; the record's current TTL is kept when omitted",
+  ),
+  disable: z.boolean().optional().describe(
+    "Disable or enable the record; its current state is kept when omitted",
+  ),
+  comments: z.string().optional().describe(
+    "New comment; the current comment is kept when omitted",
+  ),
+  expiryTtl: z.number().int().optional().describe(
+    "Seconds after last modification to auto-delete (0 = never); kept when omitted",
+  ),
   rData: RData.optional().describe(
     "Existing record data, to identify the record",
   ),
@@ -941,9 +956,95 @@ const DashboardStatsArgs = z.object({
   end: z.string().optional().describe("ISO 8601 end (when type=Custom)"),
 });
 
+/**
+ * Every section flag `/settings/backup` and `/settings/restore` accept. The
+ * server defaults each one to `false`, so a flag left out is a section left out.
+ */
+export const SETTINGS_SECTIONS = [
+  "authConfig",
+  "clusterConfig",
+  "webServiceSettings",
+  "dnsSettings",
+  "logSettings",
+  "zones",
+  "allowedZones",
+  "blockedZones",
+  "blockLists",
+  "apps",
+  "scopes",
+  "stats",
+  "logs",
+] as const;
+
+/** One of the section names in {@link SETTINGS_SECTIONS}. */
+export type SettingsSection = typeof SETTINGS_SECTIONS[number];
+
+/**
+ * Build the section flags for a backup or restore call: every section is sent
+ * explicitly, as `defaults` overridden by the caller's `options`. An unknown
+ * option name throws rather than being forwarded, because the server ignores
+ * names it does not know and the caller would never learn the section was skipped.
+ */
+export function settingsSectionFlags(
+  defaults: Record<SettingsSection, boolean>,
+  options: Record<string, boolean> | undefined,
+): Params {
+  const known = new Set<string>(SETTINGS_SECTIONS);
+  const unknown = Object.keys(options ?? {}).filter((k) => !known.has(k));
+  if (unknown.length > 0) {
+    throw new Error(
+      `Unknown settings section(s): ${unknown.join(", ")}. ` +
+        `Valid sections: ${SETTINGS_SECTIONS.join(", ")}`,
+    );
+  }
+  return { ...defaults, ...(options ?? {}) };
+}
+
+/** Backup default: every configuration section. Logs and stats are runtime data, not settings. */
+const BACKUP_DEFAULTS: Record<SettingsSection, boolean> = {
+  authConfig: true,
+  clusterConfig: true,
+  webServiceSettings: true,
+  dnsSettings: true,
+  logSettings: true,
+  zones: true,
+  allowedZones: true,
+  blockedZones: true,
+  blockLists: true,
+  apps: true,
+  scopes: true,
+  stats: false,
+  logs: false,
+};
+
+/**
+ * Restore default: the DNS data and settings, but not the three sections that
+ * change how the operator reaches the server. `authConfig` replaces every user
+ * and token, including the one making this call; `webServiceSettings` can move
+ * the port or TLS the call arrived on; `clusterConfig` rebinds cluster membership.
+ * Each has to be asked for by name.
+ */
+const RESTORE_DEFAULTS: Record<SettingsSection, boolean> = {
+  authConfig: false,
+  clusterConfig: false,
+  webServiceSettings: false,
+  dnsSettings: true,
+  logSettings: true,
+  zones: true,
+  allowedZones: true,
+  blockedZones: true,
+  blockLists: true,
+  apps: true,
+  scopes: true,
+  stats: false,
+  logs: false,
+};
+
 const SettingsBackupArgs = z.object({
   options: z.record(z.string(), z.boolean()).optional().describe(
-    "Section flags (blockLists, zones, allowedZones, blockedZones, scopes, apps, dnsApps, authConfig, logs, stats). Defaults to a config-only backup.",
+    `Section flags (${
+      SETTINGS_SECTIONS.join(", ")
+    }). Defaults to every configuration section; logs and stats are off.`,
   ),
 });
 
@@ -952,7 +1053,9 @@ const SettingsRestoreArgs = z.object({
     "Absolute path to the backup zip on the swamp host",
   ),
   options: z.record(z.string(), z.boolean()).optional().describe(
-    "Section flags controlling what to restore (mirrors settings_backup).",
+    `Section flags (${
+      SETTINGS_SECTIONS.join(", ")
+    }). Defaults to DNS data and settings; authConfig, clusterConfig and webServiceSettings must be asked for explicitly.`,
   ),
   deleteExistingFiles: z.boolean().optional().describe(
     "Delete existing config files not present in the backup",
@@ -976,10 +1079,10 @@ export const model = {
       execute: async (
         context: Pick<MethodContext<GlobalArgsT>, "globalArgs">,
       ) => {
-        const g = context.globalArgs;
-        // `swamp model validate` does NOT resolve vault expressions before checks, so
-        // the token may still be a literal `${{ … }}` and a probe can't auth. Skip then —
-        // real reachability is exercised at method-run time.
+        // Checks get globalArgs without the schema's defaults; parse to apply them.
+        const g = GlobalArgs.parse(context.globalArgs);
+        // Older swamp left the token as an unresolved `${{ ... }}` here. Skip then;
+        // the method run checks it.
         if (/\$\{\{/.test(String(g.apiToken))) return { pass: true };
         try {
           await apiCall(g, "GET", "/settings/get");
@@ -1581,13 +1684,32 @@ export const model = {
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const g: GlobalArgsT = context.globalArgs;
+        const isApp = args.type.toUpperCase() === "APP";
+        // `records/update` resets every field it is not sent: ttl to the server
+        // default, disable to false, comments and expiryTtl to empty. Read the
+        // record first so changing one field leaves the others as they were.
+        // APP records are matched by domain+type alone (only one exists per name).
+        const existing = (await getDomainRecords(g, args.domain, args.zone))
+          .filter((r) => r.type.toUpperCase() === args.type.toUpperCase())
+          .find((r) => isApp || rDataMatches(args.rData, r.rData, false));
+        if (!existing) {
+          throw new Error(
+            `record_update: no ${args.type} record at ${args.domain} matches the given rData`,
+          );
+        }
+        const ttl = args.ttl ?? existing.ttl;
+        const disable = args.disable ?? existing.disabled;
+        const comments = args.comments ?? existing.comments;
+        const expiryTtl = args.expiryTtl ?? existing.expiryTtl;
         const params: Params = { domain: args.domain, type: args.type };
         if (args.zone) params.zone = args.zone;
-        if (args.ttl !== undefined) params.ttl = args.ttl;
+        if (ttl !== undefined) params.ttl = ttl;
+        if (disable !== undefined) params.disable = disable;
+        if (comments !== undefined) params.comments = comments;
+        if (expiryTtl !== undefined) params.expiryTtl = expiryTtl;
         if (args.newDomain) params.newDomain = args.newDomain;
-        if (args.type.toUpperCase() === "APP") {
-          // APP records have no `new*` params and only one exists per name:
-          // identify by domain+type and write the desired final state directly.
+        if (isApp) {
+          // APP records have no `new*` params: write the desired final state directly.
           spreadAppRData(params, args.newRData ?? args.rData);
         } else {
           spreadRData(params, args.rData);
@@ -1619,7 +1741,8 @@ export const model = {
             zone,
             name: args.newDomain ?? args.domain,
             type: args.type,
-            ttl: args.ttl,
+            ttl,
+            disabled: disable,
             rData: args.newRData ?? args.rData,
             action: "updated",
             observedAt: new Date().toISOString(),
@@ -1871,7 +1994,8 @@ export const model = {
           domain: args.domain,
           type: args.type,
           protocol: args.protocol,
-          dnssecValidation: args.dnssecValidation,
+          // The API's name for the flag; `dnssecValidation` is only this method's argument.
+          dnssec: args.dnssecValidation,
         });
         // The parsed DNS datagram (RCODE, Answer, ...) is nested under `result`.
         const result = (pick(r, "result") as Json | undefined) ?? r;
@@ -2072,19 +2196,7 @@ export const model = {
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const g: GlobalArgsT = context.globalArgs;
-        const flags: Params = {
-          blockLists: true,
-          zones: true,
-          allowedZones: true,
-          blockedZones: true,
-          scopes: true,
-          apps: true,
-          dnsApps: true,
-          authConfig: true,
-          logs: false,
-          stats: false,
-          ...(args.options ?? {}),
-        };
+        const flags = settingsSectionFlags(BACKUP_DEFAULTS, args.options);
         logInfo(context, "Downloading settings backup");
         const bytes = await apiDownload(g, "/settings/backup", flags);
         const stamp = new Date().toISOString().replace(/[:.]/g, "-");
@@ -2104,18 +2216,8 @@ export const model = {
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const g: GlobalArgsT = context.globalArgs;
         const flags: Params = {
-          blockLists: true,
-          zones: true,
-          allowedZones: true,
-          blockedZones: true,
-          scopes: true,
-          apps: true,
-          dnsApps: true,
-          authConfig: true,
-          logs: false,
-          stats: false,
+          ...settingsSectionFlags(RESTORE_DEFAULTS, args.options),
           deleteExistingFiles: args.deleteExistingFiles ?? false,
-          ...(args.options ?? {}),
         };
         const bytes = new Uint8Array(await readFile(args.filePath));
         logInfo(context, "Restoring settings from backup", {

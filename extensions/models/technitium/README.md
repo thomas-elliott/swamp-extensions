@@ -83,6 +83,10 @@ swamp model method run dns-home cache_flush
   `rData.data` (the same key `record_list`/`record_get` read it back under) — it
   is written via Technitium's `recordData` param, and updates set the new payload
   directly (APP records have no `new*` scheme and only one exists per name).
+  `record_update` reads the record first and sends its current `ttl`, `disable`,
+  `comments` and `expiryTtl` back unless you pass new ones, because Technitium
+  resets any of those it is not sent (TTL to the server default, a disabled
+  record back to enabled).
   `record_get` reads a **single** domain's records live from the server (use it
   for ground truth — `record_list` walks the whole zone). Every `record_add` /
   `record_update` / `record_delete` **reads the record back and asserts the live
@@ -100,7 +104,16 @@ swamp model method run dns-home cache_flush
 - **`dashboard_stats`** — query statistics for `LastHour`…`LastYear`/`Custom`.
 - **`settings_*`** — `settings_backup` (downloads a zip into a `backup` file;
   **may contain secrets** — short-lived) and `settings_restore` (multipart
-  upload of a local zip; verify the file first).
+  upload of a local zip; verify the file first). Both send every section flag
+  the API knows explicitly (`authConfig`, `clusterConfig`, `webServiceSettings`,
+  `dnsSettings`, `logSettings`, `zones`, `allowedZones`, `blockedZones`,
+  `blockLists`, `apps`, `scopes`, `stats`, `logs`); an unknown name in
+  `options` is an error, not a silent skip. Backup defaults to every
+  configuration section (logs and stats off). Restore defaults leave
+  `authConfig`, `clusterConfig` and `webServiceSettings` off, because those
+  replace the users and tokens (including the one making the call), the web
+  service port/TLS, and cluster membership; pass them in `options` to restore
+  them.
 
 ## Data model
 
