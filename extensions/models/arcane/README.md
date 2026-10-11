@@ -16,13 +16,13 @@ swamp extension pull @thomas/arcane
 
 ## Configuration
 
-| Global arg            | Notes                                                                                      |
-| --------------------- | ------------------------------------------------------------------------------------------ |
-| `baseUrl`             | Arcane base URL incl. port, e.g. `https://arcane.example.com:8443`                         |
-| `apiKey`              | `X-API-Key`. **Supply via vault:** `${{ vault.get(arcane, api_key) }}` (sensitive)         |
-| `environmentId`       | Arcane environment id; `0` = local Docker. Swarm methods need a swarm-manager environment. |
-| `skipTlsVerify`       | Accept self-signed certs (default `false`)                                                 |
-| `repository`, `syncs` | Desired GitOps repo connection + sync list, reconciled by `gitops_*`                       |
+| Global arg            | Notes                                                                                                                                              |
+| --------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `baseUrl`             | Arcane base URL incl. port, e.g. `https://arcane.example.com:8443`. Over `http://` the API key is sent in clear text; the `reachable` check warns. |
+| `apiKey`              | `X-API-Key`. **Supply via vault:** `${{ vault.get(arcane, api_key) }}` (sensitive)                                                                 |
+| `environmentId`       | Arcane environment id; `0` = local Docker. Swarm methods need a swarm-manager environment.                                                         |
+| `skipTlsVerify`       | Accept self-signed certs (default `false`)                                                                                                         |
+| `repository`, `syncs` | Desired GitOps repo connection + sync list, reconciled by `gitops_*`                                                                               |
 
 ## Usage
 
@@ -51,23 +51,40 @@ swamp model method run arcane-prod swarm_stack_deploy \
 swamp model method run arcane-prod swarm_stack_remove --input '{"name":"unifi"}'
 ```
 
+**Keep secrets out of the compose file.** `envContent` is marked sensitive, so
+swamp redacts it and refuses a literal value in a definition. `composeContent`
+is not, so that a definition can hold a literal compose file, and swamp may echo
+it in run output. Put secret values in `envContent` (from
+`${{ vault.get(...) }}`) or an `envPath` `.env` file, and reference them from
+the compose file as `${VAR}`.
+
+`docker compose` and Arcane quote an interpolated value in some errors
+(`invalid containerPort: <value>`). Methods that take a `.env` replace its
+values with `[redacted]` in the errors they throw and the `operation-result`
+records they write. Only exact values of four characters or more are masked: a
+shorter value would garble every message, and an error quoting part of a value
+is not caught.
+
 ## Method sections
 
 - **`version`** — read Arcane's version (current + newest available). Use it
   before and after an upgrade.
 - **`gitops_*`** — drive Arcane Git Sync: `gitops_repo_list` /
-  `gitops_repo_ensure`, `gitops_sync_list` / `gitops_sync_ensure`,
-  `gitops_sync_trigger`, and `gitops_sync_status` (fan-out health view: per-sync
-  `lastSyncStatus` / `lastSyncError` / `lastSyncCommit` / `nextSyncAt`; use it
-  to find a sync whose scheduled runs are failing without anyone noticing).
+  `gitops_repo_ensure` / `gitops_repo_delete`, `gitops_sync_list` /
+  `gitops_sync_ensure`, `gitops_sync_trigger`, and `gitops_sync_status` (fan-out
+  health view: per-sync `lastSyncStatus` / `lastSyncError` / `lastSyncCommit` /
+  `nextSyncAt`; use it to find a sync whose scheduled runs are failing without
+  anyone noticing).
 - **`project_*`** — compose projects. Lifecycle: `project_list`, `project_get`,
   `project_up` / `project_down` / `project_redeploy` / `project_restart` /
   `project_pull` / `project_destroy`. `project_redeploy` is pull + compose up,
   which leaves an unchanged container running; `project_restart` restarts the
   containers in place (it does not start a project that is down, or pick up
-  compose changes). Direct (API) authoring: `project_validate`,
-  `project_create`, `project_update`. Orchestration: `project_deploy`
-  (validated, mode-aware, rolls back by default).
+  compose changes). `project_destroy` deletes each project's directory on the
+  host, including its compose file and `.env`; volumes are kept. Direct (API)
+  authoring: `project_validate`, `project_create`, `project_update`.
+  Orchestration: `project_deploy` (validated, mode-aware, rolls back by
+  default).
 - **`secret_*` / `config_*`** — swarm secret/config CRUD plus `secret_rotate` /
   `config_rotate` (create-v2 → re-point services → wait converged → remove-v1).
 - **`swarm_service_*`** — `swarm_service_list` / `swarm_service_get` /
@@ -93,21 +110,34 @@ swamp model method run arcane-prod swarm_stack_remove --input '{"name":"unifi"}'
   polls health, and re-applies the prior content on failure (or tears down a
   failed first deploy).
 - **GitOps mode** — content lives in a git repo pulled by Arcane Git Sync.
-  `project_deploy` triggers the sync and redeploys; it refuses inline content,
-  because in this mode the content comes from git through the sync. Auto git
-  rollback is **not** implemented; on failure it reports the error and leaves
-  the `git revert` to you.
+  `project_deploy` runs the sync that manages the project and redeploys; it
+  refuses inline compose or `.env` content, because in this mode the content
+  comes from git through the sync. It stops before the redeploy if Arcane no longer lists that
+  sync, reports the sync failed, is already running it, or does not answer
+  (Arcane runs a sync for up to 5 minutes inside the request). Auto git rollback
+  is **not** implemented; on failure it reports the error and leaves the
+  `git revert` to you.
 
 `project_deploy` detects the mode from Arcane's `gitOpsManagedBy` field.
 
 In both modes, `healthTimeoutSec` (default 300) covers the redeploy and the
-health wait together. Healthy means status `running`, every service running, and
-no healthcheck reporting `unhealthy` or still `starting`. Arcane keeps running a
-redeploy after the call gives up, so when the redeploy runs out of time, its
-connection breaks, or its response ends without a done or error line,
-`project_deploy` does not roll back on top of it: it fails and leaves the
-project for you to check in Arcane. An HTTP error or an error line from Arcane
-is a definite failure and is rolled back.
+health wait together. A rollback gets the same time again, so a failed direct
+deploy can take up to twice `healthTimeoutSec`. Healthy means status `running`,
+every service running, and no healthcheck reporting `unhealthy` or still
+`starting`, on two checks in a row, `pollIntervalSec` apart; the second check
+catches a container without a healthcheck that was seen running between
+restarts. A read that fails during the wait counts as not yet healthy, and the
+wait carries on. A service that exits on purpose, such as an init or migration job,
+therefore never passes: a project with one is rolled back at the timeout. Arcane
+keeps running a redeploy after the call gives up, so when the redeploy runs out
+of time, its connection breaks, or its response ends without a done or error
+line, `project_deploy` does not roll back on top of it: it fails and leaves the
+project for you to check in Arcane. The same goes for an HTTP 502, 503 or 504,
+which a proxy sends, as does Arcane when its call to a remote environment fails.
+Any other HTTP error, or an error line from Arcane, is a definite failure and is
+rolled back.
+
+`project_deploy` refuses an archived project; unarchive it in Arcane first.
 
 Swarm methods need Arcane to see the environment as swarm-enabled. Arcane stores
 that flag and refreshes it only at startup, so after `docker swarm init` outside
@@ -143,9 +173,16 @@ Arcane's `/swarm/stacks` API:
    `swarm_stack_validate` exposes this step on its own (returns the rendered
    services/networks/volumes/ secrets/configs + warnings).
 2. **Deploy** — `POST /swarm/stacks` with the compose content (optional `prune`
-   to drop services no longer in the file, `envContent` for a `.env`).
+   to drop services no longer in the file, `envContent` for a `.env`). Arcane
+   deploys inside the request, so the call waits up to 30 minutes. A timeout, a
+   broken connection or a 502, 503 or 504 fails the method with a note that the
+   deploy may still be running.
 3. **Poll convergence** — waits up to `convergeTimeoutSec` (default 180s) for
-   the stack's services to reach their target replica counts.
+   the stack's services to reach their target replica counts and for any rolling
+   update to complete. The first look comes one `pollIntervalSec` after the
+   deploy, because until swarm starts a rolling update the old tasks still count
+   as running. An update that swarm pauses or rolls back fails the deploy at
+   once.
 
 A stack that deploys but **does not converge is left in place** and the method
 throws. It is **not** force-removed and **not** auto-rolled-back. Inspect with
@@ -169,12 +206,17 @@ is recorded as a `swarm-stack` resource.
 ## Swarm rotation notes
 
 - Swarm secrets/configs are **immutable**, so values are rotated, never updated
-  in place: `secret_rotate` / `config_rotate` create a new version, re-point
-  every referencing service's spec (preserving the mount path), wait for
-  convergence, then remove the old object.
+  in place: `secret_rotate` / `config_rotate` find the services that reference
+  the old object (checking any named in `services` first), create a new version,
+  re-point each service's spec (preserving the mount path), wait for each
+  service's rolling update to complete, then remove the old object. If a
+  re-point fails, the error names the new version and the services already
+  re-pointed. The old object stays until swarm reports the update `completed`,
+  so a rollback still finds it.
 - Secret/config **values must come from a vault** — never inline them.
-- An in-use object is **never force-removed**; if Docker returns 409 the old
-  object is left in place and the conflict is surfaced.
+- An in-use object is **never force-removed**. Swarm refuses to remove one
+  (Arcane answers 400, "in use by the following service"); the rotation then
+  leaves the old object in place and records why.
 - Swarm methods require `environmentId` to point at a **swarm-manager**
   environment; against a non-swarm/worker environment Arcane returns 409/403.
 
@@ -186,8 +228,9 @@ Docker-level housekeeping via Arcane (works on any environment, not swarm-only):
 - `volume_remove` is **idempotent**: a volume that is already gone counts as
   removed. An in-use volume is **reported and left in place**. Arcane returns
   every delete failure as **HTTP 500** with Docker's message, so the method
-  matches on the message text. `force:true` bypasses Docker's in-use check but
-  risks data loss.
+  matches on the message text. There is no `force` option: Docker refuses an
+  in-use volume whatever is passed, so stop or remove the containers using it
+  first.
 - `volume_prune` removes only **unused anonymous** volumes (Docker's default; it
   does **not** touch named volumes). To remove a specific named volume use
   `volume_remove`.
@@ -202,8 +245,34 @@ value. A named volume held by a _stopped_ (not removed) container therefore
 can't be cleared until that container is removed (e.g. swarm task-history
 rotation); the per-type prunes above cover the rest.
 
+## GitOps notes
+
+- `gitops_sync_trigger` with no `names` runs every **deploy** sync. A backup
+  sync (one that commits to git) runs only when named, and
+  `gitops_sync_ensure prune:true` never deletes one, since `globalArgs.syncs`
+  describes deploy syncs only.
+- `gitops_repo_delete` removes a repository connection by name; one that is
+  already gone counts as deleted. It refuses a connection that a sync in this
+  environment uses. Arcane also refuses one used by a sync in any other
+  environment, with a bare HTTP 500, and the error says so.
+
 ## Breaking changes
 
+- **Data names start with their spec.** swamp keys stored data by model and
+  name, not spec, so a `sync` and a `sync-status` both named `web` used to
+  overwrite each other. Records are now named `<spec>:<key>`, for example
+  `sync:web`, `sync-status:web`, `project:web`, `project-detail:web:prior`,
+  `operation-result:deploy:validate:web`,
+  `operation-result:secret_rotate:db_pw:repoint:web` and `swarm-task:<task id>`.
+  Single-instance records use the spec alone (`arcane-version`). In a key, `/`,
+  `\`, `..`, `:` and `%` are percent-encoded, so a compose path becomes
+  `validation:projects%2Fweb%2Fcompose.yaml`, and `swarm-stack-render` keeps the
+  stack name as given instead of a lossy slug. Records written by earlier
+  versions keep their old names and are not migrated. Read one with
+  `swamp data query 'modelName == "arcane-prod" && name == "sync:web"' --json`.
+- **Project lifecycle methods act once per name.** A name repeated in `names`
+  used to run the action twice. `gitops_sync_ensure` now refuses a sync name
+  listed twice in `globalArgs.syncs`, which used to create two syncs.
 - **`project_create` and `project_update` no longer take `validate`.** Both
   always validate the compose file locally and stop if validation fails or
   cannot run. A `validate: false` still passed is ignored.
@@ -216,6 +285,64 @@ rotation); the per-type prunes above cover the rest.
   `healthTimeoutSec: 0` used to switch the timeout off.
 - **`healthTimeoutSec` defaults to 300** (was 120), since it now covers the
   image pull as well as the health wait.
+- **`envContent` arguments are sensitive.** `project_validate`,
+  `project_create`, `project_update`, `project_deploy`, `swarm_stack_validate`
+  and `swarm_stack_deploy` mark `envContent` sensitive, as `project-detail`
+  already did, because a `.env` carries secrets. swamp redacts it, and refuses a
+  literal value in a definition: pass it as `${{ vault.get(...) }}` or use
+  `envPath`.
+- **A failed sync fails `gitops_sync_trigger`.** Arcane answers 200 with
+  `success: false` when a sync fails or is already running. The method used to
+  record that as success; it now records each sync's real result, with Arcane's
+  message in `detail`, and throws if any failed. It also waits for the sync to
+  finish (up to 30 minutes) instead of giving up after 30 seconds. A sync that
+  gets no answer is recorded with `status: 0` and the remaining syncs still run.
+- **GitOps `project_deploy` uses the sync named by `gitOpsManagedBy`.** That
+  field holds the sync's id. The method used to look for a sync named like the
+  project and, finding none, redeployed the old content and recorded a
+  successful sync. It now throws if Arcane no longer lists the managing sync,
+  and stops before the redeploy when the sync fails, is already running, or
+  gives no answer. It also refuses `envContent` and `envPath`, which it used to
+  ignore without saying so.
+- **`volume_remove` no longer takes `force`.** Docker refuses an in-use volume
+  before it looks at `force`, so the option never did what it described. A
+  `force` still passed is ignored.
+- **Step records describe one run.** `project_deploy`, `swarm_stack_deploy` and
+  the rotation methods write a record per step. A run now deletes the step
+  records of earlier runs that it did not reach, so the latest records never mix
+  two runs. Rotation step records are keyed by the object rotated (and the
+  service, for per-service steps), where they used to be keyed by the step's
+  target alone.
+- **`project_deploy` needs two healthy checks in a row**, so a deploy takes one
+  `pollIntervalSec` longer.
+- **`gitops_sync_trigger` with no `names` skips backup syncs, and prune never
+  deletes one.** Both used to include them.
+- **`gitops_sync_ensure` keeps an existing sync's project name when the spec
+  omits `projectName`.** It used to reset it to the sync's `name`. A new sync
+  still defaults to `name`.
+- **Timeouts are capped at a day.** `convergeTimeoutSec`, `removeTimeoutSec` and
+  the rotation methods' `healthTimeoutSec` now refuse more than 86400, as
+  `project_deploy`'s `healthTimeoutSec` already did.
+- **`syncInterval` must be positive.** Arcane stored 0 or a negative interval
+  but ran the sync every minute.
+- **An unrecognised Arcane answer is an error.** A list in a shape the extension
+  does not know, or a create answered without an id, used to read as an empty
+  list or an empty id: an ensure could then create duplicates, and a first
+  deploy redeployed `/projects//`. Both now throw.
+- **Project lookups include archived projects.** Arcane's list leaves them out,
+  so `project_get`, `project_update` and the lifecycle methods called an
+  archived project "not found", and `project_deploy` tried to create it again.
+  `project_deploy` now refuses an archived project; the others get Arcane's own
+  answer.
+- **An HTTP 502, 503 or 504 on `project_deploy`'s redeploy or sync is outcome
+  unknown.** The deploy is no longer rolled back on top of it.
+- **`prune-result.itemsDeleted` is 0 when nothing was deleted**, rather than
+  missing.
+- **Swarm convergence waits for the rolling update.**
+  `swarm_service_force_update`, `secret_rotate`, `config_rotate` and
+  `swarm_stack_deploy` used to pass on the old tasks straight after the change,
+  before swarm had replaced any. They now take until the update completes, and
+  rotation keeps the old object until then.
 
 ## Fixes
 
@@ -240,8 +367,27 @@ rotation); the per-type prunes above cover the rest.
 - **A redeploy with an unknown outcome is not rolled back.** After a timeout, a
   broken connection or a cut-short response, Arcane may still be running it, and
   a rollback would race it.
+- **A rollback removes a `.env` the failed deploy added.** Arcane leaves an
+  empty `.env` out of the project it returns, so the rollback used to keep the
+  new one; it now sends an empty `.env` back.
 - **Request time limits cover the whole request.** They used to reset whenever
   data arrived, so a streamed operation printing progress could run past them.
   Long operations get 30 minutes, more than Arcane's own limits.
 - **New `project_restart`**, using Arcane's restart, since `project_redeploy`
   does not restart an unchanged project.
+- **`gitops_sync_ensure` checks every repository first.** It used to create or
+  update the syncs before one naming an unknown repository, then throw.
+- **`secret_rotate` and `config_rotate` check `services` before creating the new
+  version**, so a misspelt name no longer leaves an unused one behind.
+- **`swarm-service.updateState` is filled in by `swarm_service_get`.** Arcane's
+  service list has no update status, so the field was always empty; the list
+  still leaves it out.
+- **`volume_remove` records the volume's name as its id**, which is how Docker
+  identifies a volume, instead of an empty string.
+- **A rollback whose redeploy outcome is unknown says so**, instead of "ROLLBACK
+  FAILED".
+- **The `reachable` check tells a rejected key from an unreachable Arcane**, and
+  warns when `baseUrl` is `http://`.
+- **New `gitops_repo_delete`.**
+- **Every method logs when it starts and finishes**, with `{name}`-style
+  placeholders for its values.
