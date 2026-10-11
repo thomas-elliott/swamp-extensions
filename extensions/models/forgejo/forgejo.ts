@@ -50,9 +50,11 @@ import type {
  * not named `*_ensure`. A CI webhook carries a shared secret that only the CI
  * server holds, so the CI server registers it (Woodpecker: `repo_repair`).
  * This model reports WHERE every hook currently points, so a stale target is
- * visible instead of failing to deliver unnoticed. `webhook_retarget` writes
- * `config.url` alone and never sends a `secret` key, which would overwrite
- * the stored one.
+ * visible instead of failing to deliver unnoticed. `webhook_retarget` changes
+ * `config.url`, sending the hook's own events, branch filter and
+ * authorization header back with it because Forgejo resets all three on any
+ * edit that leaves them out. It never sends a `secret` key, which would
+ * overwrite the stored one.
  */
 
 // ─────────────────────────── global arguments ───────────────────────────
@@ -65,7 +67,7 @@ const GlobalArgs = z.object({
     "Forgejo access token (Settings → Applications). Supply via vault: " +
       "${{ vault.get(<vault>, forgejo/api_token) }}",
   ),
-  httpTimeoutMs: z.coerce.number().int().default(30000).describe(
+  httpTimeoutMs: z.coerce.number().int().positive().default(30000).describe(
     "Per-request timeout (ms) for API calls.",
   ),
 });
@@ -163,8 +165,30 @@ const BranchProtectionInfo = z.object({
   pushWhitelistUsernames: z.array(z.string()).describe(
     "Logins allowed to push directly (only meaningful with the whitelist on).",
   ),
+  pushWhitelistTeams: z.array(z.string()).describe(
+    "Teams allowed to push directly (only meaningful with the whitelist on).",
+  ),
+  pushWhitelistDeployKeys: z.boolean().describe(
+    "True = deploy keys with write access may push too (whitelist on).",
+  ),
+  enableMergeWhitelist: z.boolean().describe(
+    "True = only the merge whitelists below may merge PRs into this branch.",
+  ),
+  mergeWhitelistUsernames: z.array(z.string()),
+  mergeWhitelistTeams: z.array(z.string()),
   requiredApprovals: z.number().describe(
     "Approving reviews needed before a PR into this branch may merge.",
+  ),
+  enableApprovalsWhitelist: z.boolean().describe(
+    "True = only approvals from the approvals whitelists below count.",
+  ),
+  approvalsWhitelistUsernames: z.array(z.string()),
+  approvalsWhitelistTeams: z.array(z.string()),
+  dismissStaleApprovals: z.boolean().describe(
+    "True = a new commit dismisses existing approvals.",
+  ),
+  ignoreStaleApprovals: z.boolean().describe(
+    "True = approvals given on an older commit do not count.",
   ),
   requireSignedCommits: z.boolean(),
   applyToAdmins: z.boolean().describe(
@@ -172,12 +196,17 @@ const BranchProtectionInfo = z.object({
       "able to push straight through it.",
   ),
   blockOnRejectedReviews: z.boolean(),
+  blockOnOfficialReviewRequests: z.boolean(),
   blockOnOutdatedBranch: z.boolean(),
   enableStatusCheck: z.boolean(),
   statusCheckContexts: z.array(z.string()),
   protectedFilePatterns: z.string().describe(
     "Semicolon-separated globs that may not be changed on this branch even " +
       "by a whitelisted pusher — the CI-config guard.",
+  ),
+  unprotectedFilePatterns: z.string().describe(
+    "Semicolon-separated globs a pusher may change even when direct push " +
+      "is otherwise refused.",
   ),
   action: Action,
   timestamp: z.string(),
@@ -223,8 +252,9 @@ const PrInfo = z.object({
   base: z.string().describe("Target branch ref."),
   author: z.string().optional().describe("Login of the PR author."),
   ciState: z.string().optional().describe(
-    "Combined commit status of the head SHA: success | pending | failure | " +
-      "error | none (no statuses reported). Only populated on a single-PR fetch.",
+    "Combined commit status of the head SHA: success | pending | warning | " +
+      "failure | skipped | none (no statuses reported). Forgejo reports an " +
+      "error status as failure. Only populated on a single-PR fetch.",
   ),
   htmlUrl: z.string().optional(),
   additions: z.number().optional(),
@@ -304,15 +334,28 @@ function baseUrl(g: GlobalArgsT): string {
   return g.apiUrl.replace(/\/+$/, "");
 }
 
+/**
+ * Fetch and read the whole body within one timeout. The body is read inside
+ * the timed section because `fetch` resolves once the headers arrive: a
+ * server that then stalls mid-body would otherwise hang the method.
+ */
 async function fetchWithTimeout(
   url: string,
   init: RequestInit,
   timeoutMs: number,
-): Promise<Response> {
+): Promise<{ status: number; text: string }> {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
-    return await fetch(url, { ...init, signal: ctrl.signal });
+    const res = await fetch(url, { ...init, signal: ctrl.signal });
+    return { status: res.status, text: await res.text() };
+  } catch (e) {
+    if (ctrl.signal.aborted) {
+      throw new Error(
+        `${init.method ?? "GET"} ${url} timed out after ${timeoutMs} ms`,
+      );
+    }
+    throw e;
   } finally {
     clearTimeout(t);
   }
@@ -329,12 +372,11 @@ async function realCaller(g: GlobalArgsT, c: ApiCall): Promise<ApiResult> {
     headers["content-type"] = "application/json";
     body = JSON.stringify(c.body);
   }
-  const res = await fetchWithTimeout(
+  const { status, text } = await fetchWithTimeout(
     `${baseUrl(g)}${c.path}`,
     { method: c.method, headers, body },
     g.httpTimeoutMs,
   );
-  const text = await res.text();
   let parsed: Json = {};
   if (text) {
     try {
@@ -343,7 +385,7 @@ async function realCaller(g: GlobalArgsT, c: ApiCall): Promise<ApiResult> {
       parsed = { raw: text };
     }
   }
-  return { status: res.status, body: parsed };
+  return { status, body: parsed };
 }
 
 /** Dispatch through the test override if set, else the real fetch caller. */
@@ -400,6 +442,14 @@ function logInfo(
   context.logger?.info?.(message, props ?? {});
 }
 
+function logWarning(
+  context: Pick<Ctx, "logger">,
+  message: string,
+  props?: Record<string, unknown>,
+): void {
+  context.logger?.warn?.(message, props ?? {});
+}
+
 function nowIso(): string {
   return new Date().toISOString();
 }
@@ -409,12 +459,35 @@ function asArray(v: unknown): Json[] {
 }
 
 /**
- * Make a string safe as a swamp data instance name. swamp rejects names
- * containing `/`, `\`, `..`, or null bytes (path-traversal guard), and a repo
- * full name like `owner/name` contains a slash.
+ * Build a data instance name: the spec, then each key part, joined by `:`.
+ * swamp keys stored data by model + name, not by spec, so without the spec
+ * prefix a repo's `repo` and `mirror` records would overwrite each other.
+ *
+ * Each part is escaped (`%`, `:`, `/`, `\`, NUL as `%XX`, `..` as `.%2E`) so
+ * two different keys never share a name and swamp's banned sequences never
+ * appear. Forgejo owner, repo and user names contain none of these, so they
+ * appear unescaped; only patterns like the rule `agents/*` change.
+ *
+ * @param spec The spec name passed to `writeResource`.
+ * @param parts The key parts, already unique within the spec.
+ * @returns e.g. `repo:apps:web`, `pull_request:apps:web:4`, `server`.
  */
-function safeName(s: string): string {
-  return s.replace(/[\\/]/g, ":").replace(/\.\./g, "_").replace(/\0/g, "");
+export function dataName(spec: string, ...parts: string[]): string {
+  const escaped = parts.map((p) =>
+    p
+      .replace(/[%:/\\\0]/g, (c) =>
+        "%" + c.charCodeAt(0).toString(16).toUpperCase().padStart(2, "0"))
+      .replace(/\.\./g, ".%2E")
+  );
+  return [spec, ...escaped].join(":");
+}
+
+/**
+ * The key parts of a repo, lowercased: Forgejo owner and repo names are
+ * case-insensitive, so `Apps/Web` and `apps/web` must land on one record.
+ */
+function repoKey(fullName: string): string[] {
+  return fullName.toLowerCase().split("/");
 }
 
 function enc(s: string): string {
@@ -469,20 +542,50 @@ const PAGE_LIMIT = 50;
  * string; `limit`/`page` are appended with the right separator. Stops at the
  * first empty page: the server caps `limit` at its MAX_RESPONSE_ITEMS, so a
  * short page does not mean the last one.
+ *
+ * Returns null when the FIRST page answers with a status in `allowFirst`
+ * (e.g. 403 for a repo whose hooks the token may not read); any other error
+ * status throws.
  */
-async function pageAll(g: GlobalArgsT, path: string): Promise<Json[]> {
+async function pageAllOrNull(
+  g: GlobalArgsT,
+  path: string,
+  allowFirst: number[],
+): Promise<Json[] | null> {
   const sep = path.includes("?") ? "&" : "?";
   const out: Json[] = [];
+  let previousFirst: string | undefined;
   for (let page = 1;; page++) {
-    const r = await call(g, {
+    const c: ApiCall = {
       method: "GET",
       path: `${path}${sep}limit=${PAGE_LIMIT}&page=${page}`,
-    });
+    };
+    const r = page === 1
+      ? await callTolerant(g, c, allowFirst)
+      : await call(g, c);
+    if (r.status >= 400) return null;
     const items = listItems(r.body);
     if (items.length === 0) break;
+    // A server or proxy that ignores `page` would hand back the same page
+    // forever. Stop with an error rather than loop, or return a list that
+    // may be missing items.
+    const first = JSON.stringify(items[0]);
+    if (first === previousFirst) {
+      throw new Error(
+        `Forgejo API GET ${path} returned the same items for page ${page} ` +
+          `as for page ${page - 1}; the server ignores paging, so the ` +
+          "listing cannot be read in full.",
+      );
+    }
+    previousFirst = first;
     out.push(...items);
   }
   return out;
+}
+
+/** {@link pageAllOrNull} for listings where any error status should throw. */
+async function pageAll(g: GlobalArgsT, path: string): Promise<Json[]> {
+  return (await pageAllOrNull(g, path, [])) ?? [];
 }
 
 /** Every repo of one owner, which may be an org or a user. */
@@ -637,14 +740,29 @@ function toProtectionInfo(
     enablePush: Boolean(p.enable_push),
     enablePushWhitelist: Boolean(p.enable_push_whitelist),
     pushWhitelistUsernames: strs(p.push_whitelist_usernames),
+    pushWhitelistTeams: strs(p.push_whitelist_teams),
+    pushWhitelistDeployKeys: Boolean(p.push_whitelist_deploy_keys),
+    enableMergeWhitelist: Boolean(p.enable_merge_whitelist),
+    mergeWhitelistUsernames: strs(p.merge_whitelist_usernames),
+    mergeWhitelistTeams: strs(p.merge_whitelist_teams),
     requiredApprovals: Number(p.required_approvals ?? 0),
+    enableApprovalsWhitelist: Boolean(p.enable_approvals_whitelist),
+    // Forgejo's field name is singular here, unlike the other whitelists.
+    approvalsWhitelistUsernames: strs(p.approvals_whitelist_username),
+    approvalsWhitelistTeams: strs(p.approvals_whitelist_teams),
+    dismissStaleApprovals: Boolean(p.dismiss_stale_approvals),
+    ignoreStaleApprovals: Boolean(p.ignore_stale_approvals),
     requireSignedCommits: Boolean(p.require_signed_commits),
     applyToAdmins: Boolean(p.apply_to_admins),
     blockOnRejectedReviews: Boolean(p.block_on_rejected_reviews),
+    blockOnOfficialReviewRequests: Boolean(
+      p.block_on_official_review_requests,
+    ),
     blockOnOutdatedBranch: Boolean(p.block_on_outdated_branch),
     enableStatusCheck: Boolean(p.enable_status_check),
     statusCheckContexts: strs(p.status_check_contexts),
     protectedFilePatterns: String(p.protected_file_patterns ?? ""),
+    unprotectedFilePatterns: String(p.unprotected_file_patterns ?? ""),
     action,
     timestamp: nowIso(),
   };
@@ -660,11 +778,27 @@ function protectionBody(
   current: Json | null,
 ): { body: Json; changed: boolean } {
   const body: Json = {};
-  const same = (a: unknown, b: unknown): boolean =>
-    Array.isArray(a) && Array.isArray(b)
-      ? a.length === b.length && a.every((x, i) => String(x) === String(b[i]))
-      : a === b;
-  const diff = (key: string, want: unknown, cur: unknown) => {
+  // Lists are compared as sets: Forgejo returns whitelist names in its own
+  // order, not the order they were sent in, so comparing by position would
+  // report drift on every run. Logins are case-insensitive; status-check
+  // contexts are not.
+  const sameSet = (fold: boolean) => (a: unknown, b: unknown): boolean => {
+    const norm = (v: unknown) =>
+      new Set(
+        (Array.isArray(v) ? v : []).map((x) =>
+          fold ? String(x).toLowerCase() : String(x)
+        ),
+      );
+    const x = norm(a);
+    const y = norm(b);
+    return x.size === y.size && [...x].every((v) => y.has(v));
+  };
+  const diff = (
+    key: string,
+    want: unknown,
+    cur: unknown,
+    same: (a: unknown, b: unknown) => boolean = (a, b) => a === b,
+  ) => {
     if (want === undefined) return;
     if (current !== null && same(want, cur)) return;
     body[key] = want;
@@ -695,9 +829,8 @@ function protectionBody(
   diff(
     "push_whitelist_usernames",
     desired.pushWhitelistUsernames,
-    Array.isArray(current?.push_whitelist_usernames)
-      ? current.push_whitelist_usernames
-      : [],
+    current?.push_whitelist_usernames,
+    sameSet(true),
   );
   diff(
     "required_approvals",
@@ -732,9 +865,8 @@ function protectionBody(
   diff(
     "status_check_contexts",
     desired.statusCheckContexts,
-    Array.isArray(current?.status_check_contexts)
-      ? current.status_check_contexts
-      : [],
+    current?.status_check_contexts,
+    sameSet(false),
   );
   diff(
     "protected_file_patterns",
@@ -852,9 +984,27 @@ function toPrInfo(
 }
 
 /**
+ * How good each commit-status state is, worst first, as Forgejo ranks them
+ * when it combines statuses. The combined endpoint already reports `error` as
+ * `failure`, so `error` never reaches {@link combinedCiState}.
+ */
+const CI_STATE_RANK: Record<string, number> = {
+  failure: 1,
+  warning: 2,
+  pending: 3,
+  success: 4,
+  skipped: 5,
+};
+
+/**
  * Combined CI state of a commit, from its statuses. Returns `"none"` when the
  * commit carries no status at all. That is NOT a pass: a repo with CI
  * disabled and a repo whose pipeline never started both return `"none"`.
+ *
+ * The combined-status endpoint is paginated by context: each page holds the
+ * latest status of a different set of contexts, and its `state` covers only
+ * that page. So every page is read and the worst state wins; reading page 1
+ * alone could report `success` while a failing context sits on page 2.
  */
 async function combinedCiState(
   g: GlobalArgsT,
@@ -862,13 +1012,23 @@ async function combinedCiState(
   name: string,
   sha: string,
 ): Promise<string> {
-  const r = await callTolerant(g, {
-    method: "GET",
-    path: `${repoPath(owner, name)}/commits/${enc(sha)}/status`,
-  }, [404]);
-  if (r.status === 404) return "none";
-  const state = String(r.body.state ?? "");
-  return state === "" ? "none" : state;
+  const path = `${repoPath(owner, name)}/commits/${enc(sha)}/status`;
+  let worst = "none";
+  for (let page = 1;; page++) {
+    const r = await callTolerant(g, {
+      method: "GET",
+      path: `${path}?limit=${PAGE_LIMIT}&page=${page}`,
+    }, [404]);
+    if (r.status === 404 || asArray(r.body.statuses).length === 0) break;
+    const state = String(r.body.state ?? "");
+    // A state Forgejo does not rank is treated as the worst, so it can never
+    // read as green.
+    const rank = CI_STATE_RANK[state] ?? 0;
+    if (worst === "none" || rank < (CI_STATE_RANK[worst] ?? 0)) {
+      worst = state;
+    }
+  }
+  return worst;
 }
 
 /** Fetch one PR by index, or null when it does not exist. */
@@ -892,6 +1052,35 @@ async function getPrOrNull(
 function bareRef(ref: string): string {
   const i = ref.indexOf(":");
   return i === -1 ? ref : ref.slice(i + 1);
+}
+
+/**
+ * A clone URL without its `user:password@` part, safe to log or show in an
+ * error. Forgejo stores the source URL the same way (sanitised), so this is
+ * also the form to compare against `original_url`. A string that is not an
+ * absolute URL (e.g. `git@host:o/r`) is returned unchanged.
+ */
+function withoutUserinfo(u: string): string {
+  let url: URL;
+  try {
+    url = new URL(u);
+  } catch {
+    return u;
+  }
+  if (!url.username && !url.password) return u;
+  url.username = "";
+  url.password = "";
+  return url.toString();
+}
+
+/**
+ * The owner of a PR head's repo: the `owner` of an `owner:branch` (or
+ * `owner/repo:branch`) head, or `repoOwner` for a bare branch, which lives in
+ * the PR's own repo.
+ */
+function headOwner(ref: string, repoOwner: string): string {
+  const i = ref.indexOf(":");
+  return i === -1 ? repoOwner : ref.slice(0, i).split("/")[0];
 }
 
 /** Normalise clone URLs for drift comparison (.git suffix, trailing /, case). */
@@ -995,26 +1184,20 @@ const OrgEnsureArgs = z.object({
   fullName: z.string().optional().describe("Display name to converge."),
 });
 
-/**
- * A strict boolean. `z.coerce.boolean()` runs `Boolean(v)`, so `"0"` and
- * `"False"` become true; this accepts only true/false and their strings.
- */
-const StrictBool = z.union(
-  [z.boolean(), z.literal("true"), z.literal("false")],
-  { error: 'expected true or false (or the strings "true" / "false")' },
-).transform((v) => v === true || v === "true");
-
 /** The repo settings `repo_ensure` converges (all optional; only supplied ones are applied). */
 const RepoSettingsShape = {
-  private: StrictBool.optional().describe("Repo visibility."),
+  private: z.boolean().optional().describe(
+    "Repo visibility. A new repo is private unless this is false; when " +
+      "omitted, an existing repo keeps its visibility.",
+  ),
   description: z.string().optional().describe("Repo description."),
   defaultBranch: z.string().optional().describe("Default branch name."),
-  hasWiki: StrictBool.optional().describe("Enable the wiki unit."),
-  hasIssues: StrictBool.optional().describe("Enable the issues unit."),
-  hasPullRequests: StrictBool.optional().describe(
+  hasWiki: z.boolean().optional().describe("Enable the wiki unit."),
+  hasIssues: z.boolean().optional().describe("Enable the issues unit."),
+  hasPullRequests: z.boolean().optional().describe(
     "Enable the pull-requests unit.",
   ),
-  hasReleases: StrictBool.optional().describe(
+  hasReleases: z.boolean().optional().describe(
     "Enable the releases unit.",
   ),
 };
@@ -1041,25 +1224,25 @@ const CollaboratorEnsureArgs = z.object({
 
 /** The branch-protection settings the ensure method converges. */
 const ProtectionSettingsShape = {
-  enablePush: StrictBool.optional().describe(
+  enablePush: z.boolean().optional().describe(
     "Allow direct pushes. False makes the branch PR-only.",
   ),
-  enablePushWhitelist: StrictBool.optional().describe(
+  enablePushWhitelist: z.boolean().optional().describe(
     "Limit direct push to the whitelist (requires enablePush).",
   ),
   pushWhitelistUsernames: z.array(z.string()).optional().describe(
     "Logins allowed to push directly. Converged as an exact set.",
   ),
-  requiredApprovals: z.coerce.number().int().optional().describe(
+  requiredApprovals: z.coerce.number().int().min(0).optional().describe(
     "Approving reviews required before merge.",
   ),
-  requireSignedCommits: StrictBool.optional(),
-  applyToAdmins: StrictBool.optional().describe(
+  requireSignedCommits: z.boolean().optional(),
+  applyToAdmins: z.boolean().optional().describe(
     "Bind repo admins to the rule too. Without this an admin bypasses it.",
   ),
-  blockOnRejectedReviews: StrictBool.optional(),
-  blockOnOutdatedBranch: StrictBool.optional(),
-  enableStatusCheck: StrictBool.optional(),
+  blockOnRejectedReviews: z.boolean().optional(),
+  blockOnOutdatedBranch: z.boolean().optional(),
+  enableStatusCheck: z.boolean().optional(),
   statusCheckContexts: z.array(z.string()).optional(),
   protectedFilePatterns: z.string().optional().describe(
     "Semicolon-separated globs that may not be changed on this branch, e.g. " +
@@ -1117,8 +1300,8 @@ const MirrorEnsureArgs = z.object({
       'periodic sync). Defaults to "8h0m0s" on create; when omitted, an ' +
       "existing mirror keeps its interval.",
   ),
-  lfs: StrictBool.default(true).describe("Mirror LFS objects too."),
-  private: StrictBool.optional().describe(
+  lfs: z.boolean().default(true).describe("Mirror LFS objects too."),
+  private: z.boolean().optional().describe(
     "Mirror visibility. Defaults to private on create; when omitted, an " +
       "existing mirror keeps its visibility.",
   ),
@@ -1166,12 +1349,13 @@ const PrMergeArgs = z.object({
   ).describe("Merge strategy (Forgejo's `Do`)."),
   title: z.string().optional().describe("Merge commit title override."),
   message: z.string().optional().describe("Merge commit message override."),
-  deleteBranch: StrictBool.default(false).describe(
+  deleteBranch: z.boolean().default(false).describe(
     "Delete the head branch after a successful merge.",
   ),
-  force: StrictBool.default(false).describe(
-    "Merge even when the head commit's combined CI state is failure/error/" +
-      "pending. Without this, a non-green PR is refused.",
+  force: z.boolean().default(false).describe(
+    "Merge even when the head commit's combined CI state is anything but " +
+      "success (failure, warning, pending, or none). Without this, a " +
+      "non-green PR is refused.",
   ),
 });
 
@@ -1185,8 +1369,28 @@ const PrMergeArgs = z.object({
  */
 export const model = {
   type: "@thomas/forgejo",
-  version: "2026.09.04.2",
+  version: "2026.10.11.1",
   globalArguments: GlobalArgs,
+  upgrades: [
+    {
+      toVersion: "2026.10.11.1",
+      description:
+        "httpTimeoutMs must now be positive; a zero or negative value is " +
+        "dropped so the 30000 ms default applies. Stored data is not " +
+        "rewritten: new runs write instance names as <spec>:<key>, so " +
+        "records under the old names stop being the latest.",
+      upgradeAttributes: (
+        old: Record<string, unknown>,
+      ): Record<string, unknown> => {
+        // Only a literal non-positive number is dropped; an expression string
+        // is left for swamp to resolve.
+        const timeout = old.httpTimeoutMs;
+        if (typeof timeout !== "number" || timeout > 0) return old;
+        const { httpTimeoutMs: _dropped, ...rest } = old;
+        return rest;
+      },
+    },
+  ],
   checks: {
     "reachable": {
       description:
@@ -1210,6 +1414,18 @@ export const model = {
             return {
               pass: false,
               errors: [`GET /api/v1/user -> HTTP ${r.status}: ${errMsg(r)}`],
+            };
+          }
+          // Any web server answers 200 to some page. Only a Forgejo user
+          // object, with its login, proves apiUrl points at the API.
+          if (typeof r.body.login !== "string") {
+            return {
+              pass: false,
+              errors: [
+                `GET /api/v1/user at ${g.apiUrl} answered HTTP ${r.status} ` +
+                `without a user login; apiUrl may not point at a Forgejo ` +
+                `server.`,
+              ],
             };
           }
           return { pass: true };
@@ -1298,12 +1514,16 @@ export const model = {
           method: "GET",
           path: "/api/healthz",
         }, [503]);
-        const handle = await context.writeResource("server", "status", {
-          version: String(v.body.version ?? "unknown"),
-          healthy: hz.status < 400,
-          action: "observed",
-          timestamp: nowIso(),
-        });
+        const handle = await context.writeResource(
+          "server",
+          dataName("server"),
+          {
+            version: String(v.body.version ?? "unknown"),
+            healthy: hz.status < 400,
+            action: "observed",
+            timestamp: nowIso(),
+          },
+        );
         return { dataHandles: [handle] };
       },
     },
@@ -1323,7 +1543,10 @@ export const model = {
           handles.push(
             await context.writeResource(
               "org",
-              safeName(String(o.name ?? o.username ?? o.id)),
+              dataName(
+                "org",
+                String(o.name ?? o.username ?? o.id).toLowerCase(),
+              ),
               toOrgInfo(o, "observed"),
             ),
           );
@@ -1354,7 +1577,7 @@ export const model = {
           handles.push(
             await context.writeResource(
               "repo",
-              safeName(String(r.full_name ?? r.id)),
+              dataName("repo", ...repoKey(String(r.full_name ?? r.id))),
               toRepoInfo(r, "observed"),
             ),
           );
@@ -1379,7 +1602,7 @@ export const model = {
           handles.push(
             await context.writeResource(
               "user",
-              safeName(String(u.login ?? u.id)),
+              dataName("user", String(u.login ?? u.id).toLowerCase()),
               {
                 id: Number(u.id ?? 0),
                 login: String(u.login ?? ""),
@@ -1423,19 +1646,15 @@ export const model = {
         logInfo(context, "Auditing mirrors");
         const found = await pageAll(g, "/api/v1/repos/search?mode=mirror");
         const handles: DataHandle[] = [];
+        // Search results are full repo objects: Forgejo fills in
+        // mirror_interval and mirror_updated for every mirror, so no per-repo
+        // fetch is needed.
         for (const m of found) {
-          // The search payload omits mirror fields, so fetch the full repo.
-          const owner = String(((m.owner ?? {}) as Json).login ?? "");
-          const name = String(m.name ?? "");
-          const r = await call(g, {
-            method: "GET",
-            path: repoPath(owner, name),
-          });
           handles.push(
             await context.writeResource(
               "mirror",
-              safeName(String(r.body.full_name ?? `${owner}/${name}`)),
-              toMirrorInfo(r.body, a.staleFactor, "observed"),
+              dataName("mirror", ...repoKey(String(m.full_name ?? m.id))),
+              toMirrorInfo(m, a.staleFactor, "observed"),
             ),
           );
         }
@@ -1467,39 +1686,46 @@ export const model = {
         } else {
           repos = a.owner
             ? await ownerRepos(g, a.owner)
-            : await pageAll(g, "/api/v1/repos/search?q=");
+            : await pageAll(g, "/api/v1/repos/search");
         }
 
         logInfo(context, "Auditing webhooks", { repos: repos.length });
         const handles: DataHandle[] = [];
+        let skipped = 0;
         for (const r of repos) {
           const owner = String(((r.owner ?? {}) as Json).login ?? "");
           const name = String(r.name ?? "");
           const full = String(r.full_name ?? `${owner}/${name}`);
-          // A token without admin on a repo cannot list its hooks. Log and
+          // A token without admin on a repo cannot list its hooks. Warn and
           // skip the repo rather than fail the whole audit.
-          const res = await callTolerant(g, {
-            method: "GET",
-            path: hooksPath(owner, name),
-          }, [403, 404]);
-          if (res.status >= 400) {
-            logInfo(context, "Skipping repo: hooks not readable", {
+          const hooks = await pageAllOrNull(g, hooksPath(owner, name), [
+            403,
+            404,
+          ]);
+          if (hooks === null) {
+            logWarning(context, "Skipping repo: hooks not readable", {
               repo: full,
-              status: res.status,
             });
+            skipped++;
             continue;
           }
-          for (const h of listItems(res.body)) {
+          for (const h of hooks) {
             const info = toWebhookInfo(full, h, a.expectedUrl, "observed");
             handles.push(
               await context.writeResource(
                 "webhook",
-                safeName(`${full}:${info.id}`),
+                dataName("webhook", ...repoKey(full), String(info.id)),
                 info,
               ),
             );
           }
         }
+        // The output records hooks only, so say here whether it is partial.
+        logInfo(context, "Webhook audit done", {
+          repos: repos.length,
+          hooks: handles.length,
+          skippedRepos: skipped,
+        });
         return { dataHandles: handles };
       },
     },
@@ -1511,7 +1737,10 @@ export const model = {
         "it never creates a hook, never sends or clears the stored secret, and " +
         "carries the existing query string over verbatim (a CI hook's " +
         "?access_token= is what authenticates it). Idempotent — " +
-        "already-correct is a no-op.",
+        "already-correct is a no-op. The hook's events are sent back as " +
+        "Forgejo lists them, which can widen a hook set to part of an event " +
+        "group (e.g. issues opened but not labelled) to the whole group; a " +
+        "warning is logged when the events change.",
       arguments: WebhookRetargetArgs,
       execute: async (
         rawArgs,
@@ -1521,11 +1750,7 @@ export const model = {
         const g = context.globalArgs;
         const full = `${a.owner}/${a.name}`;
 
-        const listed = await call(g, {
-          method: "GET",
-          path: hooksPath(a.owner, a.name),
-        });
-        const hooks = listItems(listed.body);
+        const hooks = await pageAll(g, hooksPath(a.owner, a.name));
         if (hooks.length === 0) {
           throw new Error(
             `${full} has no webhooks to retarget. This method deliberately ` +
@@ -1602,13 +1827,32 @@ export const model = {
           });
           updated = r.body;
           action = "updated";
+          // Forgejo lists events by group name but reads a group name back as
+          // "every event in the group", and it cannot be told "send
+          // everything" through this endpoint. So a hook set to part of a
+          // group, or to everything, comes back with different events. That
+          // cannot be avoided here, only reported.
+          const before = new Set(Array.isArray(hook.events) ? hook.events : []);
+          const after = new Set(
+            Array.isArray(r.body.events) ? r.body.events : [],
+          );
+          const changed = before.size !== after.size ||
+            [...before].some((e) => !after.has(e));
+          if (changed) {
+            logWarning(context, "Retargeting changed the hook's events", {
+              repo: full,
+              hook: Number(hook.id),
+              before: [...before],
+              after: [...after],
+            });
+          }
         }
 
         return {
           dataHandles: [
             await context.writeResource(
               "webhook",
-              safeName(`${full}:${Number(hook.id)}`),
+              dataName("webhook", ...repoKey(full), String(Number(hook.id))),
               toWebhookInfo(full, updated, a.url, action),
             ),
           ],
@@ -1679,7 +1923,7 @@ export const model = {
         }
         const handle = await context.writeResource(
           "org",
-          safeName(a.name),
+          dataName("org", a.name.toLowerCase()),
           toOrgInfo({ ...org, name: org.name ?? a.name }, action),
         );
         return { dataHandles: [handle] };
@@ -1690,7 +1934,8 @@ export const model = {
         "Find-or-create a repository under an org or user and converge the " +
         "supplied settings (visibility/description/default branch/units). " +
         "Idempotent — reports created/updated/unchanged. Never touches git " +
-        "content.",
+        "content. Fails when the default branch does not exist, since " +
+        "Forgejo would silently keep the old one.",
       arguments: RepoEnsureArgs,
       execute: async (
         rawArgs,
@@ -1702,13 +1947,15 @@ export const model = {
         let action: z.infer<typeof Action>;
         if (repo === null) {
           // Create under the right namespace: the token user's own account
-          // uses /user/repos, anything else is an org.
+          // uses /user/repos, anything else is an org. Logins are
+          // case-insensitive, so `Swamp` is the token user `swamp`.
           const me = await whoami(g);
-          const path = a.owner === me
+          const own = a.owner.toLowerCase() === me.toLowerCase();
+          const path = own
             ? "/api/v1/user/repos"
             : `/api/v1/orgs/${enc(a.owner)}/repos`;
           logInfo(context, "Creating repo", { repo: `${a.owner}/${a.name}` });
-          const r = await call(g, {
+          const r = await callTolerant(g, {
             method: "POST",
             path,
             body: {
@@ -1717,7 +1964,16 @@ export const model = {
               description: a.description,
               default_branch: a.defaultBranch,
             },
-          });
+          }, own ? [] : [404]);
+          if (r.status === 404) {
+            throw new Error(
+              `No organization "${a.owner}" on ${g.apiUrl}. repo_ensure ` +
+                `creates repos under an org or under the token's own user ` +
+                `(${me}). If "${a.owner}" is another user, that needs the ` +
+                "admin endpoint /admin/users/{user}/repos, which this method " +
+                "does not use. For an org, create it first with org_ensure.",
+            );
+          }
           repo = r.body;
           action = "created";
           // Unit toggles are not part of the create payload — converge them
@@ -1743,6 +1999,21 @@ export const model = {
               path: repoPath(a.owner, a.name),
               body,
             });
+            // Forgejo silently keeps the old default branch when the new one
+            // does not exist on a non-empty repo. Without this check every
+            // run would PATCH again and report "updated".
+            if (
+              body.default_branch !== undefined &&
+              r.body.default_branch !== body.default_branch
+            ) {
+              throw new Error(
+                `${a.owner}/${a.name}: Forgejo kept default branch ` +
+                  `"${String(r.body.default_branch ?? "")}" instead of ` +
+                  `"${String(body.default_branch)}", which means that ` +
+                  "branch does not exist. Push it first. Any other settings " +
+                  "in this call were applied.",
+              );
+            }
             repo = r.body;
             action = "updated";
           } else {
@@ -1751,8 +2022,11 @@ export const model = {
         }
         const handle = await context.writeResource(
           "repo",
-          safeName(String(repo.full_name ?? `${a.owner}/${a.name}`)),
-          toRepoInfo(repo, action!),
+          dataName(
+            "repo",
+            ...repoKey(String(repo.full_name ?? `${a.owner}/${a.name}`)),
+          ),
+          toRepoInfo(repo, action),
         );
         return { dataHandles: [handle] };
       },
@@ -1762,8 +2036,12 @@ export const model = {
         "Grant a user access to a repository at a given permission level, or " +
         "converge an existing grant. Converges the collaboration row: a user " +
         "who is not a collaborator is added even when they can already read " +
-        "the repo (public repos grant everyone read). Idempotent — reports " +
-        "created/updated/unchanged. Never removes a collaborator.",
+        "the repo (public repos grant everyone read). Reports created/" +
+        "updated/unchanged, comparing against the user's effective " +
+        "permission level (team access included), because Forgejo exposes no " +
+        "other: when team access is above the requested level, the method " +
+        "PUTs the requested level again and reports updated on every run. " +
+        "Never removes a collaborator.",
       arguments: CollaboratorEnsureArgs,
       execute: async (
         rawArgs,
@@ -1775,9 +2053,17 @@ export const model = {
         const collabPath = `${repoPath(a.owner, a.name)}/collaborators/${
           enc(a.user)
         }`;
+        // Only the owning user is refused by name. The permission probe below
+        // also reads "owner" for a site admin or an owner of the owning org,
+        // and those can still be collaborators.
+        if (a.user.toLowerCase() === a.owner.toLowerCase()) {
+          throw new Error(
+            `${a.user} owns ${full} — a collaborator grant cannot apply to ` +
+              "the repo owner.",
+          );
+        }
         // The permission probe reports the EFFECTIVE access mode, so a
-        // non-collaborator reads as "read" on a public repo and the owner as
-        // "owner", which no PUT can produce and must never be downgraded.
+        // non-collaborator reads as "read" on a public repo.
         const probe = await callTolerant(g, {
           method: "GET",
           path: `${collabPath}/permission`,
@@ -1785,12 +2071,6 @@ export const model = {
         const effective = probe.status === 404
           ? "none"
           : String(probe.body.permission ?? "none");
-        if (effective === "owner") {
-          throw new Error(
-            `${a.user} owns ${full} — a collaborator grant cannot apply to ` +
-              "the repo owner.",
-          );
-        }
         // Membership is checked separately: 204 for a collaborator, 404 for
         // anyone else. Only an existing collaborator can be left unchanged.
         const membership = await callTolerant(g, {
@@ -1819,7 +2099,7 @@ export const model = {
         }
         const handle = await context.writeResource(
           "collaborator",
-          safeName(`${full}:${a.user}`),
+          dataName("collaborator", ...repoKey(full), a.user.toLowerCase()),
           {
             repo: full,
             user: a.user,
@@ -1886,7 +2166,7 @@ export const model = {
         }
         const handle = await context.writeResource(
           "branch_protection",
-          safeName(`${full}:${a.rule}`),
+          dataName("branch_protection", ...repoKey(full), a.rule),
           toProtectionInfo(full, rule, action),
         );
         return { dataHandles: [handle] };
@@ -1914,7 +2194,7 @@ export const model = {
           handles.push(
             await context.writeResource(
               "branch_protection",
-              safeName(`${full}:${info.ruleName}`),
+              dataName("branch_protection", ...repoKey(full), info.ruleName),
               info,
             ),
           );
@@ -1946,7 +2226,7 @@ export const model = {
         if (existing === null) {
           logInfo(context, "Creating pull-mirror", {
             repo: `${a.owner}/${a.name}`,
-            source: a.cloneAddr,
+            source: withoutUserinfo(a.cloneAddr),
           });
           const body: Json = {
             clone_addr: a.cloneAddr,
@@ -1984,13 +2264,14 @@ export const model = {
         } else {
           // Existing mirror: the source URL is fixed at migration time, so a
           // different requested source is drift that no PATCH can fix.
+          // Forgejo reports the source without credentials, so a cloneAddr
+          // carrying `user:token@` is compared, and shown, without them too.
           const orig = String(existing.original_url ?? "");
-          if (
-            orig && normalizeCloneUrl(orig) !== normalizeCloneUrl(a.cloneAddr)
-          ) {
+          const want = withoutUserinfo(a.cloneAddr);
+          if (orig && normalizeCloneUrl(orig) !== normalizeCloneUrl(want)) {
             throw new Error(
               `${a.owner}/${a.name} already mirrors ${orig}, not ` +
-                `${a.cloneAddr}. A mirror's source cannot be changed in ` +
+                `${want}. A mirror's source cannot be changed in ` +
                 "place — delete the mirror manually in the UI and re-run, " +
                 "or use a different repo name.",
             );
@@ -2033,7 +2314,10 @@ export const model = {
         }
         const handle = await context.writeResource(
           "mirror",
-          safeName(String(repo.full_name ?? `${a.owner}/${a.name}`)),
+          dataName(
+            "mirror",
+            ...repoKey(String(repo.full_name ?? `${a.owner}/${a.name}`)),
+          ),
           toMirrorInfo(repo, 2, action),
         );
         return { dataHandles: [handle] };
@@ -2068,7 +2352,10 @@ export const model = {
         });
         const handle = await context.writeResource(
           "mirror",
-          safeName(String(repo.full_name ?? `${a.owner}/${a.name}`)),
+          dataName(
+            "mirror",
+            ...repoKey(String(repo.full_name ?? `${a.owner}/${a.name}`)),
+          ),
           toMirrorInfo(repo, 2, "triggered"),
         );
         return { dataHandles: [handle] };
@@ -2101,7 +2388,11 @@ export const model = {
           handles.push(
             await context.writeResource(
               "pull_request",
-              safeName(`${a.owner}/${a.name}#${p.number ?? p.id}`),
+              dataName(
+                "pull_request",
+                ...repoKey(`${a.owner}/${a.name}`),
+                String(p.number ?? p.id),
+              ),
               toPrInfo(p, "observed"),
             ),
           );
@@ -2131,7 +2422,11 @@ export const model = {
           : "none";
         const handle = await context.writeResource(
           "pull_request",
-          safeName(`${a.owner}/${a.name}#${a.index}`),
+          dataName(
+            "pull_request",
+            ...repoKey(`${a.owner}/${a.name}`),
+            String(a.index),
+          ),
           toPrInfo(pr, "observed", {
             mergeable: typeof pr.mergeable === "boolean"
               ? pr.mergeable
@@ -2155,6 +2450,10 @@ export const model = {
         const a = PrEnsureArgs.parse(rawArgs);
         const g = context.globalArgs;
         const wantHead = bareRef(a.head);
+        // The API reports the bare branch name, so the head's repo owner is
+        // compared too: `alice:fix` must not match bob's `fix`, or a `fix`
+        // branch in this repo. An unqualified head is a branch in this repo.
+        const wantHeadOwner = headOwner(a.head, a.owner).toLowerCase();
         const open = await pageAll(
           g,
           `${prPath(a.owner, a.name)}?state=open`,
@@ -2162,7 +2461,9 @@ export const model = {
         const existing = open.find((p) => {
           const h = (p.head ?? {}) as Json;
           const b = (p.base ?? {}) as Json;
+          const owner = ((h.repo ?? {}) as Json).owner as Json | undefined;
           return String(h.ref ?? "") === wantHead &&
+            String(owner?.login ?? "").toLowerCase() === wantHeadOwner &&
             String(b.ref ?? "") === a.base;
         });
         let pr: Json;
@@ -2206,7 +2507,11 @@ export const model = {
         }
         const handle = await context.writeResource(
           "pull_request",
-          safeName(`${a.owner}/${a.name}#${pr.number ?? 0}`),
+          dataName(
+            "pull_request",
+            ...repoKey(`${a.owner}/${a.name}`),
+            String(pr.number ?? 0),
+          ),
           toPrInfo(pr, action),
         );
         return { dataHandles: [handle] };
@@ -2219,7 +2524,9 @@ export const model = {
         "Merge a pull request. NOT REVERSIBLE — this writes to the base " +
         "branch. Refuses a PR that is closed, already merged, draft, or not " +
         "mergeable; refuses a non-green head unless force=true. Verifies the " +
-        "PR before acting.",
+        "PR before acting, and merges only the head commit it checked: if " +
+        "the branch moves in between, nothing is merged and the error says " +
+        "to re-run.",
       arguments: PrMergeArgs,
       execute: async (
         rawArgs,
@@ -2267,7 +2574,10 @@ export const model = {
           strategy: a.strategy,
           ciState,
         });
-        await call(g, {
+        // head_commit_id pins the merge to the head that was checked above.
+        // Without it, a push landing between the check and this POST would be
+        // merged with CI unchecked.
+        const merge = await callTolerant(g, {
           method: "POST",
           path: `${prPath(a.owner, a.name, a.index)}/merge`,
           body: {
@@ -2275,15 +2585,52 @@ export const model = {
             MergeTitleField: a.title,
             MergeMessageField: a.message,
             delete_branch_after_merge: a.deleteBranch,
+            head_commit_id: sha,
           },
-        });
+        }, [409]);
+        if (merge.status === 409) {
+          if (errMsg(merge) === "head out of date") {
+            throw new Error(
+              `${ref} head moved past ${sha.slice(0, 8)} while it was being ` +
+                "checked, so nothing was merged. Re-run pr_merge to check " +
+                "and merge the new head.",
+            );
+          }
+          throw new Error(
+            `Forgejo API POST ${prPath(a.owner, a.name, a.index)}/merge -> ` +
+              `HTTP 409: ${errMsg(merge)}`,
+          );
+        }
         // Re-fetch: the merge response has no body, and the data output
-        // records the merged PR's state.
-        const after = await getPrOrNull(g, a.owner, a.name, a.index) ?? pr;
+        // records the merged PR's state. The merge has already happened, so
+        // a failed re-fetch must not fail the method: a caller would retry
+        // and get "already merged". Fall back to what was checked.
+        const assumed = { ...pr, merged: true, state: "closed" };
+        let after: Json;
+        try {
+          after = await getPrOrNull(g, a.owner, a.name, a.index) ?? assumed;
+        } catch (e) {
+          logWarning(context, "Merged, but could not re-read the PR", {
+            repo: `${a.owner}/${a.name}`,
+            index: a.index,
+            error: (e as Error).message,
+          });
+          after = assumed;
+        }
+        // Once deleteBranch has removed the head branch, Forgejo reports the
+        // head as `refs/pull/<n>/head`. Record the branch that was merged.
+        const merged = {
+          ...after,
+          head: { ...((after.head ?? {}) as Json), ref: head.ref },
+        };
         const handle = await context.writeResource(
           "pull_request",
-          safeName(ref),
-          toPrInfo(after, "merged", { ciState }),
+          dataName(
+            "pull_request",
+            ...repoKey(`${a.owner}/${a.name}`),
+            String(a.index),
+          ),
+          toPrInfo(merged, "merged", { ciState }),
         );
         return { dataHandles: [handle] };
       },
@@ -2342,7 +2689,10 @@ async function setArchived(
   }
   const handle = await context.writeResource(
     "repo",
-    safeName(String(repo.full_name ?? `${a.owner}/${a.name}`)),
+    dataName(
+      "repo",
+      ...repoKey(String(repo.full_name ?? `${a.owner}/${a.name}`)),
+    ),
     toRepoInfo(repo, action),
   );
   return { dataHandles: [handle] };
