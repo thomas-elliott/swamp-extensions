@@ -103,9 +103,11 @@ swamp model method run arcane-prod swarm_stack_remove --input '{"name":"unifi"}'
 In both modes, `healthTimeoutSec` (default 300) covers the redeploy and the
 health wait together. Healthy means status `running`, every service running, and
 no healthcheck reporting `unhealthy` or still `starting`. Arcane keeps running a
-redeploy after the call gives up, so when the redeploy itself runs out of time
+redeploy after the call gives up, so when the redeploy runs out of time, its
+connection breaks, or its response ends without a done or error line,
 `project_deploy` does not roll back on top of it: it fails and leaves the
-project for you to check in Arcane.
+project for you to check in Arcane. An HTTP error or an error line from Arcane
+is a definite failure and is rolled back.
 
 Swarm methods need Arcane to see the environment as swarm-enabled. Arcane stores
 that flag and refreshes it only at startup, so after `docker swarm init` outside
@@ -235,8 +237,9 @@ rotation); the per-type prunes above cover the rest.
   body and could report the old containers as a healthy deploy; it and
   `project_up`/`project_pull`/`project_redeploy` now fail on an error line or a
   body cut short.
-- **A timed-out redeploy is not rolled back.** Arcane may still be running it,
-  and a rollback would race it.
+- **A redeploy with an unknown outcome is not rolled back.** After a timeout, a
+  broken connection or a cut-short response, Arcane may still be running it, and
+  a rollback would race it.
 - **Request time limits cover the whole request.** They used to reset whenever
   data arrived, so a streamed operation printing progress could run past them.
   Long operations get 30 minutes, more than Arcane's own limits.

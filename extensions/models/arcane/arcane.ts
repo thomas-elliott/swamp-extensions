@@ -321,8 +321,11 @@ const REQUEST_TIMEOUT_MS = 30_000;
 // project_deploy bounds its redeploys by healthTimeoutSec instead.
 const OPERATION_TIMEOUT_MS = 30 * 60_000;
 
-/** A redeploy that outlived its budget; Arcane may still be running it. */
-class RedeployTimeout extends Error {}
+/**
+ * A redeploy whose outcome is unknown: the call timed out, the connection broke,
+ * or the stream ended without a done or error line. Arcane may still be running it.
+ */
+class RedeployOutcomeUnknown extends Error {}
 
 type GlobalArgsT = z.infer<typeof GlobalArgs>;
 /** A parsed JSON object. */
@@ -380,17 +383,24 @@ function safeJson(body: string): unknown {
  * has to be read to know whether it worked. A body with neither was cut short.
  */
 export function streamFailure(body: unknown): string | undefined {
+  const end = streamEnd(body);
+  if (end === undefined) return "the response ended without Arcane's done line";
+  return end.error;
+}
+
+/** How a streamed Arcane body ended: done, an error line, or neither (undefined). */
+function streamEnd(body: unknown): { error?: string } | undefined {
   const lines = typeof body === "string" ? body.split("\n") : [body];
   let done = false;
   for (const line of lines) {
     const obj = typeof line === "string" ? safeJson(line.trim()) : line;
     if (!obj || typeof obj !== "object") continue;
     if (typeof (obj as Json).error === "string") {
-      return (obj as Json).error as string;
+      return { error: (obj as Json).error as string };
     }
     if ((obj as Json).done === true) done = true;
   }
-  return done ? undefined : "the response ended without Arcane's done line";
+  return done ? {} : undefined;
 }
 
 /** Signature of the Arcane HTTP transport, swappable via {@link __setArcaneTransport}. */
@@ -838,7 +848,7 @@ async function pollProjectHealthy(
       }${runtimeError ? ` (runtime view failed: ${runtimeError})` : ""}`,
     };
     if (last.healthy || Date.now() >= deadline) return last;
-    await sleep(intervalSec * 1000);
+    await sleep(Math.min(intervalSec * 1000, deadline - Date.now()));
   }
 }
 
@@ -856,25 +866,33 @@ async function redeployAndPoll(
   intervalSec: number,
 ): Promise<HealthResult> {
   const deadline = Date.now() + timeoutSec * 1000;
+  let body: unknown;
   try {
-    const failure = streamFailure(
-      await arcane(
-        g,
-        "POST",
-        `${ENV(g)}/projects/${id}/redeploy`,
-        undefined,
-        timeoutSec * 1000,
-      ),
+    body = await arcane(
+      g,
+      "POST",
+      `${ENV(g)}/projects/${id}/redeploy`,
+      undefined,
+      timeoutSec * 1000,
     );
-    if (failure !== undefined) throw new Error(`redeploy failed: ${failure}`);
   } catch (e) {
-    if (e instanceof Error && /request timed out/.test(e.message)) {
-      throw new RedeployTimeout(
-        `redeploy did not finish within healthTimeoutSec (${timeoutSec}s); Arcane may still be running it`,
-      );
-    }
-    throw e;
+    const msg = e instanceof Error ? e.message : String(e);
+    // An HTTP status is Arcane's answer. Anything else (our time limit, a proxy
+    // or socket cutting the stream) leaves the redeploy running or not, unknown.
+    if (/-> HTTP \d{3}/.test(msg)) throw e;
+    throw new RedeployOutcomeUnknown(
+      /request timed out/.test(msg)
+        ? `redeploy did not finish within healthTimeoutSec (${timeoutSec}s); Arcane may still be running it`
+        : `redeploy connection broke (${msg}); Arcane may still be running it`,
+    );
   }
+  const end = streamEnd(body);
+  if (end === undefined) {
+    throw new RedeployOutcomeUnknown(
+      "redeploy response ended without a done or error line; Arcane may still be running it",
+    );
+  }
+  if (end.error !== undefined) throw new Error(`redeploy failed: ${end.error}`);
   const leftSec = Math.max(0, (deadline - Date.now()) / 1000);
   return await pollProjectHealthy(g, id, leftSec, intervalSec);
 }
@@ -1348,13 +1366,13 @@ const ProjectDeployArgs = z.object({
     .describe(
       "How long the redeploy and the wait for the project to become healthy may take together",
     ),
-  pollIntervalSec: z.number().int().positive().default(5),
+  pollIntervalSec: z.number().int().positive().max(3600).default(5),
 });
 
 const SwarmServiceForceUpdateArgs = z.object({
   name: z.string().describe("Swarm service name (e.g. unifi_unifi)"),
   convergeTimeoutSec: z.number().int().positive().default(180),
-  pollIntervalSec: z.number().int().positive().default(5),
+  pollIntervalSec: z.number().int().positive().max(3600).default(5),
 });
 
 const SwarmStackValidateArgs = z.object({
@@ -1375,7 +1393,7 @@ const SwarmStackDeployArgs = z.object({
     "Remove services no longer present in the compose file",
   ),
   convergeTimeoutSec: z.number().int().positive().default(180),
-  pollIntervalSec: z.number().int().positive().default(5),
+  pollIntervalSec: z.number().int().positive().max(3600).default(5),
 });
 
 const SwarmStackRemoveArgs = z.object({
@@ -1383,7 +1401,7 @@ const SwarmStackRemoveArgs = z.object({
   removeTimeoutSec: z.number().int().positive().default(30).describe(
     "Max seconds to keep re-issuing DELETE until the stack record 404s",
   ),
-  pollIntervalSec: z.number().int().positive().default(2),
+  pollIntervalSec: z.number().int().positive().max(3600).default(2),
 });
 
 const SwarmStackTasksArgs = z.object({
@@ -2319,7 +2337,7 @@ export const model = {
         //    failed redeploy throws (an HTTP error, or an error line in its streamed
         //    200 body) and takes the same rollback path as an unhealthy poll result.
         let failReason: string | undefined;
-        let timedOut = false;
+        let outcomeUnknown = false;
         let healthy = false;
         try {
           if (isFirstDeploy) {
@@ -2351,7 +2369,7 @@ export const model = {
           if (!healthy) failReason = `unhealthy: ${health.detail}`;
         } catch (e) {
           failReason = e instanceof Error ? e.message : String(e);
-          timedOut = e instanceof RedeployTimeout;
+          outcomeUnknown = e instanceof RedeployOutcomeUnknown;
           await record("apply", false, 0, failReason);
         }
 
@@ -2370,12 +2388,12 @@ export const model = {
 
         // 4. Failure path — roll back by default, but not on top of a redeploy
         //    Arcane is still running: the two would race.
-        if (timedOut) {
+        if (outcomeUnknown) {
           await record(
             "rollback",
             false,
             0,
-            "redeploy timed out and may still be running — no rollback attempted",
+            "redeploy outcome unknown and may still be running — no rollback attempted",
           );
           throw new Error(
             `deploy of '${name}' failed (${failReason}); no rollback attempted while it may still be running — check the project in Arcane`,
@@ -3288,7 +3306,7 @@ function makeRotate(
       `Remove the old ${kind} after successful convergence`,
     ),
     healthTimeoutSec: z.number().int().positive().default(180),
-    pollIntervalSec: z.number().int().positive().default(5),
+    pollIntervalSec: z.number().int().positive().max(3600).default(5),
   });
   return {
     [`${kind}_rotate`]: {
