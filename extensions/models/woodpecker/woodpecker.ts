@@ -19,10 +19,10 @@ import type {
  *
  * Scope: the model holds an admin PAT, so it has few methods and its mutations
  * are additive or reversible. It enables/configures repos and manages secrets;
- * the only disabling operations are `repo_disable` (re-enable to undo) and
- * secret deletes (re-create to undo). Secret VALUES are write-only: supplied via
- * a vault reference, sent once, and NEVER read back or emitted (Woodpecker's API
- * does not return them either).
+ * the only disabling operations are `repo_disable` (re-enable to undo), the
+ * secret deletes and `cron_delete` (re-create to undo). Secret VALUES are
+ * write-only: supplied via a vault reference, sent once, and NEVER read back or
+ * emitted (Woodpecker's API does not return them either).
  *
  * Auth: a Woodpecker personal access token (Settings → CLI and API). Per request
  * it is sent as `Authorization: Bearer <token>`. No token is minted or stored by
@@ -31,22 +31,25 @@ import type {
  * Idempotency: `repo_enable` finds-or-activates by `owner/name` and converges
  * the supplied settings in place; the `*_secret_set` methods create-or-update by
  * name. Each reports an `action` of created/updated/unchanged/… so a re-run is a
- * no-op when nothing changed.
+ * no-op when nothing changed. The exception is a secret set on an existing
+ * secret: the value cannot be read back to compare, so it is always sent and
+ * reported `updated`.
  */
 
 // ─────────────────────────── global arguments ───────────────────────────
 
 const GlobalArgs = z.object({
   apiUrl: z.string().describe(
-    "Woodpecker server base URL, e.g. https://tylo.ghost-eagle.ts.net:8443 " +
+    "Woodpecker server base URL, e.g. https://woodpecker.example.com " +
       "(no trailing /api).",
   ),
   token: z.string().meta({ sensitive: true }).describe(
     "Woodpecker personal access token (Settings → CLI and API). Supply via " +
       "vault: ${{ vault.get(<vault>, woodpecker/api_token) }}",
   ),
-  httpTimeoutMs: z.coerce.number().int().default(30000).describe(
-    "Per-request timeout (ms) for API calls.",
+  httpTimeoutMs: z.coerce.number().int().min(1).default(30000).describe(
+    "Per-request timeout (ms) for API calls. At least 1: zero or less would " +
+      "abort every request.",
   ),
 });
 
@@ -92,7 +95,7 @@ const RepoInfo = z.object({
   timeout: z.number().describe("Pipeline timeout in minutes."),
   visibility: z.string().describe("public | private | internal"),
   requireApproval: z.string().optional().describe(
-    "none | forks | pull_requests | all",
+    "none | forks | pull_requests | all_events",
   ),
   defaultBranch: z.string().optional(),
   action: Action,
@@ -156,6 +159,10 @@ const PipelineInfo = z.object({
   commit: z.string().optional(),
   message: z.string().optional(),
   createdAt: z.string().optional(),
+  timedOut: z.boolean().optional().describe(
+    "Written by pipeline_wait only: true when it gave up at timeoutSec " +
+      "before the pipeline finished, so `status` is not final.",
+  ),
   action: Action,
   timestamp: z.string(),
 });
@@ -163,8 +170,14 @@ const PipelineInfo = z.object({
 const PipelineStepInfo = z.object({
   repo: z.string(),
   pipelineNumber: z.number(),
-  workflow: z.string().describe("Parent workflow name."),
+  workflow: z.string().describe(
+    "Parent workflow name. A matrix pipeline has several workflows with the " +
+      "same name.",
+  ),
   name: z.string().describe("Step name."),
+  stepId: z.number().describe(
+    "Step id: unique, unlike the name. Pass it as `step` to `pipeline_logs`.",
+  ),
   state: z.string().describe(
     "pending | running | success | failure | skipped | killed | …",
   ),
@@ -240,6 +253,10 @@ const CronInfo = z.object({
   name: z.string(),
   schedule: z.string().describe("Cron expression or @hourly/@daily/… macro."),
   branch: z.string().optional(),
+  enabled: z.boolean().optional().describe(
+    "Whether the scheduler runs this cron. Absent on servers before v3.13, " +
+      "which have no such switch.",
+  ),
   nextExec: z.string().optional(),
   createdAt: z.string().optional(),
   action: Action,
@@ -290,15 +307,28 @@ function baseUrl(g: GlobalArgsT): string {
   return g.apiUrl.replace(/\/+$/, "");
 }
 
+/**
+ * Fetch and read the whole body under one timeout. Clearing the timer once the
+ * headers arrive would leave the body unbounded, so a server that then stalls
+ * mid-body would otherwise hang the method.
+ */
 async function fetchWithTimeout(
   url: string,
   init: RequestInit,
   timeoutMs: number,
-): Promise<Response> {
+): Promise<{ status: number; text: string }> {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
-    return await fetch(url, { ...init, signal: ctrl.signal });
+    const res = await fetch(url, { ...init, signal: ctrl.signal });
+    return { status: res.status, text: await res.text() };
+  } catch (e) {
+    if (ctrl.signal.aborted) {
+      throw new Error(
+        `${init.method ?? "GET"} ${url} timed out after ${timeoutMs} ms`,
+      );
+    }
+    throw e;
   } finally {
     clearTimeout(t);
   }
@@ -315,12 +345,11 @@ async function realCaller(g: GlobalArgsT, c: ApiCall): Promise<ApiResult> {
     headers["content-type"] = "application/json";
     body = JSON.stringify(c.body);
   }
-  const res = await fetchWithTimeout(
+  const { status, text } = await fetchWithTimeout(
     `${baseUrl(g)}${c.path}`,
     { method: c.method, headers, body },
     g.httpTimeoutMs,
   );
-  const text = await res.text();
   let parsed: Json = {};
   if (text) {
     try {
@@ -329,7 +358,7 @@ async function realCaller(g: GlobalArgsT, c: ApiCall): Promise<ApiResult> {
       parsed = { raw: text };
     }
   }
-  return { status: res.status, body: parsed };
+  return { status, body: parsed };
 }
 
 /** Dispatch through the test override if set, else the real fetch caller. */
@@ -385,6 +414,10 @@ const PAGE_SIZE = 50;
  * Fetch every row of a paginated list endpoint, requesting `page=1,2,...` until a
  * page comes back short. `limit` stops early (and trims) when the caller only
  * wants the first N.
+ *
+ * Every page asks for the same `perPage`, because the server computes the
+ * offset as `perPage * (page - 1)`: a smaller last page would re-read earlier
+ * rows instead of the next ones.
  */
 async function pageAll(
   g: GlobalArgsT,
@@ -394,16 +427,13 @@ async function pageAll(
   const sep = path.includes("?") ? "&" : "?";
   const rows: Json[] = [];
   for (let page = 1;; page++) {
-    const perPage = limit === undefined
-      ? PAGE_SIZE
-      : Math.min(PAGE_SIZE, limit - rows.length);
     const r = await call(g, {
       method: "GET",
-      path: `${path}${sep}page=${page}&perPage=${perPage}`,
+      path: `${path}${sep}page=${page}&perPage=${PAGE_SIZE}`,
     });
     const batch = asArray(r.body);
     rows.push(...batch);
-    if (batch.length < perPage) break;
+    if (batch.length < PAGE_SIZE) break;
     if (limit !== undefined && rows.length >= limit) break;
   }
   return limit === undefined ? rows : rows.slice(0, limit);
@@ -421,6 +451,21 @@ function logInfo(
   context.logger?.info?.(message, props ?? {});
 }
 
+/**
+ * The global args for a method run. Over plain http the admin token travels
+ * in clear, so every run says so; there is deliberately no setting to hide it.
+ */
+function serverArgs(context: Ctx): GlobalArgsT {
+  const g = context.globalArgs;
+  if (!/^https:\/\//i.test(g.apiUrl.trim())) {
+    context.logger?.warn?.(
+      "apiUrl is not https: the admin token is sent unencrypted",
+      { apiUrl: g.apiUrl },
+    );
+  }
+  return g;
+}
+
 function nowIso(): string {
   return new Date().toISOString();
 }
@@ -434,12 +479,35 @@ function looksLikeId(s: string): boolean {
 }
 
 /**
- * Make a string safe as a swamp data instance name. swamp rejects names
- * containing `/`, `\`, `..`, or null bytes (path-traversal guard), and a repo
- * full name like `owner/name` contains a slash.
+ * Read a number the API should always send and that a data name is built
+ * from. A missing one would name the record `…:undefined`, so it is an error.
  */
-function safeName(s: string): string {
-  return s.replace(/[\\/]/g, ":").replace(/\.\./g, "_").replace(/\0/g, "");
+function requireNumber(v: unknown, what: string): number {
+  const n = Number(v);
+  if (v == null || v === "" || !Number.isFinite(n)) {
+    throw new Error(`Woodpecker's response has no ${what}`);
+  }
+  return n;
+}
+
+/**
+ * The data instance name for a record: `<spec>:<key>`, or `<spec>` alone for a
+ * single-instance record. swamp keys data by model + name, not by spec, so the
+ * spec prefix stops two specs from overwriting each other.
+ *
+ * swamp rejects `/`, `\`, `..` and NUL in a name. Those are percent-escaped,
+ * with `%` escaped first, so two different keys can never map to one name
+ * (`octo-org/web` becomes `octo-org%2Fweb`).
+ */
+export function dataName(spec: string, key?: string): string {
+  if (key === undefined) return spec;
+  const safe = key
+    .replaceAll("%", "%25")
+    .replaceAll("/", "%2F")
+    .replaceAll("\\", "%5C")
+    .replaceAll("\0", "%00")
+    .replaceAll("..", ".%2E");
+  return `${spec}:${safe}`;
 }
 
 /** Normalise a raw repo object from the API into the {@link RepoInfo} shape. */
@@ -482,9 +550,31 @@ function toRepoInfo(r: Json, action: z.infer<typeof Action>): z.infer<
 async function resolveRepoId(g: GlobalArgsT, repo: string): Promise<number> {
   const ref = repo.trim();
   if (looksLikeId(ref)) return Number(ref);
+  return Number((await lookupRepo(g, ref)).id);
+}
+
+/**
+ * Resolve a repo reference to its id and full name, for the records that
+ * store the repo. A numeric id costs one GET for the name; an `owner/name`
+ * lookup returns it anyway. Storing the full name means `repo=1` and
+ * `repo=octo-org/web` write the same record contents.
+ */
+async function resolveRepo(
+  g: GlobalArgsT,
+  repo: string,
+): Promise<{ id: number; fullName: string }> {
+  const ref = repo.trim();
+  const body = looksLikeId(ref)
+    ? await getRepo(g, Number(ref))
+    : await lookupRepo(g, ref);
+  return { id: Number(body.id), fullName: String(body.full_name ?? ref) };
+}
+
+/** Look up an enabled repo by `owner/name`; throws if it is not enabled. */
+async function lookupRepo(g: GlobalArgsT, ref: string): Promise<Json> {
   if (!ref.includes("/")) {
     throw new Error(
-      `repo ${JSON.stringify(repo)} must be a numeric id or "owner/name"`,
+      `repo ${JSON.stringify(ref)} must be a numeric id or "owner/name"`,
     );
   }
   const r = await callTolerant(g, {
@@ -495,11 +585,11 @@ async function resolveRepoId(g: GlobalArgsT, repo: string): Promise<number> {
   }, [404]);
   if (r.status === 404 || !r.body.id) {
     throw new Error(
-      `repo ${JSON.stringify(repo)} is not enabled on this server ` +
+      `repo ${JSON.stringify(ref)} is not enabled on this server ` +
         `(run repo_enable first)`,
     );
   }
-  return Number(r.body.id);
+  return r.body;
 }
 
 /** Fetch the full repo object by id. */
@@ -508,19 +598,27 @@ async function getRepo(g: GlobalArgsT, id: number): Promise<Json> {
   return r.body;
 }
 
-/**
- * Resolve an org reference to its numeric id. Accepts a numeric id or an org /
- * user login (looked up via `/api/orgs/lookup`).
- */
-async function resolveOrgId(g: GlobalArgsT, owner: string): Promise<number> {
+/** The GET path for an org reference: a numeric id, or a login to look up. */
+function orgPath(owner: string): string {
   const ref = owner.trim();
-  if (looksLikeId(ref)) return Number(ref);
-  const r = await call(g, {
-    method: "GET",
-    path: `/api/orgs/lookup/${encodeURIComponent(ref)}`,
-  });
+  return looksLikeId(ref)
+    ? `/api/orgs/${ref}`
+    : `/api/orgs/lookup/${encodeURIComponent(ref)}`;
+}
+
+/**
+ * Resolve an org reference to its numeric id and name. Accepts a numeric id
+ * (fetched for its name) or an org / user login (looked up via
+ * `/api/orgs/lookup`), so `owner=7` and `owner=octo-org` store the same name.
+ */
+async function resolveOrg(
+  g: GlobalArgsT,
+  owner: string,
+): Promise<{ id: number; name: string }> {
+  const ref = owner.trim();
+  const r = await call(g, { method: "GET", path: orgPath(ref) });
   if (!r.body.id) throw new Error(`org ${JSON.stringify(owner)} not found`);
-  return Number(r.body.id);
+  return { id: Number(r.body.id), name: String(r.body.name ?? ref) };
 }
 
 /** Find a forge repo's `forge_remote_id` by full name (case-insensitive). */
@@ -571,8 +669,9 @@ async function forgeBindingHint(g: GlobalArgsT): Promise<string> {
     const me = await tokenForge(g);
     let who = `this token is ${me.login} on forge ${me.forgeId}`;
     try {
-      const f = listForges(g);
-      const mine = (await f).find((x) => Number(x.id) === me.forgeId);
+      const mine = (await listForges(g)).find((x) =>
+        Number(x.id) === me.forgeId
+      );
       if (mine) {
         who += ` (${String(mine.type ?? "?")}, ${String(mine.url ?? "?")})`;
       }
@@ -639,17 +738,22 @@ function buildRepoPatch(
   return { body, changed: Object.keys(body).length > 0 };
 }
 
-/** Write one secret (metadata only, never a value) into the data model. */
+/**
+ * Write one secret (metadata only, never a value) into the data model. The
+ * name uses the numeric org or repo id, so `owner=octo-org` and `owner=7`
+ * name the same secret alike.
+ */
 async function writeSecret(
   context: Ctx,
   scope: "org" | "repo",
+  ownerId: number,
   owner: string,
   raw: Json,
   action: z.infer<typeof Action>,
 ): Promise<DataHandle> {
   return await context.writeResource(
     "secret",
-    safeName(`${scope}:${owner}:${raw.name}`),
+    dataName("secret", `${scope}:${ownerId}:${raw.name}`),
     {
       scope,
       owner,
@@ -728,6 +832,9 @@ function toPipelineInfo(
   };
 }
 
+/** Stands in for a log line that is not valid base64, so the gap is visible. */
+const UNDECODABLE_LINE = "[undecodable log line]";
+
 /** Decode a base64 log payload to UTF-8 text (non-fatal: bad bytes → U+FFFD). */
 function b64decode(s: string): string {
   try {
@@ -736,7 +843,8 @@ function b64decode(s: string): string {
     for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
     return new TextDecoder().decode(bytes);
   } catch {
-    return "";
+    // An empty string would read as a blank line in the log.
+    return UNDECODABLE_LINE;
   }
 }
 
@@ -746,15 +854,17 @@ function sleep(ms: number): Promise<void> {
 
 /**
  * Statuses on which a wait loop stops. The full upstream set is in
- * `server/model/const.go`; a user cancel lands as `killed`, there is no
- * `canceled`. `blocked` is included because a pipeline awaiting approval
- * needs a person to act, so polling it only uses up the timeout.
+ * `server/model/const.go`. A user cancel lands as `killed`, or, since v3.14, as
+ * `canceled` when no workflow had started yet. `blocked` is included because a
+ * pipeline awaiting approval needs a person to act, so polling it only uses up
+ * the timeout.
  */
 const TERMINAL = new Set([
   "success",
   "failure",
   "error",
   "killed",
+  "canceled",
   "declined",
   "blocked",
   "skipped",
@@ -838,6 +948,7 @@ function toSteps(
         pipelineNumber,
         workflow: wfName,
         name: String(child.name ?? ""),
+        stepId: Number(child.id ?? 0),
         state: String(child.state ?? "unknown"),
         exitCode: child.exit_code != null ? Number(child.exit_code) : undefined,
         error: typeof child.error === "string" && child.error
@@ -851,22 +962,22 @@ function toSteps(
   return out;
 }
 
-/** Find a step (by name or numeric id) within a pipeline's workflows. */
+/**
+ * Find a step within a pipeline's workflows. An id match wins over a name
+ * match, because a name can repeat across workflows (matrix pipelines) and an
+ * id cannot; a repeated name returns the first step with it.
+ */
 function findStep(
   pipeline: Json,
   step: string,
 ): { id: number; name: string } | null {
   const want = step.trim();
-  for (const wf of asArray(pipeline.workflows)) {
-    for (const child of asArray(wf.children)) {
-      if (
-        String(child.name ?? "") === want || String(child.id ?? "") === want
-      ) {
-        return { id: Number(child.id ?? 0), name: String(child.name ?? "") };
-      }
-    }
-  }
-  return null;
+  const steps = asArray(pipeline.workflows).flatMap((wf) =>
+    asArray(wf.children)
+  );
+  const hit = steps.find((child) => String(child.id ?? "") === want) ??
+    steps.find((child) => String(child.name ?? "") === want);
+  return hit ? { id: Number(hit.id ?? 0), name: String(hit.name ?? "") } : null;
 }
 
 /** Normalise a raw agent object into {@link AgentInfo}, deriving `online`. */
@@ -900,11 +1011,78 @@ function toCron(
     name: String(c.name ?? ""),
     schedule: String(c.schedule ?? ""),
     branch: typeof c.branch === "string" && c.branch ? c.branch : undefined,
+    enabled: typeof c.enabled === "boolean" ? c.enabled : undefined,
     nextExec: unixToIso(c.next_exec),
     createdAt: unixToIso(c.created),
     action,
     timestamp: nowIso(),
   };
+}
+
+/**
+ * Approve or decline a blocked pipeline: the shared body of `pipeline_approve`
+ * and `pipeline_decline`. Upstream answers 400 for a pipeline that is not
+ * `blocked`, so the status is checked first and anything else is reported
+ * `unchanged`, as `pipeline_cancel` does. Without a number the target is the
+ * newest BLOCKED pipeline, not the newest pipeline: a later push must not hide
+ * the run that is waiting for approval.
+ */
+async function approveOrDecline(
+  context: Ctx,
+  a: { repo: string; number?: number },
+  verb: "approve" | "decline",
+): Promise<{ dataHandles: DataHandle[] }> {
+  const g = serverArgs(context);
+  const { id, fullName } = await resolveRepo(g, a.repo);
+  let target: Json | null;
+  if (a.number !== undefined) {
+    target = await getPipeline(g, id, a.number);
+  } else {
+    const r = await call(g, {
+      method: "GET",
+      path: `/api/repos/${id}/pipelines?status=blocked&perPage=1`,
+    });
+    // Nothing blocked: report the newest pipeline as unchanged instead.
+    target = asArray(r.body)[0] ?? await latestPipeline(g, id);
+    if (!target) throw new Error(`repo ${a.repo} has no pipelines yet`);
+  }
+  const number = Number(target.number ?? a.number);
+  const status = String(target.status ?? "");
+  if (status !== "blocked") {
+    logInfo(context, `Pipeline not blocked; nothing to ${verb}`, {
+      repo: fullName,
+      number,
+      status,
+    });
+    const handle = await context.writeResource(
+      "pipeline",
+      dataName("pipeline", `${id}:${number}`),
+      toPipelineInfo(fullName, target, "unchanged"),
+    );
+    return { dataHandles: [handle] };
+  }
+  logInfo(
+    context,
+    verb === "approve" ? "Approving pipeline" : "Declining pipeline",
+    {
+      repo: fullName,
+      number,
+    },
+  );
+  const r = await call(g, {
+    method: "POST",
+    path: `/api/repos/${id}/pipelines/${number}/${verb}`,
+  });
+  const handle = await context.writeResource(
+    "pipeline",
+    dataName("pipeline", `${id}:${number}`),
+    toPipelineInfo(
+      fullName,
+      r.body,
+      verb === "approve" ? "approved" : "declined",
+    ),
+  );
+  return { dataHandles: [handle] };
 }
 
 // ─────────────────────────── argument schemas ───────────────────────────
@@ -913,7 +1091,7 @@ const Empty = z.object({});
 
 const RepoRef = z.object({
   repo: z.string().describe(
-    'Repo reference: numeric id or "owner/name" (e.g. thomas-elliott/damson).',
+    'Repo reference: numeric id or "owner/name" (e.g. octo-org/web).',
   ),
 });
 
@@ -924,29 +1102,41 @@ const RepoAvailableArgs = z.object({
 });
 
 /**
- * A strict boolean. `z.coerce.boolean()` runs `Boolean(v)`, so `"0"` and
- * `"False"` become true; on the trust flags a typo would then grant a pipeline
- * the host network and docker socket.
+ * Woodpecker's pipeline events (`WebhookEvent` in `server/model/const.go`).
+ * `PatchRepo` stores `cancel_previous_pipeline_events` without checking it, so
+ * a misspelt event would be saved and silently never match.
  */
-const StrictBool = z.union(
-  [z.boolean(), z.literal("true"), z.literal("false")],
-  { error: 'expected true or false (or the strings "true" / "false")' },
-).transform((v) => v === true || v === "true");
+const WebhookEvent = z.enum([
+  "push",
+  "pull_request",
+  "pull_request_closed",
+  "pull_request_metadata",
+  "tag",
+  "release",
+  "deployment",
+  "cron",
+  "manual",
+]);
 
-/** The shared repo-settings fields used by enable/update. */
+/**
+ * The shared repo-settings fields used by enable/update. The trust flags are
+ * plain `z.boolean()`, not `z.coerce.boolean()`: coercion runs `Boolean(v)`, so
+ * `"0"` would grant a pipeline the host network and docker socket. swamp
+ * converts `--input trusted=true` to a boolean before zod sees it.
+ */
 const RepoConfigShape = {
-  trusted: StrictBool.optional().describe(
+  trusted: z.boolean().optional().describe(
     "Convenience: set ALL three trust capabilities (network/volumes/security) " +
       "to this value. Needed for steps that mount the host docker socket. " +
       "Granular flags below override it.",
   ),
-  trustedNetwork: StrictBool.optional().describe(
+  trustedNetwork: z.boolean().optional().describe(
     "Trust capability: host network access.",
   ),
-  trustedVolumes: StrictBool.optional().describe(
+  trustedVolumes: z.boolean().optional().describe(
     "Trust capability: host volume mounts (e.g. /var/run/docker.sock).",
   ),
-  trustedSecurity: StrictBool.optional().describe(
+  trustedSecurity: z.boolean().optional().describe(
     "Trust capability: relaxed security options.",
   ),
   timeout: z.coerce.number().int().optional().describe(
@@ -955,9 +1145,10 @@ const RepoConfigShape = {
   visibility: z.enum(["public", "private", "internal"]).optional().describe(
     "Repo visibility on Woodpecker.",
   ),
-  requireApproval: z.enum(["none", "forks", "pull_requests", "all"]).optional()
+  requireApproval: z.enum(["none", "forks", "pull_requests", "all_events"])
+    .optional()
     .describe("Which pipelines require manual approval before running."),
-  cancelPreviousPipelineEvents: z.array(z.string()).optional().describe(
+  cancelPreviousPipelineEvents: z.array(WebhookEvent).optional().describe(
     "Events for which a new pipeline cancels the previous running one.",
   ),
 };
@@ -1025,7 +1216,7 @@ type SecretSetArgs = z.infer<typeof SecretSetCore>;
 
 const PipelineListArgs = z.object({
   repo: z.string().describe('Repo reference: numeric id or "owner/name".'),
-  limit: z.coerce.number().int().default(10).describe(
+  limit: z.coerce.number().int().min(1).default(10).describe(
     "Max number of recent pipelines to return.",
   ),
 });
@@ -1046,7 +1237,11 @@ const PipelineRef = z.object({
 });
 
 const PipelineLogsArgs = PipelineRef.extend({
-  step: z.string().describe("Step name (e.g. 'dotnet') or numeric step id."),
+  step: z.string().describe(
+    "Numeric step id (exact) or step name (e.g. 'dotnet'). A name can repeat " +
+      "across workflows, for example in a matrix pipeline, and then matches " +
+      "the first; `pipeline_steps` lists each step's `stepId`.",
+  ),
   tailLines: z.coerce.number().int().default(200).describe(
     "Return only the last N decoded log lines (0 = all).",
   ),
@@ -1054,10 +1249,12 @@ const PipelineLogsArgs = PipelineRef.extend({
 
 const PipelineWaitArgs = PipelineRef.extend({
   timeoutSec: z.coerce.number().int().default(600).describe(
-    "Give up waiting after this many seconds (returns the non-terminal state).",
+    "Give up waiting after this many seconds. The method still succeeds, " +
+      "writing the non-terminal status with `timedOut: true`.",
   ),
-  pollIntervalSec: z.coerce.number().int().default(5).describe(
-    "Seconds between status polls.",
+  pollIntervalSec: z.coerce.number().int().min(1).default(5).describe(
+    "Seconds between status polls. At least 1, so a wait cannot poll the " +
+      "API in a tight loop.",
   ),
 });
 
@@ -1076,6 +1273,11 @@ const CronSetArgs = z.object({
   branch: z.string().optional().describe(
     "Branch to run (defaults to the repo's default branch).",
   ),
+  enabled: z.boolean().default(true).describe(
+    "Whether the scheduler runs this cron. The default true re-enables a " +
+      "cron disabled in the UI; pass false to create or leave it disabled. " +
+      "Servers before v3.13 have no such switch and ignore it.",
+  ),
 });
 
 const CronDeleteArgs = z.object({
@@ -1092,8 +1294,25 @@ const CronDeleteArgs = z.object({
  */
 export const model = {
   type: "@thomas/woodpecker",
-  version: "2026.09.08.1",
+  version: "2026.10.11.1",
   globalArguments: GlobalArgs,
+  upgrades: [
+    {
+      toVersion: "2026.10.11.1",
+      description:
+        "httpTimeoutMs must now be positive; a zero or negative value is dropped so the 30000 ms default applies. Stored data is renamed to <spec>:<key> (or <spec>); pipeline steps and logs are keyed by step id, secrets by org or repo id. Records under the old names are left as they are and are not migrated. cron_set takes enabled (default true) and repo_update's requireApproval takes all_events in place of all, which Woodpecker rejected.",
+      upgradeAttributes: (
+        old: Record<string, unknown>,
+      ): Record<string, unknown> => {
+        // Zero or negative aborted every request at once, so nobody relied on it.
+        if (Number(old.httpTimeoutMs) <= 0) {
+          const { httpTimeoutMs: _, ...rest } = old;
+          return rest;
+        }
+        return old;
+      },
+    },
+  ],
   checks: {
     "reachable": {
       description:
@@ -1153,7 +1372,9 @@ export const model = {
     },
     "secret": {
       description:
-        "A secret's metadata (name/events/images) — never its value.",
+        "A secret's metadata (name/events/images) — never its value. A delete " +
+        "of a secret that was already absent writes `action: unchanged` with " +
+        "empty `events` and `images`: placeholders, not the secret's settings.",
       schema: SecretInfo,
       lifetime: "infinite",
       garbageCollection: 10,
@@ -1201,7 +1422,9 @@ export const model = {
       garbageCollection: 10,
     },
     "cron": {
-      description: "A repo's scheduled-pipeline (cron) job.",
+      description: "A repo's scheduled-pipeline (cron) job. A delete of a " +
+        "cron that was already absent writes `action: unchanged` with an " +
+        "empty `schedule`: a placeholder, not the cron's settings.",
       schema: CronInfo,
       lifetime: "infinite",
       garbageCollection: 20,
@@ -1217,7 +1440,7 @@ export const model = {
         _rawArgs,
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
-        const g = context.globalArgs;
+        const g = serverArgs(context);
         logInfo(context, "Listing enabled repos");
         const repos = await pageAll(g, "/api/repos?active=true");
         const handles: DataHandle[] = [];
@@ -1225,7 +1448,7 @@ export const model = {
           handles.push(
             await context.writeResource(
               "repo",
-              String(repo.id),
+              dataName("repo", String(repo.id)),
               toRepoInfo(repo, "observed"),
             ),
           );
@@ -1241,12 +1464,13 @@ export const model = {
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const a = RepoRef.parse(rawArgs);
-        const g = context.globalArgs;
+        const g = serverArgs(context);
+        logInfo(context, "Getting repo", { repo: a.repo });
         const id = await resolveRepoId(g, a.repo);
         const repo = await getRepo(g, id);
         const handle = await context.writeResource(
           "repo",
-          String(id),
+          dataName("repo", String(id)),
           toRepoInfo(repo, "observed"),
         );
         return { dataHandles: [handle] };
@@ -1261,7 +1485,7 @@ export const model = {
         _rawArgs,
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
-        const g = context.globalArgs;
+        const g = serverArgs(context);
         logInfo(context, "Listing forges");
         const me = await tokenForge(g);
         const ts = nowIso();
@@ -1269,14 +1493,18 @@ export const model = {
         for (const forge of await listForges(g)) {
           const id = Number(forge.id);
           handles.push(
-            await context.writeResource("forge", String(id), {
-              id,
-              type: String(forge.type ?? "?"),
-              url: forge.url != null ? String(forge.url) : undefined,
-              isTokenForge: id === me.forgeId,
-              action: "observed",
-              timestamp: ts,
-            }),
+            await context.writeResource(
+              "forge",
+              dataName("forge", String(id)),
+              {
+                id,
+                type: String(forge.type ?? "?"),
+                url: forge.url != null ? String(forge.url) : undefined,
+                isTokenForge: id === me.forgeId,
+                action: "observed",
+                timestamp: ts,
+              },
+            ),
           );
         }
         return { dataHandles: handles };
@@ -1296,7 +1524,7 @@ export const model = {
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const a = RepoAvailableArgs.parse(rawArgs);
-        const g = context.globalArgs;
+        const g = serverArgs(context);
         logInfo(context, "Listing available forge repos");
         const r = await call(g, {
           method: "GET",
@@ -1309,44 +1537,51 @@ export const model = {
           const full = String(repo.full_name ?? "");
           if (match && !full.toLowerCase().includes(match)) continue;
           handles.push(
-            await context.writeResource("available-repo", safeName(full), {
-              fullName: full,
-              forgeRemoteId: repo.forge_remote_id != null
-                ? String(repo.forge_remote_id)
-                : undefined,
-              forgeId: repo.forge_id != null
-                ? Number(repo.forge_id)
-                : undefined,
-              active: Boolean(repo.active),
-              action: "observed",
-              timestamp: ts,
-            }),
+            await context.writeResource(
+              "available-repo",
+              dataName("available-repo", full),
+              {
+                fullName: full,
+                forgeRemoteId: repo.forge_remote_id != null
+                  ? String(repo.forge_remote_id)
+                  : undefined,
+                forgeId: repo.forge_id != null
+                  ? Number(repo.forge_id)
+                  : undefined,
+                active: Boolean(repo.active),
+                action: "observed",
+                timestamp: ts,
+              },
+            ),
           );
         }
         return { dataHandles: handles };
       },
     },
     org_get: {
-      description: "Look up an org / user by login. Read-only.",
+      description: "Look up an org / user by login or numeric id. Read-only.",
       arguments: OrgRef,
       execute: async (
         rawArgs,
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const a = OrgRef.parse(rawArgs);
-        const g = context.globalArgs;
-        const r = await call(g, {
-          method: "GET",
-          path: `/api/orgs/lookup/${encodeURIComponent(a.owner)}`,
-        });
+        const g = serverArgs(context);
+        logInfo(context, "Looking up org", { owner: a.owner });
+        const r = await call(g, { method: "GET", path: orgPath(a.owner) });
         const o = r.body;
-        const handle = await context.writeResource("org", String(o.id), {
-          id: Number(o.id ?? 0),
-          name: String(o.name ?? a.owner),
-          isUser: Boolean(o.is_user),
-          action: "observed",
-          timestamp: nowIso(),
-        });
+        const orgId = requireNumber(o.id, `id for org ${a.owner}`);
+        const handle = await context.writeResource(
+          "org",
+          dataName("org", String(orgId)),
+          {
+            id: orgId,
+            name: String(o.name ?? a.owner),
+            isUser: Boolean(o.is_user),
+            action: "observed",
+            timestamp: nowIso(),
+          },
+        );
         return { dataHandles: [handle] };
       },
     },
@@ -1360,13 +1595,14 @@ export const model = {
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const a = OrgRef.parse(rawArgs);
-        const g = context.globalArgs;
-        const orgId = await resolveOrgId(g, a.owner);
-        const secrets = await pageAll(g, `/api/orgs/${orgId}/secrets`);
+        const g = serverArgs(context);
+        logInfo(context, "Listing org secrets", { owner: a.owner });
+        const org = await resolveOrg(g, a.owner);
+        const secrets = await pageAll(g, `/api/orgs/${org.id}/secrets`);
         const handles: DataHandle[] = [];
         for (const s of secrets) {
           handles.push(
-            await writeSecret(context, "org", a.owner, s, "observed"),
+            await writeSecret(context, "org", org.id, org.name, s, "observed"),
           );
         }
         return { dataHandles: handles };
@@ -1382,14 +1618,15 @@ export const model = {
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const a = RepoRef.parse(rawArgs);
-        const g = context.globalArgs;
-        const id = await resolveRepoId(g, a.repo);
-        const repo = await getRepo(g, id);
-        const full = String(repo.full_name ?? a.repo);
+        const g = serverArgs(context);
+        logInfo(context, "Listing repo secrets", { repo: a.repo });
+        const { id, fullName: full } = await resolveRepo(g, a.repo);
         const secrets = await pageAll(g, `/api/repos/${id}/secrets`);
         const handles: DataHandle[] = [];
         for (const s of secrets) {
-          handles.push(await writeSecret(context, "repo", full, s, "observed"));
+          handles.push(
+            await writeSecret(context, "repo", id, full, s, "observed"),
+          );
         }
         return { dataHandles: handles };
       },
@@ -1402,8 +1639,9 @@ export const model = {
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const a = PipelineListArgs.parse(rawArgs);
-        const g = context.globalArgs;
-        const id = await resolveRepoId(g, a.repo);
+        const g = serverArgs(context);
+        logInfo(context, "Listing pipelines", { repo: a.repo, limit: a.limit });
+        const { id, fullName } = await resolveRepo(g, a.repo);
         const pipelines = await pageAll(
           g,
           `/api/repos/${id}/pipelines`,
@@ -1414,8 +1652,8 @@ export const model = {
           handles.push(
             await context.writeResource(
               "pipeline",
-              `${id}:${p.number}`,
-              toPipelineInfo(a.repo, p, "observed"),
+              dataName("pipeline", `${id}:${p.number}`),
+              toPipelineInfo(fullName, p, "observed"),
             ),
           );
         }
@@ -1432,14 +1670,15 @@ export const model = {
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const a = RepoRef.parse(rawArgs);
-        const g = context.globalArgs;
-        const id = await resolveRepoId(g, a.repo);
+        const g = serverArgs(context);
+        logInfo(context, "Getting latest pipeline", { repo: a.repo });
+        const { id, fullName } = await resolveRepo(g, a.repo);
         const p = await latestPipeline(g, id);
         if (!p) throw new Error(`repo ${a.repo} has no pipelines yet`);
         const handle = await context.writeResource(
           "pipeline",
-          `${id}:${p.number}`,
-          toPipelineInfo(a.repo, p, "observed"),
+          dataName("pipeline", `${id}:${p.number}`),
+          toPipelineInfo(fullName, p, "observed"),
         );
         return { dataHandles: [handle] };
       },
@@ -1456,16 +1695,20 @@ export const model = {
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const a = PipelineRef.parse(rawArgs);
-        const g = context.globalArgs;
-        const id = await resolveRepoId(g, a.repo);
+        const g = serverArgs(context);
+        logInfo(context, "Listing pipeline steps", {
+          repo: a.repo,
+          number: a.number,
+        });
+        const { id, fullName } = await resolveRepo(g, a.repo);
         const number = await resolveNumber(g, id, a.number);
         const pipe = await getPipeline(g, id, number);
         const handles: DataHandle[] = [];
-        for (const step of toSteps(a.repo, number, pipe, "observed")) {
+        for (const step of toSteps(fullName, number, pipe, "observed")) {
           handles.push(
             await context.writeResource(
               "pipeline-step",
-              safeName(`${id}:${number}:${step.workflow}:${step.name}`),
+              dataName("pipeline-step", `${id}:${number}:${step.stepId}`),
               step,
             ),
           );
@@ -1484,8 +1727,13 @@ export const model = {
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const a = PipelineLogsArgs.parse(rawArgs);
-        const g = context.globalArgs;
-        const id = await resolveRepoId(g, a.repo);
+        const g = serverArgs(context);
+        logInfo(context, "Fetching step logs", {
+          repo: a.repo,
+          number: a.number,
+          step: a.step,
+        });
+        const { id, fullName } = await resolveRepo(g, a.repo);
         const number = await resolveNumber(g, id, a.number);
         const pipe = await getPipeline(g, id, number);
         const step = findStep(pipe, a.step);
@@ -1506,9 +1754,9 @@ export const model = {
         const kept = a.tailLines > 0 ? lines.slice(-a.tailLines) : lines;
         const handle = await context.writeResource(
           "pipeline-log",
-          safeName(`${id}:${number}:${step.name}`),
+          dataName("pipeline-log", `${id}:${number}:${step.id}`),
           {
-            repo: a.repo,
+            repo: fullName,
             pipelineNumber: number,
             step: step.name,
             stepId: step.id,
@@ -1526,24 +1774,28 @@ export const model = {
       description:
         "Poll a pipeline until it reaches a terminal state (success/failure/…), " +
         "then write its final status plus every step (so the failed step is " +
-        "visible). Defaults to the repo's latest pipeline; bounded by `timeoutSec`.",
+        "visible). Defaults to the repo's latest pipeline; bounded by " +
+        "`timeoutSec`, after which it writes the unfinished status with " +
+        "`timedOut: true`.",
       arguments: PipelineWaitArgs,
       execute: async (
         rawArgs,
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const a = PipelineWaitArgs.parse(rawArgs);
-        const g = context.globalArgs;
-        const id = await resolveRepoId(g, a.repo);
+        const g = serverArgs(context);
+        const { id, fullName } = await resolveRepo(g, a.repo);
         const number = await resolveNumber(g, id, a.number);
         const deadline = Date.now() + a.timeoutSec * 1000;
         let pipe: Json = {};
         let status = "pending";
+        let timedOut = false;
         for (;;) {
           pipe = await getPipeline(g, id, number);
           status = String(pipe.status ?? "pending");
           if (isTerminal(status)) break;
           if (Date.now() >= deadline) {
+            timedOut = true;
             logInfo(context, "Pipeline wait timed out", {
               repo: a.repo,
               number,
@@ -1561,15 +1813,15 @@ export const model = {
         const handles: DataHandle[] = [
           await context.writeResource(
             "pipeline",
-            `${id}:${number}`,
-            toPipelineInfo(a.repo, pipe, "observed"),
+            dataName("pipeline", `${id}:${number}`),
+            { ...toPipelineInfo(fullName, pipe, "observed"), timedOut },
           ),
         ];
-        for (const step of toSteps(a.repo, number, pipe, "observed")) {
+        for (const step of toSteps(fullName, number, pipe, "observed")) {
           handles.push(
             await context.writeResource(
               "pipeline-step",
-              safeName(`${id}:${number}:${step.workflow}:${step.name}`),
+              dataName("pipeline-step", `${id}:${number}:${step.stepId}`),
               step,
             ),
           );
@@ -1587,7 +1839,7 @@ export const model = {
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const a = StatusAllArgs.parse(rawArgs);
-        const g = context.globalArgs;
+        const g = serverArgs(context);
         logInfo(context, "Collecting fleet pipeline status");
         const repos = await pageAll(g, "/api/repos?active=true");
         const match = a.match?.toLowerCase();
@@ -1602,7 +1854,7 @@ export const model = {
           handles.push(
             await context.writeResource(
               "repo-status",
-              safeName(full || String(repoId)),
+              dataName("repo-status", String(repoId)),
               {
                 repo: full,
                 repoId,
@@ -1635,13 +1887,16 @@ export const model = {
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const a = RepoEnableArgs.parse(rawArgs);
-        const g = context.globalArgs;
+        const g = serverArgs(context);
         if (!a.repo.includes("/")) {
           throw new Error(
             `repo ${JSON.stringify(a.repo)} must be "owner/name"`,
           );
         }
-        // Already enabled? (lookup tolerates 404 for not-yet-active repos.)
+        // Already enabled? The lookup is a 404 for a never-enabled repo, and
+        // returns the row with `active: false` for one `repo_disable` turned
+        // off; both need the activation POST, which upstream accepts for a
+        // previously enabled repo.
         const lookup = await callTolerant(g, {
           method: "GET",
           path: `/api/repos/lookup/${
@@ -1650,14 +1905,19 @@ export const model = {
         }, [404]);
         let repo: Json;
         let enabled = false;
-        if (lookup.status === 404 || !lookup.body.id) {
+        if (
+          lookup.status === 404 || !lookup.body.id ||
+          lookup.body.active === false
+        ) {
           const forge = await findForgeRemoteId(g, a.repo);
           if (!forge || !forge.forgeRemoteId) {
             throw new Error(
               `repo ${
                 JSON.stringify(a.repo)
               } not found among forge repos the ` +
-                `token can access.${await forgeBindingHint(g)}`,
+                `token can access. Woodpecker lists a repo it has not enabled ` +
+                `only if the token's user is an admin of it on the forge.` +
+                `${await forgeBindingHint(g)}`,
             );
           }
           logInfo(context, "Enabling repo", { repo: a.repo });
@@ -1689,7 +1949,7 @@ export const model = {
           : (changed ? "updated" : "unchanged");
         const handle = await context.writeResource(
           "repo",
-          String(id),
+          dataName("repo", String(id)),
           toRepoInfo(repo, action),
         );
         return { dataHandles: [handle] };
@@ -1705,12 +1965,15 @@ export const model = {
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const a = RepoUpdateArgs.parse(rawArgs);
-        const g = context.globalArgs;
+        const g = serverArgs(context);
+        logInfo(context, "Checking repo settings", { repo: a.repo });
         const id = await resolveRepoId(g, a.repo);
         const current = await getRepo(g, id);
         const { body, changed } = buildRepoPatch(current, a);
         let repo = current;
         if (changed) {
+          // Logged in full: the body can grant trust capabilities.
+          logInfo(context, "Updating repo settings", { repo: a.repo, body });
           const r = await call(g, {
             method: "PATCH",
             path: `/api/repos/${id}`,
@@ -1720,7 +1983,7 @@ export const model = {
         }
         const handle = await context.writeResource(
           "repo",
-          String(id),
+          dataName("repo", String(id)),
           toRepoInfo(repo, changed ? "updated" : "unchanged"),
         );
         return { dataHandles: [handle] };
@@ -1736,14 +1999,14 @@ export const model = {
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const a = RepoRef.parse(rawArgs);
-        const g = context.globalArgs;
+        const g = serverArgs(context);
         const id = await resolveRepoId(g, a.repo);
         logInfo(context, "Repairing repo webhook", { repo: a.repo });
         await call(g, { method: "POST", path: `/api/repos/${id}/repair` });
         const repo = await getRepo(g, id);
         const handle = await context.writeResource(
           "repo",
-          String(id),
+          dataName("repo", String(id)),
           toRepoInfo(repo, "repaired"),
         );
         return { dataHandles: [handle] };
@@ -1752,25 +2015,27 @@ export const model = {
     org_secret_set: {
       description:
         "Create-or-update an org-level secret (inherited by all the org's " +
-        "repos). The value is write-only — supply it via a vault reference.",
+        "repos). The value is write-only — supply it via a vault reference. " +
+        "An existing secret is always reported updated: its value cannot be " +
+        "read back to compare.",
       arguments: OrgSecretSetArgs,
       execute: async (
         rawArgs,
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const a = OrgSecretSetArgs.parse(rawArgs);
-        const g = context.globalArgs;
-        const orgId = await resolveOrgId(g, a.owner);
+        const g = serverArgs(context);
+        const org = await resolveOrg(g, a.owner);
         logInfo(context, "Setting org secret", {
           owner: a.owner,
           name: a.name,
         });
         const { raw, action } = await upsertSecret(
           g,
-          `/api/orgs/${orgId}/secrets`,
+          `/api/orgs/${org.id}/secrets`,
           a,
         );
-        const handle = await writeSecret(context, "org", a.owner, {
+        const handle = await writeSecret(context, "org", org.id, org.name, {
           ...raw,
           name: a.name,
         }, action);
@@ -1780,24 +2045,23 @@ export const model = {
     repo_secret_set: {
       description:
         "Create-or-update a repo-scoped secret. The value is write-only — " +
-        "supply it via a vault reference.",
+        "supply it via a vault reference. An existing secret is always " +
+        "reported updated: its value cannot be read back to compare.",
       arguments: RepoSecretSetArgs,
       execute: async (
         rawArgs,
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const a = RepoSecretSetArgs.parse(rawArgs);
-        const g = context.globalArgs;
-        const id = await resolveRepoId(g, a.repo);
-        const repo = await getRepo(g, id);
-        const full = String(repo.full_name ?? a.repo);
+        const g = serverArgs(context);
+        const { id, fullName: full } = await resolveRepo(g, a.repo);
         logInfo(context, "Setting repo secret", { repo: full, name: a.name });
         const { raw, action } = await upsertSecret(
           g,
           `/api/repos/${id}/secrets`,
           a,
         );
-        const handle = await writeSecret(context, "repo", full, {
+        const handle = await writeSecret(context, "repo", id, full, {
           ...raw,
           name: a.name,
         }, action);
@@ -1809,16 +2073,31 @@ export const model = {
     repo_disable: {
       description:
         "Deactivate a repo (stops its CI; removes the webhook). REVERSIBLE — " +
-        "re-run repo_enable to restore. Verifies the repo first.",
+        "re-run repo_enable to restore. Verifies the repo first; an already " +
+        "disabled repo is a no-op.",
       arguments: RepoRef,
       execute: async (
         rawArgs,
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const a = RepoRef.parse(rawArgs);
-        const g = context.globalArgs;
+        const g = serverArgs(context);
         const id = await resolveRepoId(g, a.repo);
         const current = await getRepo(g, id); // verify before mutating
+        // A disabled repo keeps its row with active=false. A second DELETE
+        // would ask the forge to remove a webhook that is already gone.
+        if (current.active === false) {
+          logInfo(context, "Repo already disabled", {
+            repo: current.full_name,
+            id,
+          });
+          const handle = await context.writeResource(
+            "repo",
+            dataName("repo", String(id)),
+            toRepoInfo(current, "unchanged"),
+          );
+          return { dataHandles: [handle] };
+        }
         logInfo(context, "Disabling repo", {
           repo: current.full_name,
           id,
@@ -1826,7 +2105,7 @@ export const model = {
         await call(g, { method: "DELETE", path: `/api/repos/${id}` });
         const handle = await context.writeResource(
           "repo",
-          String(id),
+          dataName("repo", String(id)),
           toRepoInfo({ ...current, active: false }, "disabled"),
         );
         return { dataHandles: [handle] };
@@ -1842,11 +2121,11 @@ export const model = {
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const a = OrgSecretDeleteArgs.parse(rawArgs);
-        const g = context.globalArgs;
-        const orgId = await resolveOrgId(g, a.owner);
+        const g = serverArgs(context);
+        const org = await resolveOrg(g, a.owner);
         const probe = await callTolerant(g, {
           method: "GET",
-          path: `/api/orgs/${orgId}/secrets/${encodeURIComponent(a.name)}`,
+          path: `/api/orgs/${org.id}/secrets/${encodeURIComponent(a.name)}`,
         }, [404]);
         if (probe.status === 404) {
           // Already absent — idempotent no-op (re-runs must not fail a pipeline).
@@ -1854,7 +2133,7 @@ export const model = {
             owner: a.owner,
             name: a.name,
           });
-          const handle = await writeSecret(context, "org", a.owner, {
+          const handle = await writeSecret(context, "org", org.id, org.name, {
             name: a.name,
           }, "unchanged");
           return { dataHandles: [handle] };
@@ -1865,9 +2144,9 @@ export const model = {
         });
         await call(g, {
           method: "DELETE",
-          path: `/api/orgs/${orgId}/secrets/${encodeURIComponent(a.name)}`,
+          path: `/api/orgs/${org.id}/secrets/${encodeURIComponent(a.name)}`,
         });
-        const handle = await writeSecret(context, "org", a.owner, {
+        const handle = await writeSecret(context, "org", org.id, org.name, {
           ...probe.body,
           name: a.name,
         }, "deleted");
@@ -1883,10 +2162,8 @@ export const model = {
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const a = RepoSecretDeleteArgs.parse(rawArgs);
-        const g = context.globalArgs;
-        const id = await resolveRepoId(g, a.repo);
-        const repo = await getRepo(g, id);
-        const full = String(repo.full_name ?? a.repo);
+        const g = serverArgs(context);
+        const { id, fullName: full } = await resolveRepo(g, a.repo);
         const probe = await callTolerant(g, {
           method: "GET",
           path: `/api/repos/${id}/secrets/${encodeURIComponent(a.name)}`,
@@ -1897,7 +2174,7 @@ export const model = {
             repo: full,
             name: a.name,
           });
-          const handle = await writeSecret(context, "repo", full, {
+          const handle = await writeSecret(context, "repo", id, full, {
             name: a.name,
           }, "unchanged");
           return { dataHandles: [handle] };
@@ -1907,7 +2184,7 @@ export const model = {
           method: "DELETE",
           path: `/api/repos/${id}/secrets/${encodeURIComponent(a.name)}`,
         });
-        const handle = await writeSecret(context, "repo", full, {
+        const handle = await writeSecret(context, "repo", id, full, {
           ...probe.body,
           name: a.name,
         }, "deleted");
@@ -1926,8 +2203,8 @@ export const model = {
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const a = PipelineTriggerArgs.parse(rawArgs);
-        const g = context.globalArgs;
-        const id = await resolveRepoId(g, a.repo);
+        const g = serverArgs(context);
+        const { id, fullName } = await resolveRepo(g, a.repo);
         // Woodpecker has no fallback: an empty branch goes to the forge as is.
         const branch = a.branch ?? String(
           (await call(g, { method: "GET", path: `/api/repos/${id}` })).body
@@ -1945,10 +2222,11 @@ export const model = {
           path: `/api/repos/${id}/pipelines`,
           body,
         });
+        const number = requireNumber(r.body.number, "pipeline number");
         const handle = await context.writeResource(
           "pipeline",
-          `${id}:${r.body.number}`,
-          toPipelineInfo(a.repo, r.body, "triggered"),
+          dataName("pipeline", `${id}:${number}`),
+          toPipelineInfo(fullName, r.body, "triggered"),
         );
         return { dataHandles: [handle] };
       },
@@ -1963,19 +2241,20 @@ export const model = {
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const a = PipelineRef.parse(rawArgs);
-        const g = context.globalArgs;
-        const id = await resolveRepoId(g, a.repo);
+        const g = serverArgs(context);
+        const { id, fullName } = await resolveRepo(g, a.repo);
         const number = await resolveNumber(g, id, a.number);
         logInfo(context, "Restarting pipeline", { repo: a.repo, number });
         const r = await call(g, {
           method: "POST",
           path: `/api/repos/${id}/pipelines/${number}`,
         });
-        const newNum = Number(r.body.number ?? number);
+        // Falling back to the old number would overwrite the old run's record.
+        const newNum = requireNumber(r.body.number, "pipeline number");
         const handle = await context.writeResource(
           "pipeline",
-          `${id}:${newNum}`,
-          toPipelineInfo(a.repo, r.body, "restarted"),
+          dataName("pipeline", `${id}:${newNum}`),
+          toPipelineInfo(fullName, r.body, "restarted"),
         );
         return { dataHandles: [handle] };
       },
@@ -1990,8 +2269,8 @@ export const model = {
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const a = PipelineRef.parse(rawArgs);
-        const g = context.globalArgs;
-        const id = await resolveRepoId(g, a.repo);
+        const g = serverArgs(context);
+        const { id, fullName } = await resolveRepo(g, a.repo);
         const number = await resolveNumber(g, id, a.number);
         const before = await getPipeline(g, id, number);
         const status = String(before.status ?? "");
@@ -2003,8 +2282,8 @@ export const model = {
           });
           const handle = await context.writeResource(
             "pipeline",
-            `${id}:${number}`,
-            toPipelineInfo(a.repo, before, "unchanged"),
+            dataName("pipeline", `${id}:${number}`),
+            toPipelineInfo(fullName, before, "unchanged"),
           );
           return { dataHandles: [handle] };
         }
@@ -2016,8 +2295,8 @@ export const model = {
         const after = await getPipeline(g, id, number);
         const handle = await context.writeResource(
           "pipeline",
-          `${id}:${number}`,
-          toPipelineInfo(a.repo, after, "cancelled"),
+          dataName("pipeline", `${id}:${number}`),
+          toPipelineInfo(fullName, after, "cancelled"),
         );
         return { dataHandles: [handle] };
       },
@@ -2025,54 +2304,22 @@ export const model = {
     pipeline_approve: {
       description:
         "Approve a pipeline blocked pending approval (require_approval). " +
-        "Defaults to the repo's latest.",
+        "Without `number`, targets the repo's newest blocked pipeline. A " +
+        "pipeline that is not blocked, or no blocked pipeline at all, is a " +
+        "no-op reported unchanged.",
       arguments: PipelineRef,
-      execute: async (
-        rawArgs,
-        context,
-      ): Promise<{ dataHandles: DataHandle[] }> => {
-        const a = PipelineRef.parse(rawArgs);
-        const g = context.globalArgs;
-        const id = await resolveRepoId(g, a.repo);
-        const number = await resolveNumber(g, id, a.number);
-        logInfo(context, "Approving pipeline", { repo: a.repo, number });
-        const r = await call(g, {
-          method: "POST",
-          path: `/api/repos/${id}/pipelines/${number}/approve`,
-        });
-        const handle = await context.writeResource(
-          "pipeline",
-          `${id}:${number}`,
-          toPipelineInfo(a.repo, r.body, "approved"),
-        );
-        return { dataHandles: [handle] };
-      },
+      execute: (rawArgs, context): Promise<{ dataHandles: DataHandle[] }> =>
+        approveOrDecline(context, PipelineRef.parse(rawArgs), "approve"),
     },
     pipeline_decline: {
       description:
-        "Decline a pipeline blocked pending approval (defaults to the repo's " +
-        "latest). To undo, restart it.",
+        "Decline a pipeline blocked pending approval. Without `number`, " +
+        "targets the repo's newest blocked pipeline. A pipeline that is not " +
+        "blocked, or no blocked pipeline at all, is a no-op reported " +
+        "unchanged. To undo, restart it.",
       arguments: PipelineRef,
-      execute: async (
-        rawArgs,
-        context,
-      ): Promise<{ dataHandles: DataHandle[] }> => {
-        const a = PipelineRef.parse(rawArgs);
-        const g = context.globalArgs;
-        const id = await resolveRepoId(g, a.repo);
-        const number = await resolveNumber(g, id, a.number);
-        logInfo(context, "Declining pipeline", { repo: a.repo, number });
-        const r = await call(g, {
-          method: "POST",
-          path: `/api/repos/${id}/pipelines/${number}/decline`,
-        });
-        const handle = await context.writeResource(
-          "pipeline",
-          `${id}:${number}`,
-          toPipelineInfo(a.repo, r.body, "declined"),
-        );
-        return { dataHandles: [handle] };
-      },
+      execute: (rawArgs, context): Promise<{ dataHandles: DataHandle[] }> =>
+        approveOrDecline(context, PipelineRef.parse(rawArgs), "decline"),
     },
 
     // ───────────── infra / health ─────────────
@@ -2085,7 +2332,7 @@ export const model = {
         _rawArgs,
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
-        const g = context.globalArgs;
+        const g = serverArgs(context);
         logInfo(context, "Listing agents");
         const agents = await pageAll(g, "/api/agents");
         const handles: DataHandle[] = [];
@@ -2093,7 +2340,7 @@ export const model = {
           handles.push(
             await context.writeResource(
               "agent",
-              String(ag.id ?? ""),
+              dataName("agent", String(requireNumber(ag.id, "agent id"))),
               toAgent(ag),
             ),
           );
@@ -2110,11 +2357,12 @@ export const model = {
         _rawArgs,
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
-        const g = context.globalArgs;
+        const g = serverArgs(context);
+        logInfo(context, "Reading queue statistics");
         const r = await call(g, { method: "GET", path: "/api/queue/info" });
         const b = r.body;
         const stats = (b.stats ?? {}) as Json;
-        const handle = await context.writeResource("queue", "queue", {
+        const handle = await context.writeResource("queue", dataName("queue"), {
           paused: typeof b.paused === "boolean" ? b.paused : undefined,
           pending: Number(stats.pending_count ?? asArray(b.pending).length),
           waitingOnDeps: Number(
@@ -2136,22 +2384,27 @@ export const model = {
         _rawArgs,
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
-        const g = context.globalArgs;
+        const g = serverArgs(context);
+        logInfo(context, "Reading server version and health");
         // /version and /healthz sit outside the /api prefix.
         const ver = await call(g, { method: "GET", path: "/version" });
         const health = await callTolerant(g, {
           method: "GET",
           path: "/healthz",
         }, [500, 503]);
-        const handle = await context.writeResource("server", "server", {
-          version: String(ver.body.version ?? "unknown"),
-          source: typeof ver.body.source === "string"
-            ? ver.body.source
-            : undefined,
-          healthy: health.status < 400,
-          action: "observed",
-          timestamp: nowIso(),
-        });
+        const handle = await context.writeResource(
+          "server",
+          dataName("server"),
+          {
+            version: String(ver.body.version ?? "unknown"),
+            source: typeof ver.body.source === "string"
+              ? ver.body.source
+              : undefined,
+            healthy: health.status < 400,
+            action: "observed",
+            timestamp: nowIso(),
+          },
+        );
         return { dataHandles: [handle] };
       },
     },
@@ -2166,16 +2419,17 @@ export const model = {
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const a = RepoRef.parse(rawArgs);
-        const g = context.globalArgs;
-        const id = await resolveRepoId(g, a.repo);
+        const g = serverArgs(context);
+        logInfo(context, "Listing crons", { repo: a.repo });
+        const { id, fullName } = await resolveRepo(g, a.repo);
         const crons = await pageAll(g, `/api/repos/${id}/cron`);
         const handles: DataHandle[] = [];
         for (const c of crons) {
           handles.push(
             await context.writeResource(
               "cron",
-              safeName(`${id}:${c.name}`),
-              toCron(a.repo, c, "observed"),
+              dataName("cron", `${id}:${c.name}`),
+              toCron(fullName, c, "observed"),
             ),
           );
         }
@@ -2184,20 +2438,28 @@ export const model = {
     },
     cron_set: {
       description:
-        "Create-or-update a scheduled-pipeline (cron) job by name (idempotent: " +
-        "reports unchanged when the schedule/branch already match).",
+        "Create-or-update a scheduled-pipeline (cron) job by name, enabled " +
+        "unless enabled=false (idempotent: reports unchanged when the " +
+        "schedule, branch and enabled state already match).",
       arguments: CronSetArgs,
       execute: async (
         rawArgs,
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const a = CronSetArgs.parse(rawArgs);
-        const g = context.globalArgs;
-        const id = await resolveRepoId(g, a.repo);
+        const g = serverArgs(context);
+        const { id, fullName } = await resolveRepo(g, a.repo);
         const existing = (await pageAll(g, `/api/repos/${id}/cron`)).find((c) =>
           String(c.name ?? "") === a.name
         );
-        const payload: Json = { name: a.name, schedule: a.schedule };
+        // `enabled` must always be sent: since v3.13 an omitted field binds
+        // to false, and the scheduler skips disabled crons. Older servers
+        // ignore it.
+        const payload: Json = {
+          name: a.name,
+          schedule: a.schedule,
+          enabled: a.enabled,
+        };
         if (a.branch) payload.branch = a.branch;
         let raw: Json;
         let action: "created" | "updated" | "unchanged";
@@ -2213,7 +2475,11 @@ export const model = {
         } else if (
           String(existing.schedule ?? "") === a.schedule &&
           // An omitted branch keeps the cron's own, as the PATCH does.
-          (a.branch === undefined || String(existing.branch ?? "") === a.branch)
+          (a.branch === undefined ||
+            String(existing.branch ?? "") === a.branch) &&
+          // Servers before v3.13 return no `enabled`; nothing to compare.
+          (existing.enabled === undefined ||
+            existing.enabled === a.enabled)
         ) {
           raw = existing;
           action = "unchanged";
@@ -2229,8 +2495,8 @@ export const model = {
         }
         const handle = await context.writeResource(
           "cron",
-          safeName(`${id}:${a.name}`),
-          toCron(a.repo, { ...raw, name: a.name }, action),
+          dataName("cron", `${id}:${a.name}`),
+          toCron(fullName, { ...raw, name: a.name }, action),
         );
         return { dataHandles: [handle] };
       },
@@ -2245,8 +2511,8 @@ export const model = {
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const a = CronDeleteArgs.parse(rawArgs);
-        const g = context.globalArgs;
-        const id = await resolveRepoId(g, a.repo);
+        const g = serverArgs(context);
+        const { id, fullName } = await resolveRepo(g, a.repo);
         const existing = (await pageAll(g, `/api/repos/${id}/cron`)).find((c) =>
           String(c.name ?? "") === a.name
         );
@@ -2257,8 +2523,8 @@ export const model = {
           });
           const handle = await context.writeResource(
             "cron",
-            safeName(`${id}:${a.name}`),
-            toCron(a.repo, { name: a.name, schedule: "" }, "unchanged"),
+            dataName("cron", `${id}:${a.name}`),
+            toCron(fullName, { name: a.name, schedule: "" }, "unchanged"),
           );
           return { dataHandles: [handle] };
         }
@@ -2269,8 +2535,8 @@ export const model = {
         });
         const handle = await context.writeResource(
           "cron",
-          safeName(`${id}:${a.name}`),
-          toCron(a.repo, { ...existing, name: a.name }, "deleted"),
+          dataName("cron", `${id}:${a.name}`),
+          toCron(fullName, { ...existing, name: a.name }, "deleted"),
         );
         return { dataHandles: [handle] };
       },
