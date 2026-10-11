@@ -16,25 +16,25 @@ import pg from "npm:pg@8.21.0";
  * `@thomas/postgres-admin`: non-destructive PostgreSQL administration over a
  * direct TCP connection (node-postgres).
  *
- * SCOPE GUARANTEE: the extension holds an admin credential, so its methods are
- * limited and DATA-SAFE. It NEVER reads
- * or writes table rows (no SELECT/INSERT/UPDATE/DELETE against user tables), NEVER
- * DROPs a database or role, NEVER TRUNCATEs, and exposes NO arbitrary-SQL method.
- * Every method issues author-controlled DDL or catalog reads (pg_catalog /
- * information_schema) only. Read methods additionally run under
- * `default_transaction_read_only = on`, so the server rejects any write.
+ * Scope: the extension holds an admin credential, so its methods are limited
+ * and leave data alone. It never reads or writes table rows (no
+ * SELECT/INSERT/UPDATE/DELETE against user tables), never drops a database or
+ * role, never truncates, and has no arbitrary-SQL method. Every method issues
+ * author-controlled DDL or catalog reads (pg_catalog / information_schema)
+ * only. Read methods also run under `default_transaction_read_only = on`, so
+ * the server rejects any write.
  *
  * Connection: one short-lived `pg.Client` per method run (connect → work →
  * `end()` in a `finally`); no pool, because swamp already serialises runs per model.
  *
  * Identifier safety: identifiers (db/role/schema/table names) are validated
  * against `identifierPattern` AND escaped via `client.escapeIdentifier`; the role
- * password is embedded only via `client.escapeLiteral` (DDL can't parameterise an
+ * password verifier is embedded only via `client.escapeLiteral` (DDL can't parameterise an
  * identifier or a PASSWORD literal). Filter VALUES in catalog reads use bound `$1`
  * params. Passwords are marked sensitive, never logged, never echoed in output.
- * CAVEAT: if the server runs `log_statement = ddl|all`, a `CREATE/ALTER ROLE …
- * PASSWORD '…'` is written to the SERVER log. That setting is outside this
- * extension's control, and the extension does not change it to hide the password.
+ * A role password is hashed here to a SCRAM-SHA-256 verifier before it is sent,
+ * so the plain text is never on the wire, in `pg_stat_activity` or in a server
+ * statement log.
  *
  * Secrets: `adminPassword` (and per-call role passwords) are supplied via vault
  * expressions, e.g. `${{ vault.get(<vault>, postgres/admin_password) }}`.
@@ -47,7 +47,8 @@ const SslConfig = z.object({
     "disable",
   ).describe(
     "disable = plaintext TCP (the default). require = encrypt, no " +
-      "cert verify. verify-ca/verify-full = encrypt + verify (needs `ca`).",
+      "cert verify. verify-ca = encrypt + verify the cert chain against `ca`, " +
+      "not the host name. verify-full = verify-ca plus the host name.",
   ),
   ca: z.string().optional().describe(
     "PEM CA bundle for verify-ca/verify-full",
@@ -59,9 +60,11 @@ const SslConfig = z.object({
 
 const GlobalArgs = z.object({
   host: z.string().describe(
-    "Postgres host or IP, e.g. postgres-host or 10.0.0.5",
+    "Postgres host or IP, e.g. postgres-host or 192.0.2.10",
   ),
-  port: z.coerce.number().int().default(5432).describe("Postgres TCP port"),
+  port: z.coerce.number().int().min(1).max(65535).default(5432).describe(
+    "Postgres TCP port",
+  ),
   adminUser: z.string().default("postgres").describe(
     "Admin/superuser login role used for every connection",
   ),
@@ -72,8 +75,8 @@ const GlobalArgs = z.object({
     "DB to connect to for cluster-wide ops (CREATE DATABASE, role/db catalog reads)",
   ),
   ssl: SslConfig,
-  statementTimeoutMs: z.coerce.number().int().default(30000).describe(
-    "statement_timeout (ms) applied per session as a guardrail",
+  statementTimeoutMs: z.coerce.number().int().min(0).default(30000).describe(
+    "statement_timeout (ms) applied per session as a guardrail; 0 turns it off",
   ),
   identifierPattern: z.string().default("^[a-zA-Z_][a-zA-Z0-9_]{0,62}$")
     .describe(
@@ -112,7 +115,7 @@ const Privilege = z.enum([
   "TRIGGER",
 ]);
 
-/** Table-level privileges valid as app_provision defaults. */
+/** Table-level privileges: the allowed set for app_provision's `tablePrivs`. */
 const TablePrivilege = z.enum([
   "SELECT",
   "INSERT",
@@ -156,6 +159,10 @@ const TableGrant = z.object({
   schema: z.string(),
   name: z.string(),
   privilege: z.string(),
+  // Without these, an all-roles audit shows one identical-looking row per
+  // grantee and cannot say who holds a grant.
+  grantee: z.string(),
+  grantor: z.string(),
   grantable: z.boolean().optional(),
 });
 
@@ -175,10 +182,15 @@ const DefaultPriv = z.object({
 const PermissionsAudit = z.object({
   database: z.string(),
   role: z.string().optional(),
-  databasePrivileges: z.array(z.string()),
-  schemaPrivileges: z.array(SchemaPriv),
+  // Effective privileges of `role`; left out when no role is given, where an
+  // empty list would read as "none".
+  databasePrivileges: z.array(z.string()).optional(),
+  schemaPrivileges: z.array(SchemaPriv).optional(),
   tableGrants: z.array(TableGrant),
   usageGrants: z.array(TableGrant),
+  // information_schema leaves sequences out of table grants, so their
+  // SELECT/UPDATE grants would otherwise appear nowhere.
+  sequenceGrants: z.array(TableGrant),
   defaultPrivileges: z.array(DefaultPriv),
   action: Action,
   timestamp: z.string(),
@@ -214,6 +226,9 @@ const TableInfo = z.object({
 
 const ConnectionInfo = z.object({
   pid: z.number(),
+  // Tells client sessions apart from the server's own processes (checkpointer,
+  // walwriter, ...), which have no user or database.
+  backendType: z.string().optional(),
   user: z.string().optional(),
   db: z.string().optional(),
   state: z.string().optional(),
@@ -269,7 +284,7 @@ const AppProvisionResult = z.object({
 
 /** The query functions the methods use; unit tests substitute a fake. */
 export interface Querier {
-  /** Run a parameterised SQL statement; filter VALUES go in `params` as bound `$n`. */
+  /** Run a parameterised SQL statement; filter values go in `params` as bound `$n`. */
   query(
     sql: string,
     params?: unknown[],
@@ -290,7 +305,7 @@ export interface Conn {
 export type Json = Record<string, unknown>;
 /**
  * Open a connection to `database` on the configured server. The global args are
- * typed loosely as {@link Json} so this EXPORTED seam type stays "fast-check"
+ * typed loosely as {@link Json} so this exported seam type stays "fast-check"
  * clean. Referencing the zod-inferred `GlobalArgsT` would put a slow type on
  * the public API. The real implementation re-narrows to the validated shape.
  */
@@ -303,13 +318,32 @@ export function __setPgConnect(fn: ConnectFn | null): void {
   _connectOverride = fn;
 }
 
-function sslToPg(s: GlobalArgsT["ssl"]): boolean | Record<string, unknown> {
+/** The resolved `ssl` global argument. */
+export interface SslSettings {
+  /** disable, require, verify-ca or verify-full, as libpq's `sslmode`. */
+  mode: "disable" | "require" | "verify-ca" | "verify-full";
+  /** PEM CA bundle for the verify modes. */
+  ca?: string;
+  /** Overrides the certificate check that `mode` implies. */
+  rejectUnauthorized?: boolean;
+}
+
+/** Map the `ssl` global argument to node-pg's `ssl` option. Exported for tests. */
+export function sslToPg(s: SslSettings): boolean | Record<string, unknown> {
   switch (s.mode) {
     case "disable":
       return false;
     case "require":
       return { rejectUnauthorized: s.rejectUnauthorized ?? false };
     case "verify-ca":
+      // Node's TLS checks the host name unless told not to, which would make
+      // verify-ca the same as verify-full. libpq's verify-ca checks only the
+      // chain, so a server reached by IP with a DNS-named cert still connects.
+      return {
+        ca: s.ca,
+        rejectUnauthorized: s.rejectUnauthorized ?? true,
+        checkServerIdentity: () => undefined,
+      };
     case "verify-full":
       return { ca: s.ca, rejectUnauthorized: s.rejectUnauthorized ?? true };
   }
@@ -340,10 +374,10 @@ function connect(g: GlobalArgsT, database: string): Promise<Conn> {
 }
 
 /**
- * Connect to `database`, apply session guardrails, run `fn`, and ALWAYS close the
- * socket (error path included). Read methods pass `readOnly: true` which sets
- * `default_transaction_read_only = on`, so the server rejects any accidental
- * write. Mutating methods pass `readOnly: false`.
+ * Connect to `database`, apply session guardrails, run `fn`, and always close
+ * the socket, on the error path too. Read methods pass `readOnly: true` which
+ * sets `default_transaction_read_only = on`, so the server rejects any
+ * accidental write. Mutating methods pass `readOnly: false`.
  */
 async function withConn<T>(
   g: GlobalArgsT,
@@ -352,25 +386,60 @@ async function withConn<T>(
   fn: (q: Querier) => Promise<T>,
 ): Promise<T> {
   const { q, end } = await connect(g, database);
+  let result: T;
   try {
     await q.query(`SET statement_timeout = ${Number(g.statementTimeoutMs)}`);
     if (readOnly) await q.query("SET default_transaction_read_only = on");
-    return await fn(q);
-  } finally {
-    await end();
+    result = await fn(q);
+  } catch (e) {
+    // On a broken connection end() can fail too; that error must not replace
+    // the one that says why the method failed.
+    await end().catch(() => {});
+    throw e;
   }
+  await end();
+  return result;
 }
 
 // ─────────────────────────── helpers ───────────────────────────
 
 type Ctx = MethodContext<GlobalArgsT>;
 
+/**
+ * Log at info level. swamp prints only the props named as `{placeholders}` in
+ * the message, so name every prop worth reading there. Never pass a secret.
+ */
 function logInfo(
   context: Pick<Ctx, "logger">,
   message: string,
   props?: Record<string, unknown>,
 ): void {
   context.logger?.info?.(message, props ?? {});
+}
+
+/** As {@link logInfo}, at warning level. */
+function logWarning(
+  context: Pick<Ctx, "logger">,
+  message: string,
+  props?: Record<string, unknown>,
+): void {
+  context.logger?.warn?.(message, props ?? {});
+}
+
+/**
+ * The stored-data name for a record: `<spec>` or `<spec>:<key>:...`. swamp keys
+ * data by model + name, not by spec, so the spec prefix keeps two specs from
+ * overwriting each other. Each key part is percent-escaped for `%`, `:`, `/`,
+ * `\\` and `.` (swamp rejects `/`, `\\` and `..`; `:` is the separator), so two
+ * different keys can never produce the same name.
+ */
+export function dataName(spec: string, ...keys: string[]): string {
+  const escape = (k: string) =>
+    k.replace(
+      /[%:/\\.]/g,
+      (c) => "%" + c.charCodeAt(0).toString(16).toUpperCase().padStart(2, "0"),
+    );
+  return [spec, ...keys.map(escape)].join(":");
 }
 
 /** Validate an identifier against the configured pattern. Separate from `ident`
@@ -400,7 +469,7 @@ function ident(
 
 /** Run `fn` inside one transaction so a multi-statement change is applied in
  * full or not at all. A half-applied change is worse than a failed one here: the next
- * run sees the role (or the schema grant) already present and skips the rest. */
+ * run sees the role (or a grant) already present and skips the rest. */
 async function inTransaction<T>(
   q: Querier,
   fn: () => Promise<T>,
@@ -411,7 +480,9 @@ async function inTransaction<T>(
     await q.query("COMMIT");
     return result;
   } catch (e) {
-    await q.query("ROLLBACK");
+    // On a broken connection ROLLBACK fails too (and the server rolls back
+    // anyway); report the statement's error, not that one.
+    await q.query("ROLLBACK").catch(() => {});
     throw e;
   }
 }
@@ -426,6 +497,22 @@ function asNum(v: unknown): number {
 function asStr(v: unknown): string | undefined {
   return v === null || v === undefined ? undefined : String(v);
 }
+/** A `timestamptz` as node-pg returns it, written as an ISO 8601 string.
+ * node-pg parses the value into a Date (String() of which is not ISO), and
+ * `infinity`/`-infinity` into the numbers Infinity/-Infinity. */
+function asTimestamp(v: unknown): string | undefined {
+  if (v instanceof Date) return v.toISOString();
+  if (v === Infinity) return "infinity";
+  if (v === -Infinity) return "-infinity";
+  return asStr(v);
+}
+
+// pg_database_size needs CONNECT on the database or pg_read_all_stats, and
+// otherwise fails the whole query. A non-superuser admin often lacks CONNECT
+// on some database, so its size is left out (null) instead.
+const DATABASE_SIZE = `CASE WHEN has_database_privilege(d.oid, 'CONNECT')
+                              OR pg_has_role('pg_read_all_stats', 'USAGE')
+                            THEN pg_database_size(d.oid) END`;
 
 /** Read one database's catalog row into a DatabaseInfo (minus action/timestamp). */
 async function readDatabase(
@@ -436,7 +523,7 @@ async function readDatabase(
     `SELECT d.datname AS name, pg_get_userbyid(d.datdba) AS owner,
             pg_encoding_to_char(d.encoding) AS encoding,
             d.datcollate AS collate, d.datctype AS ctype,
-            pg_database_size(d.datname) AS size_bytes,
+            ${DATABASE_SIZE} AS size_bytes,
             d.datistemplate AS is_template, d.datallowconn AS allow_conn
        FROM pg_database d WHERE d.datname = $1`,
     [name],
@@ -477,23 +564,128 @@ async function databaseExists(q: Querier, name: string): Promise<boolean> {
   return r.rows.length > 0;
 }
 
-/** Whether `role` holds USAGE on `schema` by a direct grant (not via PUBLIC).
- * app_provision uses this as its "provisioned before" marker: it is the first
- * grant of Phase B, and Phase B runs in one transaction, so it is present only
- * after a completed provision. Effective-privilege checks would not do, because
- * `public` grants USAGE to PUBLIC on every role. */
-async function holdsSchemaUsage(
+/**
+ * Whether `role` holds any direct schema-scoped grant that app_provision
+ * makes: USAGE or CREATE on `schema`, any privilege on a table or sequence in
+ * `schema`, or a default-privilege entry for `schema`. app_provision uses this
+ * as its "provisioned in this schema before" marker. Phase B runs in one
+ * transaction, so a failed first run leaves none of these behind. Any one of
+ * them counts, so that revoking a single privilege by hand does not make the
+ * next run treat the role as new and grant everything back.
+ *
+ * CONNECT on the database does not count: it is database-wide, so counting it
+ * would make app_provision for a second schema in the same database grant
+ * nothing there.
+ *
+ * Only direct grants count (aclexplode lists ACL entries, not inherited or
+ * PUBLIC privileges): by default the `public` schema grants USAGE to PUBLIC,
+ * so an effective-privilege check would call every role provisioned there. An
+ * owner's own ACL entry does count; that errs towards granting less, never
+ * more.
+ */
+async function holdsProvisionGrant(
   q: Querier,
   schema: string,
   role: string,
 ): Promise<boolean> {
-  const r = await q.query(
+  const grantee = "(SELECT oid FROM pg_roles WHERE rolname = $2)";
+  const probes = [
     `SELECT 1 FROM pg_namespace n, aclexplode(n.nspacl) a
-      WHERE n.nspname = $1 AND a.privilege_type = 'USAGE'
-        AND a.grantee = (SELECT oid FROM pg_roles WHERE rolname = $2)`,
-    [schema, role],
+      WHERE n.nspname = $1 AND a.privilege_type IN ('USAGE', 'CREATE')
+        AND a.grantee = ${grantee}`,
+    `SELECT 1 FROM pg_class c
+       JOIN pg_namespace n ON n.oid = c.relnamespace,
+            aclexplode(c.relacl) a
+      WHERE n.nspname = $1 AND a.grantee = ${grantee} LIMIT 1`,
+    `SELECT 1 FROM pg_default_acl d
+       JOIN pg_namespace n ON n.oid = d.defaclnamespace,
+            aclexplode(d.defaclacl) a
+      WHERE n.nspname = $1 AND a.grantee = ${grantee} LIMIT 1`,
+  ];
+  for (const sql of probes) {
+    const r = await q.query(sql, [schema, role]);
+    if (r.rows.length > 0) return true;
+  }
+  return false;
+}
+
+// SASLprep (RFC 4013) mapping step, as PostgreSQL's saslprep.c applies it:
+// non-ASCII spaces become U+0020 and "commonly mapped to nothing" characters
+// are dropped.
+const NON_ASCII_SPACE = /[\u00A0\u1680\u2000-\u200B\u202F\u205F\u3000]/g;
+const MAPPED_TO_NOTHING =
+  /[\u00AD\u034F\u1806\u180B-\u180D\u200C\u200D\u2060\uFE00-\uFE0F\uFEFF]/g;
+
+/**
+ * Normalise a password the way libpq and the server do before SCRAM hashing,
+ * so a verifier built here matches the one the server would have built from
+ * the plain text. ASCII passes through unchanged, as in PostgreSQL. Otherwise
+ * this applies the SASLprep mapping and NFKC, but not its prohibited-character
+ * and bidi checks: when those fail, PostgreSQL hashes the raw password, so a
+ * non-ASCII password holding such a character may not match. See the README.
+ */
+function saslPrep(password: string): string {
+  // deno-lint-ignore no-control-regex
+  if (/^[\x00-\x7F]*$/.test(password)) return password;
+  return password.replace(NON_ASCII_SPACE, " ").replace(MAPPED_TO_NOTHING, "")
+    .normalize("NFKC");
+}
+
+/** PostgreSQL's default `scram_iterations`, and what libpq uses. */
+const SCRAM_ITERATIONS = 4096;
+
+function toBase64(bytes: ArrayBuffer | Uint8Array): string {
+  return btoa(String.fromCharCode(...new Uint8Array(bytes)));
+}
+
+async function hmacSha256(
+  key: ArrayBuffer,
+  message: string,
+): Promise<ArrayBuffer> {
+  const k = await crypto.subtle.importKey(
+    "raw",
+    key,
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
   );
-  return r.rows.length > 0;
+  return await crypto.subtle.sign("HMAC", k, new TextEncoder().encode(message));
+}
+
+/**
+ * Hash `password` into a SCRAM-SHA-256 verifier (RFC 5802/7677, stored in
+ * PostgreSQL's RFC 5803 form), as psql's `\password` does. The server stores a
+ * value in this shape as it is, so the plain text never leaves this process:
+ * not on the wire, not in `pg_stat_activity`, not in a statement log.
+ * `salt` is for tests only; leave it out to get 16 random bytes, as libpq does.
+ */
+export async function scramSha256Verifier(
+  password: string,
+  salt: Uint8Array<ArrayBuffer> = crypto.getRandomValues(new Uint8Array(16)),
+): Promise<string> {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(saslPrep(password)),
+    "PBKDF2",
+    false,
+    ["deriveBits"],
+  );
+  const saltedPassword = await crypto.subtle.deriveBits(
+    { name: "PBKDF2", hash: "SHA-256", salt, iterations: SCRAM_ITERATIONS },
+    key,
+    256,
+  );
+  const clientKey = await hmacSha256(saltedPassword, "Client Key");
+  const storedKey = await crypto.subtle.digest("SHA-256", clientKey);
+  const serverKey = await hmacSha256(saltedPassword, "Server Key");
+  return `SCRAM-SHA-256$${SCRAM_ITERATIONS}:${toBase64(salt)}$${
+    toBase64(storedKey)
+  }:${toBase64(serverKey)}`;
+}
+
+/** The `PASSWORD '<verifier>'` clause for a role: hashed here, never plain. */
+async function passwordClause(q: Querier, password: string): Promise<string> {
+  return `PASSWORD ${q.escapeLiteral(await scramSha256Verifier(password))}`;
 }
 
 /** Join an already-validated privilege list into a SQL fragment (enum-bounded, safe). */
@@ -503,17 +695,8 @@ function privList(privs: string[]): string {
 
 // ─────────────────────────── method argument schemas ───────────────────────────
 
-/**
- * A strict boolean. `z.coerce.boolean()` runs `Boolean(v)`, so `"0"` and
- * `"False"` become true; this accepts only true/false and their strings.
- */
-const StrictBool = z.union(
-  [z.boolean(), z.literal("true"), z.literal("false")],
-  { error: 'expected true or false (or the strings "true" / "false")' },
-).transform((v) => v === true || v === "true");
-
 const DatabaseListArgs = z.object({
-  includeTemplates: StrictBool
+  includeTemplates: z.boolean()
     .default(false)
     .describe("Include template databases (template0/template1)"),
 });
@@ -521,23 +704,37 @@ const DatabaseListArgs = z.object({
 const PermissionsAuditArgs = z.object({
   database: z.string().describe("Database to audit (connects to it)"),
   role: z.string().optional().describe(
-    "Role to scope the audit to; omit to list all table/usage grants in the db",
+    "Role to scope the audit to; omit to list every role's table/usage grants " +
+      "in the db. System schemas (pg_*, information_schema) and collations " +
+      "are left out.",
   ),
 });
 
+// pg_class.relkind values that have columns worth describing: ordinary and
+// partitioned tables, views, materialised views and foreign tables.
+const TABLE_LIKE_KINDS = ["r", "p", "v", "m", "f"];
+const RELKIND_NAMES: Record<string, string> = {
+  i: "an index",
+  I: "a partitioned index",
+  S: "a sequence",
+  c: "a composite type",
+  t: "a TOAST table",
+};
+
 const TableInspectArgs = z.object({
-  database: z.string(),
-  schema: z.string().default("public"),
-  table: z.string(),
+  database: z.string().describe("Database holding the table (connects to it)"),
+  schema: z.string().default("public").describe("Schema of the table"),
+  table: z.string().describe("Table, view or foreign table to describe"),
 });
 
 const ConnectionsListArgs = z.object({
   database: z.string().optional().describe("Filter to one database's backends"),
-  includeQuery: StrictBool
+  includeQuery: z.boolean()
     .default(false)
     .describe(
-      "Include the current `query` text. OFF by default — query text can contain " +
-        "literal row data, which would violate the no-data-reads guarantee.",
+      "Include the current `query` text, cut to its first 2,000 characters. " +
+        "Off by default: query text can contain literal row data, which would " +
+        "break the no-data-reads guarantee.",
     ),
 });
 
@@ -548,30 +745,44 @@ const ExtensionListArgs = z.object({
 });
 
 const DatabaseCreateArgs = z.object({
-  name: z.string(),
-  owner: z.string().optional(),
+  name: z.string().describe("Database to create"),
+  owner: z.string().optional().describe(
+    "Owning role; defaults to the admin login",
+  ),
   encoding: z.string().optional().describe(
     "Only emitted when set; a non-default encoding usually needs template0",
   ),
-  template: z.string().optional(),
-  locale: z.string().optional(),
+  template: z.string().optional().describe(
+    "Template database to copy; defaults to template1",
+  ),
+  locale: z.string().optional().describe(
+    "Sets both LC_COLLATE and LC_CTYPE, e.g. en_GB.UTF-8",
+  ),
 });
 
 const RoleCreateArgs = z.object({
-  name: z.string(),
-  login: StrictBool
-    .default(true),
-  password: z.string().optional().meta({ sensitive: true }).describe(
-    "Supply via vault expression; embedded via escapeLiteral, never logged/echoed",
+  name: z.string().describe("Role to create"),
+  login: z.boolean()
+    .default(true)
+    .describe("LOGIN (a user) when true, NOLOGIN (a group role) when false"),
+  // min(1): PostgreSQL reads PASSWORD '' as PASSWORD NULL, so an empty
+  // value (say, a vault expression that resolved to nothing) would make a
+  // LOGIN role with no password. Omit the field for a role without one.
+  password: z.string().min(1).optional().meta({ sensitive: true }).describe(
+    "Supply via vault expression. Sent only as a SCRAM-SHA-256 verifier, never logged/echoed. Must not be empty",
   ),
-  connLimit: z.coerce.number().int().default(-1),
+  connLimit: z.coerce.number().int().default(-1).describe(
+    "CONNECTION LIMIT; -1 means no limit",
+  ),
   validUntil: z.string().optional().describe(
     "e.g. 2027-01-01 (a timestamp literal)",
   ),
-  createDb: StrictBool
-    .default(false),
-  createRole: StrictBool
-    .default(false),
+  createDb: z.boolean()
+    .default(false)
+    .describe("Give the role CREATEDB"),
+  createRole: z.boolean()
+    .default(false)
+    .describe("Give the role CREATEROLE"),
   memberOf: z.array(z.string()).default([]).describe(
     "Parent roles to GRANT to this role",
   ),
@@ -580,21 +791,31 @@ const RoleCreateArgs = z.object({
 const GrantScope = z.enum(["database", "schema", "table", "sequence"]);
 
 const GrantArgs = z.object({
-  database: z.string(),
-  scope: GrantScope,
-  privileges: z.array(Privilege).min(1),
-  role: z.string(),
+  database: z.string().describe(
+    "Database the privileges apply in (or to, for database scope)",
+  ),
+  scope: GrantScope.describe("Kind of object the privileges are on"),
+  privileges: z.array(Privilege).min(1).describe(
+    "Privileges to grant or revoke; TRUNCATE and ALL are not allowed",
+  ),
+  role: z.string().describe("Role that receives (or loses) the privileges"),
   schema: z.string().optional().describe(
     "Required for schema/table/sequence scope",
   ),
   objects: z.array(z.string()).default([]).describe(
-    "Specific table/sequence names; empty + allInSchema=true targets ALL in schema",
+    "Specific table/sequence names. Leave empty when allInSchema=true",
   ),
-  allInSchema: StrictBool
-    .default(false),
-  includeFuture: StrictBool
+  allInSchema: z.boolean()
     .default(false)
-    .describe("Also ALTER DEFAULT PRIVILEGES for future objects in the schema"),
+    .describe(
+      "Target every existing table/sequence in `schema` instead of `objects`",
+    ),
+  includeFuture: z.boolean()
+    .default(false)
+    .describe(
+      "Also ALTER DEFAULT PRIVILEGES for future objects in the schema. " +
+        "Table and sequence scope only",
+    ),
   defaultForRole: z.string().optional().describe(
     "FOR ROLE in ALTER DEFAULT PRIVILEGES: the role whose future objects the " +
       "grant covers (the one that will create the tables). Required when " +
@@ -604,36 +825,45 @@ const GrantArgs = z.object({
 });
 
 const RolePasswordSetArgs = z.object({
-  name: z.string(),
-  password: z.string().meta({ sensitive: true }),
+  name: z.string().describe("Existing role whose password to set"),
+  // min(1): PASSWORD '' clears the password rather than setting one.
+  password: z.string().min(1).meta({ sensitive: true }).describe(
+    "New password; supply via vault expression. Sent only as a SCRAM-SHA-256 verifier. Must not be empty",
+  ),
 });
 
 const AppProvisionArgs = z.object({
-  database: z.string(),
-  role: z.string(),
-  password: z.string().optional().meta({ sensitive: true }).describe(
-    "Login password for a NEW role (ignored if the role already exists)",
+  database: z.string().describe("Database to create (or reuse) for the app"),
+  role: z.string().describe("Login role to create (or reuse) for the app"),
+  // min(1): see RoleCreateArgs.password.
+  password: z.string().min(1).optional().meta({ sensitive: true }).describe(
+    "Login password for a NEW role (ignored if the role already exists). Must not be empty",
   ),
   owner: z.string().optional().describe(
     "Database/schema owner; defaults to `role`",
   ),
-  schema: z.string().default("public"),
-  createSchema: StrictBool
-    .default(false),
+  schema: z.string().default("public").describe(
+    "Schema the role is provisioned in",
+  ),
+  createSchema: z.boolean()
+    .default(false)
+    .describe("CREATE SCHEMA IF NOT EXISTS, owned by `owner` (not for public)"),
   // No schema defaults: GRANT only adds, so a default re-applied on a re-run
   // would widen a role provisioned with less. The method applies them only
   // when the role has not been provisioned in the schema before.
   tablePrivs: z.array(TablePrivilege).optional().describe(
     "Table privileges to grant. Defaults to SELECT, INSERT, UPDATE, DELETE " +
-      "until the role holds the schema grant; omitted on a later run, table " +
-      "grants are left as they are.",
+      "until the role holds a grant in this schema from an earlier run; omitted on " +
+      "a later run, table grants are left as they are.",
   ),
-  includeFuture: StrictBool.optional().describe(
+  includeFuture: z.boolean().optional().describe(
     "Also grant on future tables and sequences. Defaults to true until the " +
-      "role holds the schema grant; omitted on a later run, default " +
-      "privileges are left as they are.",
+      "role holds a grant in this schema from an earlier run; omitted on a later " +
+      "run, default privileges are left as they are.",
   ),
-  connLimit: z.coerce.number().int().default(-1),
+  connLimit: z.coerce.number().int().default(-1).describe(
+    "CONNECTION LIMIT for a new role; -1 means no limit. Ignored if the role exists",
+  ),
 });
 
 // ─────────────────────────── model ───────────────────────────
@@ -646,8 +876,18 @@ const AppProvisionArgs = z.object({
  */
 export const model = {
   type: "@thomas/postgres-admin",
-  version: "2026.06.01.1",
+  version: "2026.10.11.1",
   globalArguments: GlobalArgs,
+  upgrades: [
+    {
+      toVersion: "2026.10.11.1",
+      description:
+        "No change to the global arguments' shape: port must now be 1-65535 and statementTimeoutMs at least 0, which PostgreSQL already required. Data names are now <spec>:<key>, so data written by earlier versions stays under its old names and is not migrated.",
+      upgradeAttributes: (
+        old: Record<string, unknown>,
+      ): Record<string, unknown> => old,
+    },
+  ],
   checks: {
     "reachable": {
       description:
@@ -755,7 +995,7 @@ export const model = {
             `SELECT d.datname AS name, pg_get_userbyid(d.datdba) AS owner,
                     pg_encoding_to_char(d.encoding) AS encoding,
                     d.datcollate AS collate, d.datctype AS ctype,
-                    pg_database_size(d.datname) AS size_bytes,
+                    ${DATABASE_SIZE} AS size_bytes,
                     d.datistemplate AS is_template, d.datallowconn AS allow_conn
                FROM pg_database d
               WHERE $1 OR NOT d.datistemplate
@@ -768,11 +1008,14 @@ export const model = {
             handles.push(
               await context.writeResource(
                 "database",
-                String(row.name),
+                dataName("database", String(row.name)),
                 shapeDatabase(row, "observed", ts),
               ),
             );
           }
+          logInfo(context, "Listed {count} databases", {
+            count: handles.length,
+          });
           return { dataHandles: handles };
         });
       },
@@ -789,36 +1032,51 @@ export const model = {
         const g = context.globalArgs;
         logInfo(context, "Listing roles");
         return await withConn(g, g.maintenanceDb, true, async (q) => {
+          // `::text`: node-pg parses a text[] into an array but leaves a
+          // name[] as the raw string "{a,b}". DISTINCT: PostgreSQL 16+ keeps
+          // one membership row per grantor, so a parent can appear twice.
           const r = await q.query(
             `SELECT r.rolname AS name, r.rolcanlogin AS login, r.rolsuper AS superuser,
                     r.rolcreatedb AS create_db, r.rolcreaterole AS create_role,
                     r.rolreplication AS replication, r.rolbypassrls AS bypass_rls,
                     r.rolconnlimit AS conn_limit, r.rolvaliduntil AS valid_until,
-                    ARRAY(SELECT g.rolname FROM pg_auth_members m
+                    ARRAY(SELECT DISTINCT g.rolname::text FROM pg_auth_members m
                             JOIN pg_roles g ON g.oid = m.roleid
-                           WHERE m.member = r.oid ORDER BY g.rolname) AS member_of
+                           WHERE m.member = r.oid ORDER BY 1) AS member_of
                FROM pg_roles r ORDER BY r.rolname`,
           );
           const ts = new Date().toISOString();
           const handles: DataHandle[] = [];
           for (const row of r.rows) {
+            if (!Array.isArray(row.member_of)) {
+              throw new Error(
+                `role_list: memberOf for role ${
+                  JSON.stringify(row.name)
+                } came back as ${typeof row.member_of}, not an array`,
+              );
+            }
             handles.push(
-              await context.writeResource("role", String(row.name), {
-                name: String(row.name),
-                login: asBool(row.login),
-                superuser: asBool(row.superuser),
-                createDb: asBool(row.create_db),
-                createRole: asBool(row.create_role),
-                replication: asBool(row.replication),
-                bypassRls: asBool(row.bypass_rls),
-                connLimit: asNum(row.conn_limit),
-                validUntil: asStr(row.valid_until),
-                memberOf: (row.member_of as string[] | null) ?? [],
-                action: "observed",
-                timestamp: ts,
-              }),
+              await context.writeResource(
+                "role",
+                dataName("role", String(row.name)),
+                {
+                  name: String(row.name),
+                  login: asBool(row.login),
+                  superuser: asBool(row.superuser),
+                  createDb: asBool(row.create_db),
+                  createRole: asBool(row.create_role),
+                  replication: asBool(row.replication),
+                  bypassRls: asBool(row.bypass_rls),
+                  connLimit: asNum(row.conn_limit),
+                  validUntil: asTimestamp(row.valid_until),
+                  memberOf: row.member_of.map(String),
+                  action: "observed",
+                  timestamp: ts,
+                },
+              ),
             );
           }
+          logInfo(context, "Listed {count} roles", { count: handles.length });
           return { dataHandles: handles };
         });
       },
@@ -826,8 +1084,12 @@ export const model = {
 
     permissions_audit: {
       description:
-        "Audit privileges for a database (optionally a single role): database/schema privileges, " +
-        "table & usage grants, and default privileges. Catalog reads only.",
+        "Audit privileges for a database (optionally a single role). databasePrivileges and " +
+        "schemaPrivileges are effective privileges (including PUBLIC and role membership), " +
+        "present only when `role` is given. tableGrants, usageGrants and sequenceGrants are " +
+        "direct grants, with grantee and grantor; sequenceGrants lists every privilege on " +
+        "sequences, USAGE included. Also lists default privileges. System schemas and " +
+        "collations are left out. Catalog reads only.",
       arguments: PermissionsAuditArgs,
       execute: async (
         rawArgs,
@@ -840,10 +1102,12 @@ export const model = {
           role: a.role ?? "(all)",
         });
         return await withConn(g, a.database, true, async (q) => {
-          const databasePrivileges: string[] = [];
-          const schemaPrivileges: Array<z.infer<typeof SchemaPriv>> = [];
+          let databasePrivileges: string[] | undefined;
+          let schemaPrivileges: Array<z.infer<typeof SchemaPriv>> | undefined;
 
           if (a.role) {
+            databasePrivileges = [];
+            schemaPrivileges = [];
             const dbr = await q.query(
               `SELECT p AS priv, has_database_privilege($1, $2, p) AS granted
                  FROM unnest(ARRAY['CONNECT','CREATE','TEMP']) AS p`,
@@ -873,31 +1137,76 @@ export const model = {
             }
           }
 
+          // System schemas are left out: their grants are the same on every
+          // server, and unscoped they ran to thousands of rows that buried
+          // the database's own. Collations are left out because every one
+          // carries an implicit USAGE to PUBLIC. COALESCE keeps foreign data
+          // wrappers and servers, which belong to no schema.
           const tg = await q.query(
-            `SELECT table_schema AS schema, table_name AS name, privilege_type AS privilege, is_grantable
+            `SELECT table_schema AS schema, table_name AS name, privilege_type AS privilege,
+                    grantee, grantor, is_grantable
                FROM information_schema.role_table_grants
               WHERE ($1::text IS NULL OR grantee = $1)
-              ORDER BY table_schema, table_name, privilege_type`,
+                AND table_schema NOT LIKE 'pg\\_%' AND table_schema <> 'information_schema'
+              ORDER BY table_schema, table_name, privilege_type, grantee, grantor`,
             [a.role ?? null],
           );
           const tableGrants = tg.rows.map((row) => ({
             schema: String(row.schema),
             name: String(row.name),
             privilege: String(row.privilege),
+            grantee: String(row.grantee),
+            grantor: String(row.grantor),
             grantable: asBool(row.is_grantable),
           }));
 
           const ug = await q.query(
-            `SELECT object_schema AS schema, object_name AS name, privilege_type AS privilege, is_grantable
+            `SELECT object_schema AS schema, object_name AS name, privilege_type AS privilege,
+                    grantee, grantor, is_grantable
                FROM information_schema.role_usage_grants
               WHERE ($1::text IS NULL OR grantee = $1)
-              ORDER BY object_schema, object_name, privilege_type`,
+                AND COALESCE(object_schema, '') NOT LIKE 'pg\\_%'
+                AND COALESCE(object_schema, '') <> 'information_schema'
+                AND object_type <> 'COLLATION'
+              ORDER BY object_schema, object_name, privilege_type, grantee, grantor`,
             [a.role ?? null],
           );
           const usageGrants = ug.rows.map((row) => ({
             schema: asStr(row.schema) ?? "",
             name: asStr(row.name) ?? "",
             privilege: String(row.privilege),
+            grantee: String(row.grantee),
+            grantor: String(row.grantor),
+            grantable: asBool(row.is_grantable),
+          }));
+
+          // Read from the ACL itself: information_schema.table_privileges
+          // has no sequences. A NULL relacl means the built-in default (the
+          // owner holds everything), which acldefault spells out. Grantee 0
+          // is PUBLIC.
+          const sg = await q.query(
+            `SELECT schema, name, privilege, grantee, grantor, is_grantable
+               FROM (SELECT n.nspname AS schema, c.relname AS name,
+                            a.privilege_type AS privilege,
+                            CASE WHEN a.grantee = 0 THEN 'PUBLIC'
+                                 ELSE pg_get_userbyid(a.grantee) END AS grantee,
+                            pg_get_userbyid(a.grantor) AS grantor,
+                            a.is_grantable
+                       FROM pg_class c
+                       JOIN pg_namespace n ON n.oid = c.relnamespace,
+                            aclexplode(COALESCE(c.relacl, acldefault('s', c.relowner))) a
+                      WHERE c.relkind = 'S'
+                        AND n.nspname NOT LIKE 'pg\\_%' AND n.nspname <> 'information_schema') s
+              WHERE ($1::text IS NULL OR grantee = $1)
+              ORDER BY schema, name, privilege, grantee, grantor`,
+            [a.role ?? null],
+          );
+          const sequenceGrants = sg.rows.map((row) => ({
+            schema: String(row.schema),
+            name: String(row.name),
+            privilege: String(row.privilege),
+            grantee: String(row.grantee),
+            grantor: String(row.grantor),
             grantable: asBool(row.is_grantable),
           }));
 
@@ -920,7 +1229,11 @@ export const model = {
           const ts = new Date().toISOString();
           const handle = await context.writeResource(
             "permissions-audit",
-            `${a.database}-${a.role ?? "all"}`,
+            // No role = the audit of all roles; one key part fewer, so no role
+            // name (not even "all") can collide with it.
+            a.role === undefined
+              ? dataName("permissions-audit", a.database)
+              : dataName("permissions-audit", a.database, a.role),
             {
               database: a.database,
               role: a.role,
@@ -928,9 +1241,18 @@ export const model = {
               schemaPrivileges,
               tableGrants,
               usageGrants,
+              sequenceGrants,
               defaultPrivileges,
               action: "observed",
               timestamp: ts,
+            },
+          );
+          logInfo(
+            context,
+            "Audited permissions: {tableGrants} table and {usageGrants} usage grants",
+            {
+              tableGrants: tableGrants.length,
+              usageGrants: usageGrants.length,
             },
           );
           return { dataHandles: [handle] };
@@ -940,7 +1262,8 @@ export const model = {
 
     table_inspect: {
       description:
-        "Describe a table: columns, primary key, indexes, constraints, owner. Catalog only — NEVER reads table rows.",
+        "Describe a table (or view, materialised view, foreign table): columns, primary key, " +
+        "indexes, constraints, owner. Catalog only; never reads table rows.",
       arguments: TableInspectArgs,
       execute: async (
         rawArgs,
@@ -954,22 +1277,39 @@ export const model = {
           table: a.table,
         });
         return await withConn(g, a.database, true, async (q) => {
-          const exists = await q.query(
-            "SELECT to_regclass(format('%I.%I', $1::text, $2::text)) IS NOT NULL AS present",
+          const found = await q.query(
+            `SELECT c.relkind AS kind FROM pg_class c
+              WHERE c.oid = to_regclass(format('%I.%I', $1::text, $2::text))`,
             [a.schema, a.table],
           );
-          if (!asBool(exists.rows[0]?.present)) {
+          if (found.rows.length === 0) {
             throw new Error(
               `Table ${a.schema}.${a.table} does not exist in database ${a.database}`,
             );
           }
+          // to_regclass also finds indexes, sequences and composite types,
+          // which have no columns here; describing one would look like an
+          // empty table.
+          const kind = String(found.rows[0].kind);
+          if (!TABLE_LIKE_KINDS.includes(kind)) {
+            throw new Error(
+              `${a.schema}.${a.table} in database ${a.database} is ${
+                RELKIND_NAMES[kind] ?? `relkind ${kind}`
+              }, not a table or view`,
+            );
+          }
 
           const cols = await q.query(
-            `SELECT column_name AS name, data_type AS type, is_nullable AS nullable,
-                    column_default AS def, ordinal_position AS position
-               FROM information_schema.columns
-              WHERE table_schema = $1 AND table_name = $2
-              ORDER BY ordinal_position`,
+            // format_type gives the declared type (text[], my_enum,
+            // varchar(40)) where data_type says only ARRAY or USER-DEFINED.
+            `SELECT c.column_name AS name, c.is_nullable AS nullable,
+                    (SELECT format_type(t.atttypid, t.atttypmod) FROM pg_attribute t
+                      WHERE t.attrelid = format('%I.%I', $1::text, $2::text)::regclass
+                        AND t.attname = c.column_name) AS type,
+                    c.column_default AS def, c.ordinal_position AS position
+               FROM information_schema.columns c
+              WHERE c.table_schema = $1 AND c.table_name = $2
+              ORDER BY c.ordinal_position`,
             [a.schema, a.table],
           );
           const columns = cols.rows.map((row) => ({
@@ -1003,6 +1343,7 @@ export const model = {
             `SELECT conname AS name,
                     CASE contype WHEN 'p' THEN 'primary key' WHEN 'f' THEN 'foreign key'
                          WHEN 'u' THEN 'unique' WHEN 'c' THEN 'check' WHEN 'x' THEN 'exclusion'
+                         WHEN 'n' THEN 'not null' WHEN 't' THEN 'trigger'
                          ELSE contype::text END AS type,
                     pg_get_constraintdef(oid) AS def
                FROM pg_constraint
@@ -1026,7 +1367,7 @@ export const model = {
           const ts = new Date().toISOString();
           const handle = await context.writeResource(
             "table",
-            `${a.database}-${a.schema}-${a.table}`,
+            dataName("table", a.database, a.schema, a.table),
             {
               database: a.database,
               schema: a.schema,
@@ -1040,6 +1381,9 @@ export const model = {
               timestamp: ts,
             },
           );
+          logInfo(context, "Inspected table: {columns} columns", {
+            columns: columns.length,
+          });
           return { dataHandles: [handle] };
         });
       },
@@ -1047,8 +1391,9 @@ export const model = {
 
     connections_list: {
       description:
-        "List backends from pg_stat_activity (factory: one `connection` per pid). The `query` " +
-        "column is OMITTED unless includeQuery=true (it can contain row data).",
+        "List backends from pg_stat_activity (factory: one `connection` per pid), " +
+        "including the server's own processes; `backendType` tells them apart. The " +
+        "`query` column is left out unless includeQuery=true (it can contain row data).",
       arguments: ConnectionsListArgs,
       execute: async (
         rawArgs,
@@ -1061,7 +1406,8 @@ export const model = {
         });
         return await withConn(g, g.maintenanceDb, true, async (q) => {
           const r = await q.query(
-            `SELECT pid, usename AS "user", datname AS db, state, client_addr::text AS client_addr,
+            `SELECT pid, backend_type, usename AS "user", datname AS db, state,
+                    host(client_addr) AS client_addr,
                     EXTRACT(EPOCH FROM (now() - backend_start))::int AS backend_age_sec,
                     wait_event_type, wait_event,
                     CASE WHEN $1 THEN left(query, 2000) ELSE NULL END AS query
@@ -1074,22 +1420,30 @@ export const model = {
           const handles: DataHandle[] = [];
           for (const row of r.rows) {
             handles.push(
-              await context.writeResource("connection", String(row.pid), {
-                pid: asNum(row.pid),
-                user: asStr(row.user),
-                db: asStr(row.db),
-                state: asStr(row.state),
-                clientAddr: asStr(row.client_addr),
-                backendAgeSec: row.backend_age_sec === null
-                  ? undefined
-                  : asNum(row.backend_age_sec),
-                waitEventType: asStr(row.wait_event_type),
-                waitEvent: asStr(row.wait_event),
-                query: asStr(row.query),
-                timestamp: ts,
-              }),
+              await context.writeResource(
+                "connection",
+                dataName("connection", String(row.pid)),
+                {
+                  pid: asNum(row.pid),
+                  backendType: asStr(row.backend_type),
+                  user: asStr(row.user),
+                  db: asStr(row.db),
+                  state: asStr(row.state),
+                  clientAddr: asStr(row.client_addr),
+                  backendAgeSec: row.backend_age_sec === null
+                    ? undefined
+                    : asNum(row.backend_age_sec),
+                  waitEventType: asStr(row.wait_event_type),
+                  waitEvent: asStr(row.wait_event),
+                  query: asStr(row.query),
+                  timestamp: ts,
+                },
+              ),
             );
           }
+          logInfo(context, "Listed {count} connections", {
+            count: handles.length,
+          });
           return { dataHandles: handles };
         });
       },
@@ -1120,32 +1474,45 @@ export const model = {
         }
         logInfo(context, "Listing extensions", { databases: dbs.length });
 
-        const ts = new Date().toISOString();
-        const handles: DataHandle[] = [];
+        // Read every database before writing anything: a database that
+        // refuses the connection late in the list must fail the run without
+        // leaving the earlier databases' records behind as a partial result.
+        const found: Array<{ db: string; rows: Record<string, unknown>[] }> =
+          [];
         for (const db of dbs) {
-          await withConn(g, db, true, async (q) => {
+          const rows = await withConn(g, db, true, async (q) => {
             const r = await q.query(
               `SELECT e.extname AS name, e.extversion AS version, n.nspname AS schema
                  FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace
                 ORDER BY e.extname`,
             );
-            for (const row of r.rows) {
-              handles.push(
-                await context.writeResource(
-                  "extension",
-                  `${db}-${String(row.name)}`,
-                  {
-                    database: db,
-                    name: String(row.name),
-                    version: String(row.version),
-                    schema: asStr(row.schema),
-                    timestamp: ts,
-                  },
-                ),
-              );
-            }
+            return r.rows;
           });
+          found.push({ db, rows });
         }
+
+        const ts = new Date().toISOString();
+        const handles: DataHandle[] = [];
+        for (const { db, rows } of found) {
+          for (const row of rows) {
+            handles.push(
+              await context.writeResource(
+                "extension",
+                dataName("extension", db, String(row.name)),
+                {
+                  database: db,
+                  name: String(row.name),
+                  version: String(row.version),
+                  schema: asStr(row.schema),
+                  timestamp: ts,
+                },
+              ),
+            );
+          }
+        }
+        logInfo(context, "Listed {records} extensions", {
+          records: handles.length,
+        });
         return { dataHandles: handles };
       },
     },
@@ -1153,7 +1520,8 @@ export const model = {
     // ───────────── mutating (admin DDL, data-safe) ─────────────
     database_create: {
       description:
-        "Create a database (idempotent: returns the existing one as `unchanged`). Never drops.",
+        "Create a database (idempotent: returns the existing one as `unchanged`, not altered; " +
+        "a warning names any arguments not applied). Never drops.",
       arguments: DatabaseCreateArgs,
       execute: async (
         rawArgs,
@@ -1164,13 +1532,25 @@ export const model = {
         return await withConn(g, g.maintenanceDb, false, async (q) => {
           const ts = new Date().toISOString();
           if (await databaseExists(q, a.name)) {
-            logInfo(context, "Database already exists; unchanged", {
+            logInfo(context, "Database {name} already exists; unchanged", {
               name: a.name,
             });
+            // An existing database is not compared or altered, so say which
+            // requested settings were not applied rather than drop them quietly.
+            const ignored =
+              (["owner", "encoding", "template", "locale"] as const)
+                .filter((k) => a[k] !== undefined);
+            if (ignored.length > 0) {
+              logWarning(
+                context,
+                "Database {name} exists, so these arguments were not applied: {ignored}",
+                { name: a.name, ignored: ignored.join(", ") },
+              );
+            }
             const row = await readDatabase(q, a.name);
             const handle = await context.writeResource(
               "database",
-              a.name,
+              dataName("database", a.name),
               shapeDatabase(row!, "unchanged", ts),
             );
             return { dataHandles: [handle] };
@@ -1187,9 +1567,10 @@ export const model = {
           const row = await readDatabase(q, a.name);
           const handle = await context.writeResource(
             "database",
-            a.name,
+            dataName("database", a.name),
             shapeDatabase(row!, "created", ts),
           );
+          logInfo(context, "Created database {name}", { name: a.name });
           return { dataHandles: [handle] };
         });
       },
@@ -1197,7 +1578,8 @@ export const model = {
 
     role_create: {
       description:
-        "Create a login/group role (idempotent: existing role returned as `unchanged`, not altered). Never drops.",
+        "Create a login/group role (idempotent: existing role returned as `unchanged`, not altered; " +
+        "a warning names any arguments not applied). Never drops.",
       arguments: RoleCreateArgs,
       execute: async (
         rawArgs,
@@ -1213,15 +1595,39 @@ export const model = {
         return await withConn(g, g.maintenanceDb, false, async (q) => {
           const ts = new Date().toISOString();
           if (await roleExists(q, a.name)) {
-            logInfo(context, "Role already exists; unchanged", {
+            logInfo(context, "Role {name} already exists; unchanged", {
               name: a.name,
             });
-            const handle = await context.writeResource("role-result", a.name, {
-              role: a.name,
-              action: "unchanged",
-              passwordSet: false,
-              timestamp: ts,
-            });
+            // An existing role is not compared or altered. Name the requested
+            // settings that were not applied (never their values: one may be
+            // the password). Defaults are left out, as the caller may not
+            // have asked for them.
+            const ignored = [
+              a.login ? "" : "login",
+              a.password === undefined ? "" : "password",
+              a.connLimit === -1 ? "" : "connLimit",
+              a.validUntil === undefined ? "" : "validUntil",
+              a.createDb ? "createDb" : "",
+              a.createRole ? "createRole" : "",
+              a.memberOf.length === 0 ? "" : "memberOf",
+            ].filter((k) => k !== "");
+            if (ignored.length > 0) {
+              logWarning(
+                context,
+                "Role {name} exists, so these arguments were not applied: {ignored}",
+                { name: a.name, ignored: ignored.join(", ") },
+              );
+            }
+            const handle = await context.writeResource(
+              "role-result",
+              dataName("role-result", a.name),
+              {
+                role: a.name,
+                action: "unchanged",
+                passwordSet: false,
+                timestamp: ts,
+              },
+            );
             return { dataHandles: [handle] };
           }
           const parts = [`CREATE ROLE ${ident(g, q, a.name, "role")}`];
@@ -1229,7 +1635,7 @@ export const model = {
           if (a.createDb) parts.push("CREATEDB");
           if (a.createRole) parts.push("CREATEROLE");
           parts.push(`CONNECTION LIMIT ${Number(a.connLimit)}`);
-          if (a.password) parts.push(`PASSWORD ${q.escapeLiteral(a.password)}`);
+          if (a.password) parts.push(await passwordClause(q, a.password));
           if (a.validUntil) {
             parts.push(`VALID UNTIL ${q.escapeLiteral(a.validUntil)}`);
           }
@@ -1246,12 +1652,24 @@ export const model = {
               );
             }
           });
-          const handle = await context.writeResource("role-result", a.name, {
-            role: a.name,
-            action: "created",
-            passwordSet: !!a.password,
-            timestamp: ts,
-          });
+          const handle = await context.writeResource(
+            "role-result",
+            dataName("role-result", a.name),
+            {
+              role: a.name,
+              action: "created",
+              passwordSet: !!a.password,
+              timestamp: ts,
+            },
+          );
+          logInfo(
+            context,
+            "Created role {name} with {memberships} memberships",
+            {
+              name: a.name,
+              memberships: a.memberOf.length,
+            },
+          );
           return { dataHandles: [handle] };
         });
       },
@@ -1273,15 +1691,23 @@ export const model = {
           }
           logInfo(context, "Rotating role password", { name: a.name }); // never logs the value
           await q.query(
-            `ALTER ROLE ${ident(g, q, a.name, "role")} PASSWORD ${
-              q.escapeLiteral(a.password)
-            }`,
+            `ALTER ROLE ${ident(g, q, a.name, "role")} ${await passwordClause(
+              q,
+              a.password,
+            )}`,
           );
-          const handle = await context.writeResource("role-result", a.name, {
-            role: a.name,
-            action: "rotated",
-            passwordSet: true,
-            timestamp: new Date().toISOString(),
+          const handle = await context.writeResource(
+            "role-result",
+            dataName("role-result", a.name),
+            {
+              role: a.name,
+              action: "rotated",
+              passwordSet: true,
+              timestamp: new Date().toISOString(),
+            },
+          );
+          logInfo(context, "Rotated the password of role {name}", {
+            name: a.name,
           });
           return { dataHandles: [handle] };
         });
@@ -1321,8 +1747,12 @@ export const model = {
       description:
         "Composite, idempotent 'new application' setup: create database + login role (vault password) + " +
         "grant CONNECT, schema USAGE/CREATE, table/sequence privileges, and (default) future-object " +
-        "privileges. A re-run grants only the table privileges and future-object privileges it is " +
-        "given, so it never widens a role, including one narrowed by hand. Never drops.",
+        "privileges. Once the role directly holds any of the schema-scoped grants (schema " +
+        "USAGE/CREATE, table or sequence privileges, default privileges for the schema), a " +
+        "re-run grants only the table privileges and future-object privileges it is given, so " +
+        "it never widens a role narrowed by hand. CONNECT does not count, so a second schema " +
+        "in the same database gets the full set. Revoking every schema-scoped grant resets the " +
+        "role to unprovisioned in that schema. Never drops.",
       arguments: AppProvisionArgs,
       execute: async (
         rawArgs,
@@ -1349,7 +1779,7 @@ export const model = {
               `CONNECTION LIMIT ${Number(a.connLimit)}`,
             ];
             if (a.password) {
-              parts.push(`PASSWORD ${q.escapeLiteral(a.password)}`);
+              parts.push(await passwordClause(q, a.password));
             }
             logInfo(context, "app_provision: creating role", { role: a.role });
             await q.query(parts.join(" "));
@@ -1378,15 +1808,19 @@ export const model = {
           // "Before" is read from the catalog, not from whether this run
           // created the role: a first run that failed after Phase A leaves the
           // role and database in place, and keying on creation would then
-          // grant nothing on every re-run. The schema USAGE grant is the
-          // marker because Phase B is one transaction, so it is present only
-          // after the whole set of grants was applied. CONNECT and the schema
-          // grants are issued only before that point, so a re-run cannot put
-          // back a privilege someone revoked to narrow the role.
-          const provisioned = await holdsSchemaUsage(q, a.schema, a.role);
+          // grant nothing on every re-run. See holdsProvisionGrant for why
+          // any one direct schema-scoped grant is the marker. CONNECT and the
+          // schema grants are issued only before that point, so a re-run
+          // cannot put back a privilege someone revoked to narrow the role.
+          const provisioned = await holdsProvisionGrant(q, a.schema, a.role);
           const tablePrivs = a.tablePrivs ??
             (provisioned ? [] : ["SELECT", "INSERT", "UPDATE", "DELETE"]);
           const includeFuture = a.includeFuture ?? !provisioned;
+          logInfo(
+            context,
+            "app_provision: granting in schema {schema} (provisioned before: {provisioned})",
+            { schema: a.schema, provisioned },
+          );
 
           const sc = ident(g, q, a.schema, "schema");
           const ro = ident(g, q, a.role, "role");
@@ -1442,18 +1876,22 @@ export const model = {
         });
         const { includeFuture, privsGranted } = phaseB;
 
-        // "granted" marks the run that applied the first grants to a role and
-        // database that already existed (a re-run after a partial failure, or
-        // a role made by role_create); "unchanged" would hide that it did work.
+        // "granted" marks a run that issued any grant to a role and database
+        // that already existed: the first grants (a re-run after a partial
+        // failure, or a role made by role_create), or the table and
+        // future-object privileges passed to a provisioned role. "unchanged"
+        // would hide that it did work.
+        const issuedGrants = !phaseB.provisioned ||
+          privsGranted.length > 0 || includeFuture;
         const overall: z.infer<typeof Action> =
           phaseA.roleAction === "created" || phaseA.dbAction === "created"
             ? "created"
-            : phaseB.provisioned
-            ? "unchanged"
-            : "granted";
+            : issuedGrants
+            ? "granted"
+            : "unchanged";
         const handle = await context.writeResource(
           "app-provision",
-          a.database,
+          dataName("app-provision", a.database, a.role),
           {
             database: a.database,
             role: a.role,
@@ -1465,6 +1903,14 @@ export const model = {
             roleAction: phaseA.roleAction,
             action: overall,
             timestamp: ts,
+          },
+        );
+        logInfo(
+          context,
+          "app_provision: {action}, granted {privilegesGranted}",
+          {
+            action: overall,
+            privilegesGranted: privsGranted,
           },
         );
         return { dataHandles: [handle] };
@@ -1485,7 +1931,21 @@ async function runGrant(
   const connDb = a.scope === "database" ? g.maintenanceDb : a.database;
   const verb = revoke ? "REVOKE" : "GRANT";
   const dir = revoke ? "FROM" : "TO";
+  const byName = a.scope !== "database" && a.scope !== "schema" &&
+    !a.allInSchema;
 
+  // Default privileges exist only for tables and sequences here. Accepting
+  // includeFuture for another scope recorded `includeFuture: true` while
+  // nothing future-facing changed.
+  if (a.includeFuture && (a.scope === "database" || a.scope === "schema")) {
+    throw new Error(
+      `includeFuture applies only to table and sequence scope, not ${a.scope}`,
+    );
+  }
+  // allInSchema used to ignore `objects` without a word.
+  if (a.allInSchema && a.objects.length > 0) {
+    throw new Error("pass either objects[] or allInSchema=true, not both");
+  }
   // Without FOR ROLE, ALTER DEFAULT PRIVILEGES targets the current role, which
   // here is the admin login. That silently does nothing for the app's own
   // tables, so refuse rather than guess whose objects the caller meant.
@@ -1497,57 +1957,82 @@ async function runGrant(
         "that behaviour.",
     );
   }
+  // Reject every bad argument before any statement runs, so a call cannot
+  // grant on the objects and then fail on the default-privilege step.
+  checkIdent(g, a.role, "role");
+  if (a.scope === "database") {
+    checkIdent(g, a.database, "database");
+  } else {
+    if (!a.schema) {
+      throw new Error(
+        `schema is required for ${a.scope}-scope ${verb.toLowerCase()}`,
+      );
+    }
+    checkIdent(g, a.schema, "schema");
+  }
+  if (byName) {
+    if (a.objects.length === 0) {
+      throw new Error(
+        `provide objects[] or set allInSchema=true for ${a.scope}-scope ${verb.toLowerCase()}`,
+      );
+    }
+    for (const o of a.objects) checkIdent(g, o, a.scope);
+  }
+  if (a.defaultForRole) checkIdent(g, a.defaultForRole, "defaultForRole");
+
+  logInfo(context, "{verb} {privileges} on {scope} in {database} for {role}", {
+    verb,
+    privileges: a.privileges.join(", "),
+    scope: a.scope,
+    database: a.database,
+    role: a.role,
+  });
 
   return await withConn(g, connDb, false, async (q) => {
     const ro = ident(g, q, a.role, "role");
     const privs = privList(a.privileges);
     const objects: string[] = [];
 
-    if (a.scope === "database") {
-      const db = ident(g, q, a.database, "database");
-      await q.query(`${verb} ${privs} ON DATABASE ${db} ${dir} ${ro}`);
-      objects.push(a.database);
-    } else {
-      if (!a.schema) {
-        throw new Error(
-          `schema is required for ${a.scope}-scope ${verb.toLowerCase()}`,
-        );
+    // One transaction: if the default-privilege step fails (say, the
+    // defaultForRole role does not exist), the object grant must not stay.
+    await inTransaction(q, async () => {
+      if (a.scope === "database") {
+        const db = ident(g, q, a.database, "database");
+        await q.query(`${verb} ${privs} ON DATABASE ${db} ${dir} ${ro}`);
+        objects.push(a.database);
+        return;
       }
-      const sc = ident(g, q, a.schema, "schema");
+      const schema = a.schema!; // checked above
+      const sc = ident(g, q, schema, "schema");
       if (a.scope === "schema") {
         await q.query(`${verb} ${privs} ON SCHEMA ${sc} ${dir} ${ro}`);
-        objects.push(a.schema);
-      } else {
-        const kw = a.scope === "table" ? "TABLE" : "SEQUENCE";
-        const kwAll = a.scope === "table" ? "TABLES" : "SEQUENCES";
-        if (a.allInSchema) {
-          await q.query(
-            `${verb} ${privs} ON ALL ${kwAll} IN SCHEMA ${sc} ${dir} ${ro}`,
-          );
-          objects.push(`ALL ${kwAll} IN ${a.schema}`);
-        } else {
-          if (a.objects.length === 0) {
-            throw new Error(
-              `provide objects[] or set allInSchema=true for ${a.scope}-scope ${verb.toLowerCase()}`,
-            );
-          }
-          const list = a.objects.map((o) => `${sc}.${ident(g, q, o, a.scope)}`)
-            .join(", ");
-          await q.query(`${verb} ${privs} ON ${kw} ${list} ${dir} ${ro}`);
-          objects.push(...a.objects.map((o) => `${a.schema}.${o}`));
-        }
-        if (a.includeFuture && a.defaultForRole) {
-          const fr = ident(g, q, a.defaultForRole, "defaultForRole");
-          await q.query(
-            `ALTER DEFAULT PRIVILEGES FOR ROLE ${fr} IN SCHEMA ${sc} ${verb} ${privs} ON ${kwAll} ${dir} ${ro}`,
-          );
-        }
+        objects.push(schema);
+        return;
       }
-    }
+      const kw = a.scope === "table" ? "TABLE" : "SEQUENCE";
+      const kwAll = a.scope === "table" ? "TABLES" : "SEQUENCES";
+      if (byName) {
+        const list = a.objects.map((o) => `${sc}.${ident(g, q, o, a.scope)}`)
+          .join(", ");
+        await q.query(`${verb} ${privs} ON ${kw} ${list} ${dir} ${ro}`);
+        objects.push(...a.objects.map((o) => `${schema}.${o}`));
+      } else {
+        await q.query(
+          `${verb} ${privs} ON ALL ${kwAll} IN SCHEMA ${sc} ${dir} ${ro}`,
+        );
+        objects.push(`ALL ${kwAll} IN ${schema}`);
+      }
+      if (a.includeFuture && a.defaultForRole) {
+        const fr = ident(g, q, a.defaultForRole, "defaultForRole");
+        await q.query(
+          `ALTER DEFAULT PRIVILEGES FOR ROLE ${fr} IN SCHEMA ${sc} ${verb} ${privs} ON ${kwAll} ${dir} ${ro}`,
+        );
+      }
+    });
 
     const handle = await context.writeResource(
       "grant-result",
-      `${a.database}-${a.scope}-${a.role}`,
+      dataName("grant-result", a.database, a.scope, a.role),
       {
         database: a.database,
         scope: a.scope,
@@ -1560,6 +2045,10 @@ async function runGrant(
         timestamp: new Date().toISOString(),
       },
     );
+    logInfo(context, "{verb} done on {objects}", {
+      verb,
+      objects: objects.join(", "),
+    });
     return { dataHandles: [handle] };
   });
 }
