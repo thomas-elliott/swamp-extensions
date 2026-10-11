@@ -20,10 +20,11 @@ import type {
  * first.
  *
  * Secrets: `adminToken` is supplied via a vault expression, e.g.
- * `${{ vault.get(<vault>, garage/admin_token) }}`. Newly created/rotated key
- * secrets are returned ONCE by Garage and surfaced on the `key-result` resource
- * (`secretAccessKey`, marked sensitive). Store them somewhere safe; they cannot
- * be retrieved again except via `key_get --showSecretKey`.
+ * `${{ vault.get(<vault>, garage/admin_token) }}`. A created, imported or
+ * rotated key's secret is surfaced on the `key-result` resource as
+ * `secretAccessKey`. That one field is marked sensitive, so swamp stores the
+ * value in a vault and keeps only a vault reference in the data; the other
+ * fields stay plain so they can be read and wired with CEL.
  */
 
 // ─────────────────────────── global arguments ───────────────────────────
@@ -40,7 +41,7 @@ const GlobalArgs = z.object({
   s3Region: z.string().default("garage").describe(
     "S3 region label this cluster advertises (informational; echoed in output)",
   ),
-  timeoutMs: z.coerce.number().int().default(30000).describe(
+  timeoutMs: z.coerce.number().int().positive().default(30000).describe(
     "Per-request timeout in milliseconds (AbortController)",
   ),
 });
@@ -65,6 +66,26 @@ const Action = z.enum([
   "reverted",
   "observed",
 ]);
+
+// ─────────────────────────── data names ───────────────────────────
+
+/**
+ * Data name for a record. swamp keys stored data by model + name, not by spec,
+ * so every name starts with its spec: otherwise `bucket` and `bucket-result` for
+ * the same bucket id would overwrite each other. Keys are usually Garage's hex
+ * ids, but a delete of an id that is already gone records the id as typed, so
+ * the characters swamp rejects are percent-escaped.
+ */
+function dataName(spec: string, key?: string): string {
+  if (key === undefined) return spec;
+  const safeKey = key
+    .replaceAll("%", "%25")
+    .replaceAll("/", "%2F")
+    .replaceAll("\\", "%5C")
+    .replaceAll("\0", "%00")
+    .replaceAll("..", ".%2E");
+  return `${spec}:${safeKey}`;
+}
 
 // ─────────────────────────── resource schemas ───────────────────────────
 
@@ -126,7 +147,7 @@ const KeyInfo = z.object({
   buckets: z.array(KeyBucketAccess).optional().describe(
     "Buckets this key can reach (populated only by key_get; key_list leaves it empty)",
   ),
-  // Present ONLY on key_create / key_rotate output, or key_get with showSecretKey.
+  // Present only on key_get with showSecretKey; vaulted like key-result's.
   secretAccessKey: z.string().meta({ sensitive: true }).nullable().optional(),
   action: Action,
   timestamp: z.string(),
@@ -172,8 +193,8 @@ const BucketResult = z.object({
 const KeyResult = z.object({
   accessKeyId: z.string().optional(),
   name: z.string().optional(),
-  /** Returned ONCE by Garage on create/rotate. Sensitive; persisted here so you can
-   * capture it. Move it to 1Password and GC this artifact. */
+  /** Set on create, import and rotate. Sensitive: swamp stores the value in a
+   * vault and persists only the vault reference here. */
   secretAccessKey: z.string().meta({ sensitive: true }).nullable().optional(),
   action: Action,
   timestamp: z.string(),
@@ -298,9 +319,11 @@ async function realApi(
   body: unknown,
 ): Promise<unknown> {
   const url = buildUrl(g.endpoint, op, query);
+  const timeoutMs = Number(g.timeoutMs);
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), Number(g.timeoutMs));
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   let res: Response;
+  let text: string;
   try {
     res = await fetch(url, {
       method,
@@ -311,10 +334,19 @@ async function realApi(
       body: body !== undefined ? JSON.stringify(body) : undefined,
       signal: ctrl.signal,
     });
+    // The body is read under the same timer: a server that sends its headers
+    // and then stalls would otherwise hang the method.
+    text = await res.text();
+  } catch (e) {
+    // A bare fetch error ("signal has been aborted", a TypeError) does not
+    // say which call failed or that it was our timeout.
+    const cause = ctrl.signal.aborted
+      ? `timed out after ${timeoutMs} ms`
+      : (e as Error).message;
+    throw new Error(`Garage ${op} failed: ${cause}`);
   } finally {
     clearTimeout(timer);
   }
-  const text = await res.text();
   if (!res.ok) {
     let detail = text;
     try {
@@ -360,6 +392,11 @@ function api(
   body?: unknown,
 ): Promise<unknown> {
   return (_apiOverride ?? realApi as ApiFn)(g, method, op, query, body);
+}
+
+/** True when `e` is an Admin API error with this HTTP status (see {@link realApi}). */
+function isHttpStatus(e: unknown, status: number): boolean {
+  return (e as Error)?.message?.includes(`(HTTP ${status})`) ?? false;
 }
 
 // ─────────────────────────── helpers ───────────────────────────
@@ -483,19 +520,21 @@ const BucketGetArgs = z.object({
   globalAlias: z.string().optional().describe("Global alias to look up"),
   search: z.string().optional().describe("Partial id/alias to search"),
 }).refine(
-  (a) => !!(a.id || a.globalAlias || a.search),
-  { message: "provide one of id, globalAlias, or search" },
+  // Garage rejects more than one selector.
+  (a) => [a.id, a.globalAlias, a.search].filter(Boolean).length === 1,
+  { message: "provide exactly one of id, globalAlias, or search" },
 );
 
 const KeyGetArgs = z.object({
   id: z.string().optional().describe("Access key id (exact)"),
   search: z.string().optional().describe("Partial id/name to search"),
   showSecretKey: z.boolean().default(false).describe(
-    "Include the secret access key in output (sensitive — persisted to swamp data)",
+    "Include the secret access key in output (sensitive: stored in a vault, the data keeps a reference)",
   ),
 }).refine(
-  (a) => !!(a.id || a.search),
-  { message: "provide id or search" },
+  // Garage rejects both together.
+  (a) => [a.id, a.search].filter(Boolean).length === 1,
+  { message: "provide exactly one of id or search" },
 );
 
 const BucketCreateArgs = z.object({
@@ -508,20 +547,36 @@ const BucketCreateArgs = z.object({
   localAliasAccessKeyId: z.string().optional().describe(
     "Access key the local alias belongs to",
   ),
+  localAliasRead: z.boolean().default(false).describe(
+    "Grant the local alias's key read on the new bucket",
+  ),
+  localAliasWrite: z.boolean().default(false).describe(
+    "Grant the local alias's key write on the new bucket",
+  ),
+  localAliasOwner: z.boolean().default(false).describe(
+    "Grant the local alias's key owner on the new bucket",
+  ),
 }).refine(
   (a) => !!(a.globalAlias || a.localAlias),
   { message: "provide globalAlias or localAlias" },
 ).refine(
   (a) => !a.localAlias || !!a.localAliasAccessKeyId,
   { message: "localAlias requires localAliasAccessKeyId" },
+).refine(
+  // Without a local alias there is no key to grant to.
+  (a) =>
+    !!a.localAlias ||
+    !(a.localAliasRead || a.localAliasWrite || a.localAliasOwner),
+  { message: "localAliasRead/Write/Owner need localAlias" },
 );
 
 const BucketUpdateArgs = z.object({
   id: z.string().describe("Bucket id to update"),
-  maxObjects: z.coerce.number().int().nullable().optional().describe(
-    "Object-count quota; null clears it",
-  ),
-  maxSize: z.coerce.number().int().nullable().optional().describe(
+  maxObjects: z.coerce.number().int().nonnegative().nullable().optional()
+    .describe(
+      "Object-count quota; null clears it",
+    ),
+  maxSize: z.coerce.number().int().nonnegative().nullable().optional().describe(
     "Size quota in bytes; null clears it",
   ),
   websiteEnabled: z.boolean().optional().describe(
@@ -546,8 +601,9 @@ const AliasArgs = z.object({
     "Access key the local alias belongs to (required for localAlias)",
   ),
 }).refine(
-  (a) => !!(a.globalAlias || a.localAlias),
-  { message: "provide globalAlias or localAlias" },
+  // With both, one would be silently ignored.
+  (a) => [a.globalAlias, a.localAlias].filter(Boolean).length === 1,
+  { message: "provide exactly one of globalAlias or localAlias" },
 ).refine(
   (a) => !a.localAlias || !!a.accessKeyId,
   { message: "localAlias requires accessKeyId" },
@@ -561,8 +617,15 @@ const KeyCreateArgs = z.object({
   expiration: z.string().optional().describe(
     "RFC 3339 expiry timestamp (omit + neverExpires=true for no expiry)",
   ),
-  neverExpires: z.boolean().default(true).describe("Key never expires"),
-});
+  neverExpires: z.boolean().default(true).describe(
+    "Key never expires. false needs expiration: a new key has no expiry otherwise.",
+  ),
+}).refine(
+  // A new key has no expiry until one is set, so false alone would still
+  // create a key that never expires.
+  (a) => a.neverExpires || !!a.expiration,
+  { message: "neverExpires=false needs expiration" },
+);
 
 const KeyImportArgs = z.object({
   accessKeyId: z.string().describe("Existing access key id to import"),
@@ -579,7 +642,9 @@ const KeyUpdateArgs = z.object({
     "Set/clear the create-bucket permission",
   ),
   expiration: z.string().optional().describe("New RFC 3339 expiry"),
-  neverExpires: z.boolean().optional().describe("Clear expiry"),
+  neverExpires: z.boolean().optional().describe(
+    "true clears the expiry. false does nothing; set expiration instead.",
+  ),
 });
 
 const KeyRotateArgs = z.object({
@@ -614,10 +679,11 @@ const LayoutAssignArgs = z.object({
     "Zone/datacenter label for the node. Omit to keep the node's current zone " +
       "(required for a node that has no role yet).",
   ),
-  capacity: z.coerce.number().int().nullable().optional().describe(
-    "Storage capacity in BYTES (e.g. 1000000000 = 1 GB). null = gateway (no storage). " +
-      "Omit to keep the node's current capacity (gateway for a node with no role yet).",
-  ),
+  capacity: z.coerce.number().int().nonnegative().nullable().optional()
+    .describe(
+      "Storage capacity in BYTES (e.g. 1000000000 = 1 GB). null = gateway (no storage). " +
+        "Omit to keep the node's current capacity (gateway for a node with no role yet).",
+    ),
   tags: z.array(z.string()).optional().describe(
     "Node tags. Omit to keep the node's current tags (none for a node with no role yet).",
   ),
@@ -627,7 +693,7 @@ const LayoutAssignArgs = z.object({
 });
 
 const LayoutApplyArgs = z.object({
-  version: z.coerce.number().int().optional().describe(
+  version: z.coerce.number().int().nonnegative().optional().describe(
     "Layout version to apply; defaults to current + 1 (the staged version)",
   ),
 });
@@ -637,7 +703,7 @@ const ClusterInitArgs = z.object({
     "Node to configure; defaults to the responding node (correct for a single-node cluster)",
   ),
   zone: z.string().default("dc1").describe("Zone/datacenter label"),
-  capacity: z.coerce.number().int().describe(
+  capacity: z.coerce.number().int().nonnegative().describe(
     "Storage capacity in BYTES for the node (e.g. 1000000000 = 1 GB). Required.",
   ),
   tags: z.array(z.string()).default([]).describe("Optional node tags"),
@@ -652,7 +718,7 @@ const ClusterInitArgs = z.object({
 /** Parse a zoneRedundancy arg ("maximum" or a positive integer) into the API shape. */
 function parseZoneRedundancy(s: string): "maximum" | { atLeast: number } {
   if (s === "maximum") return "maximum";
-  if (/^\d+$/.test(s)) return { atLeast: Number(s) };
+  if (/^[1-9]\d*$/.test(s)) return { atLeast: Number(s) };
   throw new Error(
     `invalid zoneRedundancy ${
       JSON.stringify(s)
@@ -669,14 +735,17 @@ function zrToStr(v: unknown): string | undefined {
 }
 
 /**
- * Id of the node answering our requests. GetClusterStatus lists every node but
- * does not say which one we are talking to; GetNodeInfo?node=self does, as a
- * per-node response map keyed by node id.
+ * Id and Garage version of the node answering our requests. GetClusterStatus
+ * lists every node but does not say which one we are talking to, and has no
+ * top-level version; GetNodeInfo?node=self has both, as a per-node response
+ * map keyed by node id.
  */
-async function selfNodeId(g: GlobalArgsT): Promise<string> {
+async function selfNodeInfo(
+  g: GlobalArgsT,
+): Promise<{ id: string; garageVersion?: string }> {
   const raw = asObj(await api(g, "GET", "GetNodeInfo", { node: "self" }));
-  const [info] = Object.values(asObj(raw.success));
-  const id = asStr(asObj(info).nodeId);
+  const info = asObj(Object.values(asObj(raw.success))[0]);
+  const id = asStr(info.nodeId);
   if (!id) {
     throw new Error(
       `GetNodeInfo?node=self returned no node: ${
@@ -684,13 +753,13 @@ async function selfNodeId(g: GlobalArgsT): Promise<string> {
       }`,
     );
   }
-  return id;
+  return { id, garageVersion: asStr(info.garageVersion) };
 }
 
 /** Shape a raw GetClusterStatus response into a {@link ClusterStatus}. */
 function shapeStatus(
   raw: unknown,
-  node: string,
+  self: { id: string; garageVersion?: string },
   action: z.infer<typeof Action>,
   ts: string,
 ): z.infer<typeof ClusterStatus> {
@@ -712,8 +781,8 @@ function shapeStatus(
     };
   });
   return {
-    node,
-    garageVersion: asStr(s.garageVersion),
+    node: self.id,
+    garageVersion: self.garageVersion,
     layoutVersion: asNum(s.layoutVersion),
     nodes,
     action,
@@ -773,6 +842,60 @@ async function getBucketRaw(
   return asObj(raw);
 }
 
+/**
+ * GetBucketInfo by id for a bucket just seen in ListBuckets, or `undefined` if
+ * it has been deleted since (Garage answers 404). One bucket going away during
+ * a listing must not fail the whole listing.
+ */
+async function getListedBucketRaw(
+  g: GlobalArgsT,
+  id: string,
+): Promise<Record<string, unknown> | undefined> {
+  return await getBucketRaw(g, { id }).catch((e: Error) => {
+    if (isHttpStatus(e, 404)) return undefined;
+    throw e;
+  });
+}
+
+/**
+ * Whether an alias is on a bucket, judged from its GetBucketInfo. Garage
+ * lists a key on a bucket only when the key has a permission there, so a local
+ * alias of a key with none is invisible: that case is "unknown", and the
+ * caller lets Garage decide.
+ */
+function aliasOnBucket(
+  bucket: Record<string, unknown>,
+  a: { globalAlias?: string; localAlias?: string; accessKeyId?: string },
+): "present" | "absent" | "unknown" {
+  if (a.globalAlias) {
+    return asArr(bucket.globalAliases).map(String).includes(a.globalAlias)
+      ? "present"
+      : "absent";
+  }
+  const key = asArr(bucket.keys).map(asObj).find((k) =>
+    k.accessKeyId === a.accessKeyId
+  );
+  if (!key) return "unknown";
+  return asArr(key.bucketLocalAliases).map(String).includes(
+      a.localAlias ?? "",
+    )
+    ? "present"
+    : "absent";
+}
+
+/**
+ * The error for a key that Garage created but swamp failed to record (for
+ * example, no vault for the secret). The key exists and works, so the caller
+ * needs its id to recover the secret or remove the key.
+ */
+function keyNotRecorded(accessKeyId: string, cause: Error): Error {
+  return new Error(
+    `Key ${accessKeyId} was created in Garage but recording it failed ` +
+      `(${cause.message}). Read its secret with key_get id=${accessKeyId} ` +
+      "showSecretKey=true, or remove it with key_delete.",
+  );
+}
+
 /** GetKeyInfo by id/search → raw object. */
 async function getKeyRaw(
   g: GlobalArgsT,
@@ -795,8 +918,25 @@ async function getKeyRaw(
  */
 export const model = {
   type: "@thomas/garage",
-  version: "2026.06.24.1",
+  version: "2026.10.11.1",
   globalArguments: GlobalArgs,
+  upgrades: [
+    {
+      toVersion: "2026.10.11.1",
+      description:
+        "timeoutMs must now be positive; a zero or negative value is dropped so the 30000 ms default applies. Stored data is renamed to <spec>:<id> (or <spec>); the four specs that shared `main` and the specs that shared a bare id now have names of their own. Records under the old names are left as they are and are not migrated. key-result vaults only secretAccessKey; its other fields are plain values.",
+      upgradeAttributes: (
+        old: Record<string, unknown>,
+      ): Record<string, unknown> => {
+        // Zero or negative aborted every request at once, so nobody relied on it.
+        if (Number(old.timeoutMs) <= 0) {
+          const { timeoutMs: _, ...rest } = old;
+          return rest;
+        }
+        return old;
+      },
+    },
+  ],
   checks: {
     "reachable": {
       description:
@@ -858,9 +998,12 @@ export const model = {
     },
     "key-result": {
       description:
-        "Result of a key create/import/update/rotate/delete (may carry the one-time secret)",
+        "Result of a key create/import/update/rotate/delete (may carry the secret, vaulted)",
+      // Only secretAccessKey is secret, and its field-level sensitive mark
+      // vaults it. Marking the whole output sensitive would also turn the key
+      // id, name and action into vault references, which CEL and scripts
+      // cannot read, and would need a vault for writes that carry no secret.
       schema: KeyResult,
-      sensitiveOutput: true,
       lifetime: "infinite",
       garbageCollection: 10,
     },
@@ -904,17 +1047,24 @@ export const model = {
         logInfo(context, "Fetching cluster health");
         const raw = asObj(await api(g, "GET", "GetClusterHealth"));
         const ts = new Date().toISOString();
-        const handle = await context.writeResource("cluster-health", "main", {
+        const handle = await context.writeResource(
+          "cluster-health",
+          dataName("cluster-health"),
+          {
+            status: String(raw.status ?? "unknown"),
+            knownNodes: asNum(raw.knownNodes) ?? 0,
+            connectedNodes: asNum(raw.connectedNodes) ?? 0,
+            storageNodes: asNum(raw.storageNodes) ?? 0,
+            storageNodesUp: asNum(raw.storageNodesUp) ?? 0,
+            partitions: asNum(raw.partitions) ?? 0,
+            partitionsQuorum: asNum(raw.partitionsQuorum) ?? 0,
+            partitionsAllOk: asNum(raw.partitionsAllOk) ?? 0,
+            s3Region: g.s3Region,
+            timestamp: ts,
+          },
+        );
+        logInfo(context, "Fetched cluster health", {
           status: String(raw.status ?? "unknown"),
-          knownNodes: asNum(raw.knownNodes) ?? 0,
-          connectedNodes: asNum(raw.connectedNodes) ?? 0,
-          storageNodes: asNum(raw.storageNodes) ?? 0,
-          storageNodesUp: asNum(raw.storageNodesUp) ?? 0,
-          partitions: asNum(raw.partitions) ?? 0,
-          partitionsQuorum: asNum(raw.partitionsQuorum) ?? 0,
-          partitionsAllOk: asNum(raw.partitionsAllOk) ?? 0,
-          s3Region: g.s3Region,
-          timestamp: ts,
         });
         return { dataHandles: [handle] };
       },
@@ -937,22 +1087,24 @@ export const model = {
         for (const item of list) {
           const id = String(asObj(item).id ?? "");
           if (!id) continue;
-          const raw = await getBucketRaw(g, { id });
+          const raw = await getListedBucketRaw(g, id);
+          if (!raw) continue;
           handles.push(
             await context.writeResource(
               "bucket",
-              id,
+              dataName("bucket", id),
               shapeBucket(raw, "observed", ts),
             ),
           );
         }
+        logInfo(context, "Listed buckets", { count: handles.length });
         return { dataHandles: handles };
       },
     },
 
     bucket_get: {
       description:
-        "Get one bucket by id, globalAlias, or search (full detail). Read-only.",
+        "Get one bucket by exactly one of id, globalAlias or search (full detail). Read-only.",
       arguments: BucketGetArgs,
       execute: async (
         rawArgs,
@@ -960,9 +1112,15 @@ export const model = {
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const a = BucketGetArgs.parse(rawArgs);
         const g = context.globalArgs;
+        logInfo(context, "Fetching bucket", a);
         const raw = await getBucketRaw(g, a);
         const shaped = shapeBucket(raw, "observed", new Date().toISOString());
-        const handle = await context.writeResource("bucket", shaped.id, shaped);
+        const handle = await context.writeResource(
+          "bucket",
+          dataName("bucket", shaped.id),
+          shaped,
+        );
+        logInfo(context, "Fetched bucket", { id: shaped.id });
         return { dataHandles: [handle] };
       },
     },
@@ -985,7 +1143,7 @@ export const model = {
           const id = String(k.id ?? "");
           if (!id) continue;
           handles.push(
-            await context.writeResource("key", id, {
+            await context.writeResource("key", dataName("key", id), {
               accessKeyId: id,
               name: asStr(k.name),
               created: k.created === undefined
@@ -1001,13 +1159,14 @@ export const model = {
             }),
           );
         }
+        logInfo(context, "Listed keys", { count: handles.length });
         return { dataHandles: handles };
       },
     },
 
     key_get: {
       description:
-        "Get one access key by id or search, with the buckets it can reach. " +
+        "Get one access key by exactly one of id or search, with the buckets it can reach. " +
         "Set showSecretKey to reveal the secret (sensitive). Read-only.",
       arguments: KeyGetArgs,
       execute: async (
@@ -1016,13 +1175,15 @@ export const model = {
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const a = KeyGetArgs.parse(rawArgs);
         const g = context.globalArgs;
+        logInfo(context, "Fetching key", { id: a.id, search: a.search });
         const raw = await getKeyRaw(g, a);
         const shaped = shapeKey(raw, "observed", new Date().toISOString());
         const handle = await context.writeResource(
           "key",
-          shaped.accessKeyId,
+          dataName("key", shaped.accessKeyId),
           shaped,
         );
+        logInfo(context, "Fetched key", { id: shaped.accessKeyId });
         return { dataHandles: [handle] };
       },
     },
@@ -1030,8 +1191,7 @@ export const model = {
     permissions_audit: {
       description:
         "Build the full key×bucket permission matrix and risk flags (orphan keys, " +
-        "owner-everywhere, website-exposed buckets, expired keys). Read-only. The " +
-        "data source for the garage-audit report.",
+        "owner-everywhere, website-exposed buckets, expired keys). Read-only.",
       arguments: Empty,
       execute: async (
         _rawArgs,
@@ -1048,11 +1208,16 @@ export const model = {
         const keysWithGrant = new Set<string>();
         // accessKeyId -> {total grants, owner grants}
         const ownerTally = new Map<string, { total: number; owner: number }>();
+        // Buckets deleted between ListBuckets and GetBucketInfo are left out,
+        // so count the ones actually audited.
+        let bucketCount = 0;
 
         for (const b of buckets) {
           const id = String(asObj(b).id ?? "");
           if (!id) continue;
-          const raw = await getBucketRaw(g, { id });
+          const raw = await getListedBucketRaw(g, id);
+          if (!raw) continue;
+          bucketCount += 1;
           const alias = asArr(raw.globalAliases).map(String)[0];
           if (asBool(raw.websiteAccess)) websiteBuckets.push(alias ?? id);
           for (const k of asArr(raw.keys)) {
@@ -1093,14 +1258,23 @@ export const model = {
           .map((k) => String(asObj(k).id ?? ""))
           .filter(Boolean);
 
-        const handle = await context.writeResource("permission-audit", "main", {
-          entries,
-          bucketCount: buckets.length,
-          keyCount: keys.length,
-          grantCount: entries.length,
-          flags: { orphanKeys, ownerEverywhere, websiteBuckets, expiredKeys },
-          s3Region: g.s3Region,
-          timestamp: ts,
+        const handle = await context.writeResource(
+          "permission-audit",
+          dataName("permission-audit"),
+          {
+            entries,
+            bucketCount,
+            keyCount: keys.length,
+            grantCount: entries.length,
+            flags: { orphanKeys, ownerEverywhere, websiteBuckets, expiredKeys },
+            s3Region: g.s3Region,
+            timestamp: ts,
+          },
+        );
+        logInfo(context, "Audited permissions", {
+          buckets: bucketCount,
+          keys: keys.length,
+          grants: entries.length,
         });
         return { dataHandles: [handle] };
       },
@@ -1110,7 +1284,8 @@ export const model = {
     bucket_create: {
       description:
         "Create a bucket with a global (or local) alias. Idempotent on globalAlias: " +
-        "an existing one is returned as `unchanged`.",
+        "an existing one is returned as `unchanged`. A local alias's key gets " +
+        "only the permissions set with localAliasRead/Write/Owner (none by default).",
       arguments: BucketCreateArgs,
       execute: async (
         rawArgs,
@@ -1126,7 +1301,7 @@ export const model = {
           const existing = await api(g, "GET", "GetBucketInfo", {
             globalAlias: a.globalAlias,
           }).catch((e: Error) => {
-            if (/HTTP 404/.test(e.message)) return undefined;
+            if (isHttpStatus(e, 404)) return undefined;
             throw e;
           });
           if (existing && asObj(existing).id) {
@@ -1135,7 +1310,7 @@ export const model = {
             });
             const handle = await context.writeResource(
               "bucket-result",
-              a.globalAlias,
+              dataName("bucket-result", String(asObj(existing).id)),
               {
                 id: String(asObj(existing).id),
                 alias: a.globalAlias,
@@ -1153,6 +1328,12 @@ export const model = {
           body.localAlias = {
             accessKeyId: a.localAliasAccessKeyId,
             alias: a.localAlias,
+            // Garage grants the alias's key nothing unless asked.
+            allow: {
+              read: a.localAliasRead,
+              write: a.localAliasWrite,
+              owner: a.localAliasOwner,
+            },
           };
         }
         logInfo(context, "Creating bucket", {
@@ -1162,7 +1343,8 @@ export const model = {
         const raw = asObj(await api(g, "POST", "CreateBucket", {}, body));
         const handle = await context.writeResource(
           "bucket-result",
-          a.globalAlias ?? a.localAlias ?? String(raw.id ?? "bucket"),
+          // Named by id, not alias: a local alias is only unique per key.
+          dataName("bucket-result", String(raw.id)),
           {
             id: asStr(raw.id),
             alias: a.globalAlias ?? a.localAlias,
@@ -1170,6 +1352,7 @@ export const model = {
             timestamp: ts,
           },
         );
+        logInfo(context, "Created bucket", { id: asStr(raw.id) });
         return { dataHandles: [handle] };
       },
     },
@@ -1215,24 +1398,44 @@ export const model = {
           const enabled = a.websiteEnabled ?? asBool(current.websiteAccess);
           if (enabled) {
             const w = asObj(current.websiteConfig);
+            const indexDocument = a.indexDocument ?? asStr(w.indexDocument);
+            // Garage refuses to enable a website without an index document.
+            if (!indexDocument) {
+              throw new Error(
+                `bucket ${a.id} has no index document; pass indexDocument to enable the website`,
+              );
+            }
             body.websiteAccess = {
               enabled: true,
-              indexDocument: a.indexDocument ?? asStr(w.indexDocument) ?? null,
+              indexDocument,
               errorDocument: a.errorDocument ?? asStr(w.errorDocument) ?? null,
             };
           } else {
-            // Garage rejects documents on a disable, and there is nothing to
-            // carry over once serving is off.
+            // Garage rejects documents on a disable, and dropping them
+            // silently would hide that they were not set.
+            if (
+              a.indexDocument !== undefined || a.errorDocument !== undefined
+            ) {
+              throw new Error(
+                `website serving is off for bucket ${a.id}; documents can only be ` +
+                  "set with websiteEnabled=true",
+              );
+            }
             body.websiteAccess = { enabled: false };
           }
         }
         logInfo(context, "Updating bucket", { id: a.id });
         await api(g, "POST", "UpdateBucket", { id: a.id }, body);
-        const handle = await context.writeResource("bucket-result", a.id, {
-          id: a.id,
-          action: "updated",
-          timestamp: new Date().toISOString(),
-        });
+        const handle = await context.writeResource(
+          "bucket-result",
+          dataName("bucket-result", a.id),
+          {
+            id: a.id,
+            action: "updated",
+            timestamp: new Date().toISOString(),
+          },
+        );
+        logInfo(context, "Updated bucket", { id: a.id });
         return { dataHandles: [handle] };
       },
     },
@@ -1240,7 +1443,8 @@ export const model = {
     bucket_delete: {
       description:
         "Delete a bucket BY ID (verified to exist first; refuses a non-empty bucket " +
-        "unless allowNonEmpty, and Garage itself also refuses non-empty). Destructive.",
+        "unless allowNonEmpty, and Garage itself also refuses non-empty). A bucket " +
+        "that is already gone is recorded as `unchanged`. Destructive.",
       arguments: BucketDeleteArgs,
       execute: async (
         rawArgs,
@@ -1248,9 +1452,24 @@ export const model = {
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const a = BucketDeleteArgs.parse(rawArgs);
         const g = context.globalArgs;
-        const raw = await getBucketRaw(g, { id: a.id });
-        if (!raw.id) {
-          throw new Error(`Bucket ${JSON.stringify(a.id)} not found`);
+        const raw = await getBucketRaw(g, { id: a.id }).catch((e: Error) => {
+          if (isHttpStatus(e, 404)) return undefined;
+          throw e;
+        });
+        // Already gone: the goal of the call holds, so a re-run succeeds.
+        // The record carries the id, so a mistyped one still shows.
+        if (!raw) {
+          logInfo(context, "Bucket already gone; unchanged", { id: a.id });
+          const handle = await context.writeResource(
+            "bucket-result",
+            dataName("bucket-result", a.id),
+            {
+              id: a.id,
+              action: "unchanged",
+              timestamp: new Date().toISOString(),
+            },
+          );
+          return { dataHandles: [handle] };
         }
         const objects = asNum(raw.objects) ?? 0;
         if (objects > 0 && !a.allowNonEmpty) {
@@ -1261,18 +1480,25 @@ export const model = {
         }
         logInfo(context, "Deleting bucket", { id: a.id, objects });
         await api(g, "POST", "DeleteBucket", { id: a.id });
-        const handle = await context.writeResource("bucket-result", a.id, {
-          id: a.id,
-          alias: asArr(raw.globalAliases).map(String)[0],
-          action: "deleted",
-          timestamp: new Date().toISOString(),
-        });
+        const handle = await context.writeResource(
+          "bucket-result",
+          dataName("bucket-result", a.id),
+          {
+            id: a.id,
+            alias: asArr(raw.globalAliases).map(String)[0],
+            action: "deleted",
+            timestamp: new Date().toISOString(),
+          },
+        );
+        logInfo(context, "Deleted bucket", { id: a.id });
         return { dataHandles: [handle] };
       },
     },
 
     bucket_alias_add: {
-      description: "Add a global or local alias to a bucket (AddBucketAlias).",
+      description:
+        "Add a global or local alias to a bucket (AddBucketAlias). An alias " +
+        "already on the bucket records `unchanged`.",
       arguments: AliasArgs,
       execute: async (
         rawArgs,
@@ -1287,15 +1513,23 @@ export const model = {
             localAlias: a.localAlias,
             accessKeyId: a.accessKeyId,
           };
-        logInfo(context, "Adding bucket alias", body);
-        await api(g, "POST", "AddBucketAlias", {}, body);
+        // Garage accepts a repeat add silently, so check first to report it.
+        const bucket = await getBucketRaw(g, { id: a.bucketId });
+        const present = aliasOnBucket(bucket, a) === "present";
+        if (present) {
+          logInfo(context, "Bucket alias already present", body);
+        } else {
+          logInfo(context, "Adding bucket alias", body);
+          await api(g, "POST", "AddBucketAlias", {}, body);
+          logInfo(context, "Added bucket alias", { bucketId: a.bucketId });
+        }
         const handle = await context.writeResource(
           "bucket-result",
-          a.bucketId,
+          dataName("bucket-result", a.bucketId),
           {
             id: a.bucketId,
             alias: a.globalAlias ?? a.localAlias,
-            action: "updated",
+            action: present ? "unchanged" : "updated",
             timestamp: new Date().toISOString(),
           },
         );
@@ -1305,7 +1539,10 @@ export const model = {
 
     bucket_alias_remove: {
       description:
-        "Remove a global or local alias from a bucket (RemoveBucketAlias).",
+        "Remove a global or local alias from a bucket (RemoveBucketAlias). " +
+        "An alias already gone records `unchanged`, except a local alias of " +
+        "a key with no permission on the bucket, which Garage does not show: " +
+        "that fails with Garage's error.",
       arguments: AliasArgs,
       execute: async (
         rawArgs,
@@ -1320,15 +1557,24 @@ export const model = {
             localAlias: a.localAlias,
             accessKeyId: a.accessKeyId,
           };
-        logInfo(context, "Removing bucket alias", body);
-        await api(g, "POST", "RemoveBucketAlias", {}, body);
+        // An alias already gone succeeds, like bucket_delete of a gone bucket.
+        // Garage answers that case with a 500, so check first instead.
+        const bucket = await getBucketRaw(g, { id: a.bucketId });
+        const absent = aliasOnBucket(bucket, a) === "absent";
+        if (absent) {
+          logInfo(context, "Bucket alias already absent", body);
+        } else {
+          logInfo(context, "Removing bucket alias", body);
+          await api(g, "POST", "RemoveBucketAlias", {}, body);
+          logInfo(context, "Removed bucket alias", { bucketId: a.bucketId });
+        }
         const handle = await context.writeResource(
           "bucket-result",
-          a.bucketId,
+          dataName("bucket-result", a.bucketId),
           {
             id: a.bucketId,
             alias: a.globalAlias ?? a.localAlias,
-            action: "updated",
+            action: absent ? "unchanged" : "updated",
             timestamp: new Date().toISOString(),
           },
         );
@@ -1339,8 +1585,9 @@ export const model = {
     // ───────────── keys (mutating) ─────────────
     key_create: {
       description:
-        "Create a new access key; the secret is returned ONCE on `key-result` " +
-        "(sensitive). Capture it and store in 1Password.",
+        "Create a new access key. The secret is returned on `key-result` " +
+        "(sensitive, vaulted); later it can be read only with key_get " +
+        "showSecretKey. Capture it and store it in 1Password.",
       arguments: KeyCreateArgs,
       execute: async (
         rawArgs,
@@ -1356,17 +1603,21 @@ export const model = {
         else body.neverExpires = a.neverExpires;
         logInfo(context, "Creating key", { name: a.name }); // never logs the secret
         const raw = asObj(await api(g, "POST", "CreateKey", {}, body));
+        const accessKeyId = String(raw.accessKeyId);
         const handle = await context.writeResource(
           "key-result",
-          String(raw.accessKeyId ?? a.name ?? "key"),
+          dataName("key-result", accessKeyId),
           {
-            accessKeyId: asStr(raw.accessKeyId),
+            accessKeyId,
             name: asStr(raw.name) ?? a.name,
             secretAccessKey: asStr(raw.secretAccessKey) ?? null,
             action: "created",
             timestamp: new Date().toISOString(),
           },
-        );
+        ).catch((e: Error) => {
+          throw keyNotRecorded(accessKeyId, e);
+        });
+        logInfo(context, "Created key", { accessKeyId });
         return { dataHandles: [handle] };
       },
     },
@@ -1374,7 +1625,8 @@ export const model = {
     key_import: {
       description:
         "Import a pre-existing access key pair (ImportKey) — e.g. to recreate a key " +
-        "with a known secret after a cluster rebuild.",
+        "with a known secret after a cluster rebuild. Idempotent: a key that " +
+        "already exists with the same secret is returned as `unchanged`.",
       arguments: KeyImportArgs,
       execute: async (
         rawArgs,
@@ -1383,30 +1635,56 @@ export const model = {
         const a = KeyImportArgs.parse(rawArgs);
         const g = context.globalArgs;
         logInfo(context, "Importing key", { accessKeyId: a.accessKeyId }); // never logs the secret
+        let action: "imported" | "unchanged" = "imported";
         const raw = asObj(
           await api(g, "POST", "ImportKey", {}, {
             accessKeyId: a.accessKeyId,
             secretAccessKey: a.secretAccessKey,
             name: a.name,
+          }).catch(async (e: Error) => {
+            // Garage answers 409 for an id it already holds. If it holds the
+            // same pair, a re-run of this import is already done. A deleted
+            // key also answers 409 (its id can never be reused), but
+            // GetKeyInfo then says 404; Garage's own error explains that.
+            if (!isHttpStatus(e, 409)) throw e;
+            const existing = await getKeyRaw(g, {
+              id: a.accessKeyId,
+              showSecretKey: true,
+            }).catch((lookup: Error) => {
+              throw isHttpStatus(lookup, 404) ? e : lookup;
+            });
+            if (existing.secretAccessKey !== a.secretAccessKey) {
+              throw new Error(
+                `Key ${a.accessKeyId} already exists with a different secret`,
+              );
+            }
+            action = "unchanged";
+            // The secret stays here: key-result records none for an import.
+            return { accessKeyId: existing.accessKeyId, name: existing.name };
           }),
         );
         const handle = await context.writeResource(
           "key-result",
-          String(raw.accessKeyId ?? a.accessKeyId),
+          dataName("key-result", String(raw.accessKeyId ?? a.accessKeyId)),
           {
             accessKeyId: asStr(raw.accessKeyId) ?? a.accessKeyId,
             name: asStr(raw.name) ?? a.name,
-            action: "imported",
+            action,
             timestamp: new Date().toISOString(),
           },
         );
+        logInfo(context, "Imported key", {
+          accessKeyId: a.accessKeyId,
+          action,
+        });
         return { dataHandles: [handle] };
       },
     },
 
     key_update: {
       description:
-        "Update a key's name, create-bucket permission, and/or expiry (UpdateKey).",
+        "Update a key's name, create-bucket permission, and/or expiry (UpdateKey). " +
+        "neverExpires=true clears the expiry; neverExpires=false does nothing.",
       arguments: KeyUpdateArgs,
       execute: async (
         rawArgs,
@@ -1421,7 +1699,9 @@ export const model = {
           body.deny = { createBucket: !a.allowCreateBucket };
         }
         if (a.expiration !== undefined) body.expiration = a.expiration;
-        if (a.neverExpires !== undefined) body.neverExpires = a.neverExpires;
+        // Garage reads a missing neverExpires as false, which changes nothing,
+        // so false is not a change and must not count as one below.
+        if (a.neverExpires) body.neverExpires = true;
         if (Object.keys(body).length === 0) {
           throw new Error(
             "nothing to update: provide name, allowCreateBucket, expiration, or neverExpires",
@@ -1431,23 +1711,28 @@ export const model = {
         const raw = asObj(
           await api(g, "POST", "UpdateKey", { id: a.id }, body),
         );
-        const handle = await context.writeResource("key-result", a.id, {
-          accessKeyId: a.id,
-          name: asStr(raw.name) ?? a.name,
-          action: "updated",
-          timestamp: new Date().toISOString(),
-        });
+        const handle = await context.writeResource(
+          "key-result",
+          dataName("key-result", a.id),
+          {
+            accessKeyId: a.id,
+            name: asStr(raw.name) ?? a.name,
+            action: "updated",
+            timestamp: new Date().toISOString(),
+          },
+        );
+        logInfo(context, "Updated key", { id: a.id });
         return { dataHandles: [handle] };
       },
     },
 
     key_rotate: {
       description:
-        "Rotate a key: create a NEW key, copy the OLD key's bucket grants onto it, " +
-        "and return the new secret ONCE (sensitive). The new key keeps the old " +
-        "key's expiry. If a grant cannot be copied, the new key is deleted again " +
-        "and the method fails. Does NOT delete the old key: update consumers, " +
-        "then call key_delete on the old id.",
+        "Rotate a key: create a NEW key, copy the OLD key's bucket grants and " +
+        "local aliases onto it, and return the new secret (sensitive, vaulted). " +
+        "The new key keeps the old key's expiry, so an expired key is refused. If a grant or alias cannot be " +
+        "copied, the new key is deleted again and the method fails. Does NOT " +
+        "delete the old key: update consumers, then call key_delete on the old id.",
       arguments: KeyRotateArgs,
       execute: async (
         rawArgs,
@@ -1457,15 +1742,24 @@ export const model = {
         const g = context.globalArgs;
         const ts = new Date().toISOString();
 
-        const oldKey = await getKeyRaw(g, { id: a.id });
-        if (!oldKey.accessKeyId) {
-          throw new Error(`Key ${JSON.stringify(a.id)} not found`);
-        }
+        const oldKey = await getKeyRaw(g, { id: a.id }).catch((e: Error) => {
+          if (isHttpStatus(e, 404)) {
+            throw new Error(`Key ${JSON.stringify(a.id)} not found`);
+          }
+          throw e;
+        });
         const oldName = asStr(oldKey.name);
         const oldPerm = asObj(oldKey.permissions);
+        const oldExpiration = asStr(oldKey.expiration);
+        // The new key takes the old key's expiry, so it would be born expired.
+        if (asBool(oldKey.expired)) {
+          throw new Error(
+            `Key ${a.id} expired at ${oldExpiration}; its replacement would ` +
+              "be expired too. Give it a new expiration with key_update first.",
+          );
+        }
 
         logInfo(context, "Rotating key: creating replacement", { oldId: a.id });
-        const oldExpiration = asStr(oldKey.expiration);
         const created = asObj(
           await api(g, "POST", "CreateKey", {}, {
             name: a.name ?? `${oldName ?? a.id} (rotated)`,
@@ -1481,6 +1775,7 @@ export const model = {
         }
 
         let copied = 0;
+        let aliases = 0;
         try {
           for (const b of asArr(oldKey.buckets)) {
             const bb = asObj(b);
@@ -1497,10 +1792,20 @@ export const model = {
               },
             });
             copied += 1;
+            // Local aliases belong to a key, so a client that addresses the
+            // bucket by one would get NoSuchBucket under the new key.
+            for (const localAlias of asArr(bb.localAliases).map(String)) {
+              await api(g, "POST", "AddBucketAlias", {}, {
+                bucketId,
+                localAlias,
+                accessKeyId: newId,
+              });
+              aliases += 1;
+            }
           }
         } catch (e) {
-          // The new secret has not been returned to anyone yet, so a key left
-          // behind would be unusable. Remove it before failing.
+          // No one holds the new key yet, and it carries only part of the old
+          // key's access. Remove it rather than leave a half-copied key.
           const cleanup = await api(g, "POST", "DeleteKey", { id: newId })
             .then(() => "the new key was deleted again")
             .catch((d: Error) =>
@@ -1508,28 +1813,40 @@ export const model = {
               "delete it by hand"
             );
           throw new Error(
-            `Rotation failed copying grants: ${
+            `Rotation failed copying grants and aliases: ${
               (e as Error).message
             }; ${cleanup}`,
           );
         }
-        logInfo(context, "Rotation: copied grants", { newId, grants: copied });
-
-        const handle = await context.writeResource("key-result", newId, {
-          accessKeyId: newId,
-          name: asStr(created.name),
-          secretAccessKey: asStr(created.secretAccessKey) ?? null,
-          action: "rotated",
-          timestamp: ts,
+        logInfo(context, "Rotation: copied grants and aliases", {
+          newId,
+          grants: copied,
+          localAliases: aliases,
         });
+
+        const handle = await context.writeResource(
+          "key-result",
+          dataName("key-result", newId),
+          {
+            accessKeyId: newId,
+            name: asStr(created.name),
+            secretAccessKey: asStr(created.secretAccessKey) ?? null,
+            action: "rotated",
+            timestamp: ts,
+          },
+        ).catch((e: Error) => {
+          throw keyNotRecorded(newId, e);
+        });
+        logInfo(context, "Rotated key", { oldId: a.id, newId });
         return { dataHandles: [handle] };
       },
     },
 
     key_delete: {
       description:
-        "Delete an access key BY ID (verified to exist first). Destructive — any " +
-        "client using it loses access immediately.",
+        "Delete an access key BY ID (verified to exist first). A key that is " +
+        "already gone is recorded as `unchanged`. Destructive — any client using " +
+        "it loses access immediately.",
       arguments: KeyDeleteArgs,
       execute: async (
         rawArgs,
@@ -1537,18 +1854,38 @@ export const model = {
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const a = KeyDeleteArgs.parse(rawArgs);
         const g = context.globalArgs;
-        const raw = await getKeyRaw(g, { id: a.id });
-        if (!raw.accessKeyId) {
-          throw new Error(`Key ${JSON.stringify(a.id)} not found`);
+        const raw = await getKeyRaw(g, { id: a.id }).catch((e: Error) => {
+          if (isHttpStatus(e, 404)) return undefined;
+          throw e;
+        });
+        // Already gone: as for bucket_delete, a re-run succeeds and the
+        // record carries the id.
+        if (!raw) {
+          logInfo(context, "Key already gone; unchanged", { id: a.id });
+          const handle = await context.writeResource(
+            "key-result",
+            dataName("key-result", a.id),
+            {
+              accessKeyId: a.id,
+              action: "unchanged",
+              timestamp: new Date().toISOString(),
+            },
+          );
+          return { dataHandles: [handle] };
         }
         logInfo(context, "Deleting key", { id: a.id });
         await api(g, "POST", "DeleteKey", { id: a.id });
-        const handle = await context.writeResource("key-result", a.id, {
-          accessKeyId: a.id,
-          name: asStr(raw.name),
-          action: "deleted",
-          timestamp: new Date().toISOString(),
-        });
+        const handle = await context.writeResource(
+          "key-result",
+          dataName("key-result", a.id),
+          {
+            accessKeyId: a.id,
+            name: asStr(raw.name),
+            action: "deleted",
+            timestamp: new Date().toISOString(),
+          },
+        );
+        logInfo(context, "Deleted key", { id: a.id });
         return { dataHandles: [handle] };
       },
     },
@@ -1573,17 +1910,19 @@ export const model = {
           accessKeyId: a.accessKeyId,
           permissions: { read: a.read, write: a.write, owner: a.owner },
         });
+        const held = keyPermsOn(bucket, a.accessKeyId);
         const handle = await context.writeResource(
           "permission-result",
-          `${a.bucketId}-${a.accessKeyId}`,
+          dataName("permission-result", `${a.bucketId}:${a.accessKeyId}`),
           {
             bucketId: a.bucketId,
             accessKeyId: a.accessKeyId,
-            ...keyPermsOn(bucket, a.accessKeyId),
+            ...held,
             action: "granted",
             timestamp: new Date().toISOString(),
           },
         );
+        logInfo(context, "Allowed key on bucket", held);
         return { dataHandles: [handle] };
       },
     },
@@ -1608,17 +1947,19 @@ export const model = {
           accessKeyId: a.accessKeyId,
           permissions: { read: a.read, write: a.write, owner: a.owner },
         });
+        const held = keyPermsOn(bucket, a.accessKeyId);
         const handle = await context.writeResource(
           "permission-result",
-          `${a.bucketId}-${a.accessKeyId}`,
+          dataName("permission-result", `${a.bucketId}:${a.accessKeyId}`),
           {
             bucketId: a.bucketId,
             accessKeyId: a.accessKeyId,
-            ...keyPermsOn(bucket, a.accessKeyId),
+            ...held,
             action: "denied",
             timestamp: new Date().toISOString(),
           },
         );
+        logInfo(context, "Denied key on bucket", held);
         return { dataHandles: [handle] };
       },
     },
@@ -1636,12 +1977,16 @@ export const model = {
         const g = context.globalArgs;
         logInfo(context, "Fetching cluster status");
         const raw = await api(g, "GET", "GetClusterStatus");
-        const node = await selfNodeId(g);
+        const self = await selfNodeInfo(g);
         const handle = await context.writeResource(
           "cluster-status",
-          "main",
-          shapeStatus(raw, node, "observed", new Date().toISOString()),
+          dataName("cluster-status"),
+          shapeStatus(raw, self, "observed", new Date().toISOString()),
         );
+        logInfo(context, "Fetched cluster status", {
+          node: self.id,
+          nodes: asArr(asObj(raw).nodes).length,
+        });
         return { dataHandles: [handle] };
       },
     },
@@ -1655,20 +2000,29 @@ export const model = {
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const g = context.globalArgs;
+        logInfo(context, "Fetching cluster layout");
         const raw = await api(g, "GET", "GetClusterLayout");
+        const layout = shapeLayout(raw, "observed", new Date().toISOString());
         const handle = await context.writeResource(
           "cluster-layout",
-          "main",
-          shapeLayout(raw, "observed", new Date().toISOString()),
+          dataName("cluster-layout"),
+          layout,
         );
+        logInfo(context, "Fetched cluster layout", {
+          version: layout.version,
+          roles: layout.roles.length,
+          staged: layout.stagedChanges.length,
+        });
         return { dataHandles: [handle] };
       },
     },
 
     layout_assign: {
       description:
-        "STAGE a role for a node (zone + storage capacity, or gateway when capacity is " +
-        "omitted). Stages only — review with layout_get, then commit with layout_apply.",
+        "STAGE a role for a node (zone, storage capacity in bytes or null for gateway, " +
+        "tags). Anything omitted keeps the node's current value, staged or applied; " +
+        "a node with no role yet needs a zone and defaults to gateway. Stages only — " +
+        "review with layout_get, then commit with layout_apply.",
       arguments: LayoutAssignArgs,
       execute: async (
         rawArgs,
@@ -1679,12 +2033,18 @@ export const model = {
 
         // A role change replaces the node's whole role (zone, capacity and
         // tags together), so whatever the caller left out is taken from the
-        // role the node holds now. A node with no role yet has nothing to
-        // carry over: it needs a zone, and omitted capacity means gateway.
+        // role the node holds now. Garage keeps one staged change per node and
+        // a new one overwrites it, so a role already staged for the node wins
+        // over its applied role; otherwise a second call would silently undo
+        // the first. A staged removal carries no role, so it falls through to
+        // the applied one. A node with no role at all has nothing to carry
+        // over: it needs a zone, and omitted capacity means gateway.
         const layout = asObj(await api(g, "GET", "GetClusterLayout"));
-        const role = asArr(layout.roles).map(asObj).find((r) =>
-          r.id === a.nodeId
-        );
+        const stagedRole = asArr(layout.stagedRoleChanges).map(asObj).find((
+          c,
+        ) => c.id === a.nodeId && c.remove !== true);
+        const role = stagedRole ??
+          asArr(layout.roles).map(asObj).find((r) => r.id === a.nodeId);
         const zone = a.zone ?? (role ? asStr(role.zone) : undefined);
         if (!zone) {
           throw new Error(
@@ -1703,13 +2063,18 @@ export const model = {
         };
         logInfo(context, "Staging layout role", { nodeId: a.nodeId, zone });
         await api(g, "POST", "UpdateClusterLayout", {}, body);
-        const handle = await context.writeResource("layout-result", a.nodeId, {
-          nodeId: a.nodeId,
-          staged: true,
-          applied: false,
-          action: "staged",
-          timestamp: new Date().toISOString(),
-        });
+        const handle = await context.writeResource(
+          "layout-result",
+          dataName("layout-result", a.nodeId),
+          {
+            nodeId: a.nodeId,
+            staged: true,
+            applied: false,
+            action: "staged",
+            timestamp: new Date().toISOString(),
+          },
+        );
+        logInfo(context, "Staged layout role", { nodeId: a.nodeId });
         return { dataHandles: [handle] };
       },
     },
@@ -1726,8 +2091,11 @@ export const model = {
         const a = LayoutApplyArgs.parse(rawArgs);
         const g = context.globalArgs;
         const layout = asObj(await api(g, "GET", "GetClusterLayout"));
-        const staged = asArr(layout.stagedRoleChanges);
-        if (staged.length === 0 && a.version === undefined) {
+        // A zoneRedundancy change is staged on its own, with no role change.
+        const staged = asArr(layout.stagedRoleChanges).length > 0 ||
+          (layout.stagedParameters !== undefined &&
+            layout.stagedParameters !== null);
+        if (!staged && a.version === undefined) {
           throw new Error("no staged layout changes to apply");
         }
         const version = a.version ?? (asNum(layout.version) ?? 0) + 1;
@@ -1737,7 +2105,8 @@ export const model = {
         );
         const handle = await context.writeResource(
           "layout-result",
-          String(version),
+          // "apply-" keeps a version number apart from a node id.
+          dataName("layout-result", `apply-${version}`),
           {
             version,
             staged: false,
@@ -1747,6 +2116,7 @@ export const model = {
             timestamp: new Date().toISOString(),
           },
         );
+        logInfo(context, "Applied layout", { version });
         return { dataHandles: [handle] };
       },
     },
@@ -1762,12 +2132,17 @@ export const model = {
         const g = context.globalArgs;
         logInfo(context, "Reverting staged layout changes");
         await api(g, "POST", "RevertClusterLayout");
-        const handle = await context.writeResource("layout-result", "revert", {
-          staged: false,
-          applied: false,
-          action: "reverted",
-          timestamp: new Date().toISOString(),
-        });
+        const handle = await context.writeResource(
+          "layout-result",
+          dataName("layout-result", "revert"),
+          {
+            staged: false,
+            applied: false,
+            action: "reverted",
+            timestamp: new Date().toISOString(),
+          },
+        );
+        logInfo(context, "Reverted staged layout changes");
         return { dataHandles: [handle] };
       },
     },
@@ -1787,18 +2162,22 @@ export const model = {
         const g = context.globalArgs;
         const ts = new Date().toISOString();
 
-        const nodeId = a.nodeId ?? await selfNodeId(g);
+        const nodeId = a.nodeId ?? (await selfNodeInfo(g)).id;
 
         const layout = asObj(await api(g, "GET", "GetClusterLayout"));
         if (asArr(layout.roles).length > 0 && !a.force) {
           logInfo(context, "Layout already initialised; unchanged", { nodeId });
-          const handle = await context.writeResource("layout-result", nodeId, {
-            version: asNum(layout.version),
-            applied: false,
-            nodeId,
-            action: "unchanged",
-            timestamp: ts,
-          });
+          const handle = await context.writeResource(
+            "layout-result",
+            dataName("layout-result", nodeId),
+            {
+              version: asNum(layout.version),
+              applied: false,
+              nodeId,
+              action: "unchanged",
+              timestamp: ts,
+            },
+          );
           return { dataHandles: [handle] };
         }
 
@@ -1820,17 +2199,31 @@ export const model = {
         });
         const version = (asNum(layout.version) ?? 0) + 1;
         const res = asObj(
-          await api(g, "POST", "ApplyClusterLayout", {}, { version }),
+          await api(g, "POST", "ApplyClusterLayout", {}, { version }).catch(
+            (e: Error) => {
+              // The role was staged above and stays staged after a failed
+              // apply; say so, or a later layout change would carry it along.
+              throw new Error(
+                `${e.message}; the role for ${nodeId} is still staged: run ` +
+                  "layout_revert to discard it or layout_apply to retry",
+              );
+            },
+          ),
         );
-        const handle = await context.writeResource("layout-result", nodeId, {
-          version,
-          staged: false,
-          applied: true,
-          nodeId,
-          messages: asArr(res.message).map(String),
-          action: "created",
-          timestamp: ts,
-        });
+        const handle = await context.writeResource(
+          "layout-result",
+          dataName("layout-result", nodeId),
+          {
+            version,
+            staged: false,
+            applied: true,
+            nodeId,
+            messages: asArr(res.message).map(String),
+            action: "created",
+            timestamp: ts,
+          },
+        );
+        logInfo(context, "Initialised cluster layout", { nodeId, version });
         return { dataHandles: [handle] };
       },
     },
