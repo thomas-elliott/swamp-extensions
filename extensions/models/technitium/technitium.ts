@@ -14,13 +14,14 @@ import { readFile } from "node:fs/promises";
 
 /**
  * `@thomas/technitium` manages a Technitium DNS Server entirely through its
- * HTTP API. A permanent API token (sent both as `Authorization: Bearer`
- * and as the legacy `?token=` query param) is the only credential; the extension
+ * HTTP API. A permanent API token, sent only as an `Authorization: Bearer`
+ * header (Technitium 15 and later), is the only credential; the extension
  * never touches the server host directly. Every mutation goes through the API.
  *
- * Only blocking-relevant fields of the server settings are stored as data. The
- * full settings object is NOT passed through, so it cannot leak
- * secrets (e.g. TLS certificate passwords) into the data model.
+ * Only a named subset of the server settings is stored as data: blocking,
+ * web-service TLS, DNSSEC validation and DNS-over-TLS. The full settings object
+ * is NOT passed through, so it cannot leak secrets (e.g. TLS certificate
+ * passwords) into the data model.
  */
 
 const GlobalArgs = z.object({
@@ -31,7 +32,8 @@ const GlobalArgs = z.object({
     "Permanent Technitium API token. Supply via vault: ${{ vault.get(technitium, api_token) }}",
   ),
   skipTlsVerify: z.boolean().default(false).describe(
-    "Accept self-signed certs (default false — a valid cert is expected)",
+    "Turn off TLS certificate verification entirely (default false). This " +
+      "accepts a self-signed cert, but also any cert for any hostname.",
   ),
 });
 
@@ -83,7 +85,9 @@ const SettingsResource = z.object({
   ),
   blockListUrls: z.array(z.string()).optional(),
   allowListUrls: z.array(z.string()).optional(),
-  blockListUrlUpdateIntervalHours: z.number().optional(),
+  blockListUrlUpdateIntervalHours: z.number().optional().describe(
+    "Hours between automatic block-list downloads (Technitium's `blockListUpdateIntervalHours`)",
+  ),
   // Web-service TLS and resolver security settings (read-only copy; the
   // cert password is never included).
   webServiceEnableTls: z.boolean().optional().describe(
@@ -110,6 +114,8 @@ const SettingsResource = z.object({
 
 const StatsResource = z.object({
   range: z.string().describe("LastHour | LastDay | LastWeek | ... | Custom"),
+  start: z.string().optional().describe("Start of a Custom range, as given"),
+  end: z.string().optional().describe("End of a Custom range, as given"),
   totalQueries: z.number().optional(),
   totalNoError: z.number().optional(),
   totalServerFailure: z.number().optional(),
@@ -122,7 +128,7 @@ const StatsResource = z.object({
   topBlockedDomains: z.array(z.unknown()).optional(),
   topClients: z.array(z.unknown()).optional(),
   observedAt: z.string(),
-}).passthrough();
+});
 
 const ListEntryResource = z.object({
   list: z.enum(["allowed", "blocked"]),
@@ -138,11 +144,17 @@ const DnsResponseResource = z.object({
   protocol: z.string(),
   rcode: z.string().optional(),
   answer: z.array(z.unknown()).optional(),
+  result: z.unknown().optional().describe(
+    "The parsed DNS response as Technitium returns it",
+  ),
+  rawResponses: z.array(z.unknown()).optional(),
   observedAt: z.string(),
-}).passthrough();
+});
 
 const QueryLogResource = z.object({
-  rowNumber: z.number().optional(),
+  rowNumber: z.number().optional().describe(
+    "Position in the query's results when last read; not an id",
+  ),
   timestamp: z.string().optional(),
   clientIpAddress: z.string().optional(),
   protocol: z.string().optional(),
@@ -153,7 +165,17 @@ const QueryLogResource = z.object({
   qclass: z.string().optional(),
   answer: z.string().optional(),
   observedAt: z.string(),
-}).passthrough();
+});
+
+const QueryLogPageResource = z.object({
+  pageNumber: z.number().optional(),
+  totalPages: z.number().optional(),
+  totalEntries: z.number().optional().describe(
+    "Entries the query matched across all pages",
+  ),
+  entriesOnPage: z.number(),
+  observedAt: z.string(),
+});
 
 const CacheEntryResource = z.object({
   name: z.string(),
@@ -181,7 +203,7 @@ type GlobalArgsT = z.infer<typeof GlobalArgs>;
 /** A parsed JSON object. */
 export type Json = Record<string, unknown>;
 /** An HTTP verb used by the Technitium transport. */
-export type HttpMethod = "GET" | "POST" | "PUT" | "DELETE";
+export type HttpMethod = "GET" | "POST";
 /** Query/form parameters for a Technitium API call. */
 export type Params = Record<string, string | number | boolean | undefined>;
 type HttpResult = { status: number; body: Buffer };
@@ -271,16 +293,17 @@ export function __setTechnitiumTransport(fn: TechFn | null): void {
 }
 
 /**
- * Build the request URL (always carrying the `token` query param) and the
- * `Authorization: Bearer` header for a Technitium API call.
+ * Build the request URL and headers for a Technitium API call. The token goes
+ * only in the `Authorization: Bearer` header, never the URL, so it stays out
+ * of proxy and access logs. Technitium before 15 needs it in the URL and is
+ * not supported.
  */
-function buildRequest(
-  g: GlobalArgsT,
+export function buildRequest(
+  g: { baseUrl: string; apiToken: string },
   path: string,
   query: Params,
 ): { url: URL; headers: Record<string, string>; secure: boolean } {
   const u = new URL(g.baseUrl.replace(/\/+$/, "") + API + path);
-  u.searchParams.set("token", g.apiToken);
   for (const [k, v] of Object.entries(query)) {
     if (v !== undefined && v !== null) u.searchParams.set(k, String(v));
   }
@@ -291,6 +314,22 @@ function buildRequest(
       "Authorization": `Bearer ${g.apiToken}`,
       "Accept": "application/json",
     },
+  };
+}
+
+/**
+ * Where `http.request` should connect for `url`. `URL.hostname` keeps the
+ * brackets around an IPv6 literal (`[::1]`), which `http.request` would try to
+ * resolve as a hostname and fail, so they are removed.
+ */
+export function requestTarget(
+  url: URL,
+): { hostname: string; port: number; path: string } {
+  const secure = url.protocol === "https:";
+  return {
+    hostname: url.hostname.replace(/^\[(.*)\]$/, "$1"),
+    port: url.port ? parseInt(url.port, 10) : (secure ? 443 : 80),
+    path: url.pathname + url.search,
   };
 }
 
@@ -332,9 +371,7 @@ async function apiCallReal(
   }
   const res = await httpRequest(
     {
-      hostname: url.hostname,
-      port: url.port ? parseInt(url.port, 10) : (secure ? 443 : 80),
-      path: url.pathname + url.search,
+      ...requestTarget(url),
       method,
       headers,
       rejectUnauthorized: !g.skipTlsVerify,
@@ -364,9 +401,7 @@ async function apiDownload(
   const { url, headers, secure } = buildRequest(g, path, params);
   const res = await httpRequest(
     {
-      hostname: url.hostname,
-      port: url.port ? parseInt(url.port, 10) : (secure ? 443 : 80),
-      path: url.pathname + url.search,
+      ...requestTarget(url),
       method: "GET",
       headers,
       rejectUnauthorized: !g.skipTlsVerify,
@@ -380,9 +415,9 @@ async function apiDownload(
       }`,
     );
   }
-  // A zip starts with "PK". Anything else (a JSON error, a proxy's login page)
-  // is not a backup, however it was served.
-  if (res.body[0] !== 0x50 || res.body[1] !== 0x4b) {
+  // Anything that is not a zip (a JSON error, a proxy's login page) is not a
+  // backup, however it was served.
+  if (!isZip(res.body)) {
     throw new Error(
       `Technitium GET ${path}: the reply is not a zip file: ${
         res.body.subarray(0, 200).toString("utf8")
@@ -390,6 +425,11 @@ async function apiDownload(
     );
   }
   return new Uint8Array(res.body);
+}
+
+/** Does `bytes` start with "PK", the signature every zip file starts with? */
+function isZip(bytes: Uint8Array): boolean {
+  return bytes[0] === 0x50 && bytes[1] === 0x4b;
 }
 
 /**
@@ -413,9 +453,7 @@ async function apiUpload(
   headers["Content-Length"] = String(body.length);
   const res = await httpRequest(
     {
-      hostname: url.hostname,
-      port: url.port ? parseInt(url.port, 10) : (secure ? 443 : 80),
-      path: url.pathname + url.search,
+      ...requestTarget(url),
       method: "POST",
       headers,
       rejectUnauthorized: !g.skipTlsVerify,
@@ -460,45 +498,60 @@ function toStringArray(v: unknown): string[] | undefined {
 }
 
 /**
- * Slugify an arbitrary label into a safe swamp data instance name. swamp rejects
- * instance names containing `/`, `..`, `\`, or null bytes, so dotted domains and
- * record names are flattened.
+ * The data instance name for a record of `spec`: `<spec>:<key>`, or `<spec>`
+ * alone for a one-per-model record. swamp keys stored data by model + instance
+ * name, not by spec, so the spec prefix stops two specs overwriting each other.
  */
-export function slug(s: string): string {
-  // Map `*` to a literal token BEFORE the alnum strip so a wildcard label slugs
-  // distinctly from its bare form. Otherwise `*.s3.x` and `s3.x` both flatten to
-  // `s3-x`. The duplicate instance names abort `record_list` (swamp rejects
-  // duplicate data-instance names) for any zone containing both a name and its wildcard.
-  const out = s.replace(/\*/g, "star").replace(/[^A-Za-z0-9_-]+/g, "-").replace(
-    /^-+|-+$/g,
-    "",
-  );
-  return out.length > 0 ? out : "root";
+export function dataName(spec: string, key?: string): string {
+  return key === undefined ? spec : `${spec}:${key}`;
 }
 
-/** Deterministic short hash (FNV-1a → base36) of a record's rData, for stable instance naming. */
+/**
+ * A DNS name as a data-name key. DNS names are case-insensitive and Technitium
+ * ignores a trailing dot, so both are normalised. Dots stay as they are. `%`,
+ * `:`, `/` and `\` are percent-escaped: swamp rejects `/` and `\` (which a
+ * classless reverse name such as `0/26.2.0.192.in-addr.arpa` can contain), and
+ * escaping `:` keeps the `:`-separated parts of a record key unambiguous.
+ */
+export function dnsKey(name: string): string {
+  return name.toLowerCase().replace(/\.$/, "").replace(
+    /[%:/\\]/g,
+    (c) => "%" + c.charCodeAt(0).toString(16).toUpperCase(),
+  );
+}
+
+/**
+ * Deterministic short hash (FNV-1a → base36) of a record's rData. Values are
+ * hashed as the server returns them, case and all (TXT data is case-sensitive),
+ * and nested values (SVCB params, APL lists) as JSON.
+ */
 function rDataHash(rData?: Record<string, unknown>): string {
-  const canon = rData
-    ? Object.keys(rData).sort()
-      .map((k) => `${k}=${String(rData[k])}`)
-      .join("&")
-      .toLowerCase()
-    : "";
+  return shortHash(canonicalRData(rData));
+}
+
+/** Deterministic short hash (FNV-1a → base36) of a string. */
+function shortHash(text: string): string {
   let h = 0x811c9dc5;
-  for (let i = 0; i < canon.length; i++) {
-    h ^= canon.charCodeAt(i);
+  for (let i = 0; i < text.length; i++) {
+    h ^= text.charCodeAt(i);
     h = Math.imul(h, 0x01000193);
   }
   return (h >>> 0).toString(36).padStart(7, "0");
 }
 
+/** rData as a key-order-independent string, so two copies of one record compare equal. */
+function canonicalRData(rData?: Record<string, unknown>): string {
+  return rData
+    ? JSON.stringify(Object.keys(rData).sort().map((k) => [k, rData[k]]))
+    : "";
+}
+
 /**
- * Deterministic, identity-stable instance name for a zone record, shared by
- * EVERY record method. Keyed on (zone, name, type, rData), never on a list
- * position, so a record has one instance regardless of which method wrote it,
- * a re-list produces a new version instead of a duplicate, and two records at
- * one name (e.g. two A records) stay distinct. DNS names are
- * case-insensitive, so name/zone are lowercased and type upper-cased.
+ * The data name for a zone record, shared by every record method:
+ * `zoneRecord:<zone>:<name>:<TYPE>:<rData hash>`. DNS records have no id, so
+ * the key is the record itself. Every writer passes the record as Technitium
+ * returns it (not the caller's rData), so one record has one name whichever
+ * method wrote it, and two records at one name (e.g. two A records) differ.
  */
 export function recordInstanceName(
   zone: string,
@@ -506,9 +559,10 @@ export function recordInstanceName(
   type: string,
   rData?: Record<string, unknown>,
 ): string {
-  return `rec-${slug(zone.toLowerCase())}-${
-    slug(name.toLowerCase())
-  }-${type.toUpperCase()}-${rDataHash(rData)}`;
+  return dataName(
+    "zoneRecord",
+    `${dnsKey(zone)}:${dnsKey(name)}:${type.toUpperCase()}:${rDataHash(rData)}`,
+  );
 }
 
 /** Pull an array out of a Technitium response under any of the given keys. */
@@ -571,6 +625,15 @@ export function prefixNew(rData: Record<string, unknown>): Params {
   return out;
 }
 
+/**
+ * CNAME and DNAME records have no `new*` update params. A name holds at most
+ * one of each, and `records/update` replaces it with the target sent as
+ * `cname`/`dname`.
+ */
+function hasNoNewParams(type: string): boolean {
+  return ["CNAME", "DNAME"].includes(type.toUpperCase());
+}
+
 /** Flatten a record's rData object into flat query params (Technitium uses flat names). */
 function spreadRData(into: Params, rData?: Record<string, unknown>): Params {
   if (rData) {
@@ -620,6 +683,45 @@ type LiveRecord = {
 };
 
 /**
+ * A record as Technitium writes it in JSON (`records/get`, `addedRecord`,
+ * `updatedRecord`). A FWD record's `proxyPassword` is dropped: Technitium
+ * returns it in clear, and this record is what gets stored as data.
+ */
+function toLiveRecord(rec: Json, fallbackName: string): LiveRecord {
+  const rData = pick(rec, "rData") as Record<string, unknown> | undefined;
+  let stored = rData;
+  if (rData && "proxyPassword" in rData) {
+    const { proxyPassword: _secret, ...rest } = rData;
+    stored = rest;
+  }
+  return {
+    name: asString(pick(rec, "name")) ?? fallbackName,
+    type: asString(pick(rec, "type")) ?? "UNKNOWN",
+    ttl: asNumber(pick(rec, "ttl")),
+    disabled: pick(rec, "disabled") as boolean | undefined,
+    comments: asString(pick(rec, "comments")),
+    expiryTtl: asNumber(pick(rec, "expiryTtl")),
+    rData: stored,
+  };
+}
+
+/**
+ * The record a write response says the server stored: `addedRecord` from
+ * `records/add`, `updatedRecord` from `records/update`. Undefined when the
+ * response does not carry one.
+ */
+function writtenRecord(
+  resp: Json,
+  key: "addedRecord" | "updatedRecord",
+  fallbackName: string,
+): LiveRecord | undefined {
+  const rec = resp[key];
+  return rec && typeof rec === "object"
+    ? toLiveRecord(rec as Json, fallbackName)
+    : undefined;
+}
+
+/**
  * The live records at one domain, and the zone that holds them as Technitium
  * reports it. Without an explicit `zone` that is the only way to know it: the
  * domain `www.example.com` lives in zone `example.com`.
@@ -635,41 +737,179 @@ async function getDomainRecords(
   const zoneInfo = (r.zone ?? {}) as Json;
   return {
     zone: asString(pick(zoneInfo, "name")) ?? zone ?? domain,
-    records: coerceArray(r, "records").map((rec) => ({
-      name: asString(pick(rec, "name")) ?? domain,
-      type: asString(pick(rec, "type")) ?? "UNKNOWN",
-      ttl: asNumber(pick(rec, "ttl")),
-      disabled: pick(rec, "disabled") as boolean | undefined,
-      comments: asString(pick(rec, "comments")),
-      expiryTtl: asNumber(pick(rec, "expiryTtl")),
-      rData: (pick(rec, "rData") as Record<string, unknown> | undefined) ??
-        undefined,
-    })),
+    records: coerceArray(r, "records").map((rec) => toLiveRecord(rec, domain)),
   };
 }
 
 /**
- * Does a live record's rData satisfy every field in `want` (subset, string-
- * compared)? APP content is normalized: Technitium reports it under `data` but
- * it is written via `recordData`, so the two compare equal.
+ * Write parameters that Technitium reads back under another name. The add,
+ * update and delete endpoints take a type prefix that the record's JSON drops
+ * (`WriteRecordAsJson` in Technitium's `WebServiceZonesApi.cs`).
+ */
+const READ_KEY: Record<string, string> = {
+  naptrOrder: "order",
+  naptrPreference: "preference",
+  naptrFlags: "flags",
+  naptrServices: "services",
+  naptrRegexp: "regexp",
+  naptrReplacement: "replacement",
+  sshfpAlgorithm: "algorithm",
+  sshfpFingerprintType: "fingerprintType",
+  sshfpFingerprint: "fingerprint",
+  tlsaCertificateUsage: "certificateUsage",
+  tlsaSelector: "selector",
+  tlsaMatchingType: "matchingType",
+  tlsaCertificateAssociationData: "certificateAssociationData",
+  uriPriority: "priority",
+  uriWeight: "weight",
+  forwarderPriority: "priority",
+};
+
+/**
+ * DS, SSHFP and TLSA fields that Technitium accepts as a number or a name but
+ * always reads back as the name, keyed by record type and read-shape field.
+ * The names are the enum names in TechnitiumLibrary (`DnssecAlgorithm`,
+ * `DnssecDigestType`, `DnsSSHFPAlgorithm`, `DnsSSHFPFingerprintType`,
+ * `DnsTLSACertificateUsage`, `DnsTLSASelector`, `DnsTLSAMatchingType`). A
+ * number missing here is read back as the number, so it still compares equal.
+ */
+const ENUM_NAMES: Record<string, Record<string, Record<number, string>>> = {
+  DS: {
+    algorithm: {
+      0: "Unknown",
+      1: "RSAMD5",
+      3: "DSA",
+      5: "RSASHA1",
+      6: "DSA_NSEC3_SHA1",
+      7: "RSASHA1_NSEC3_SHA1",
+      8: "RSASHA256",
+      10: "RSASHA512",
+      12: "ECC_GOST",
+      13: "ECDSAP256SHA256",
+      14: "ECDSAP384SHA384",
+      15: "ED25519",
+      16: "ED448",
+      253: "PRIVATEDNS",
+      254: "PRIVATEOID",
+    },
+    digestType: {
+      0: "Unknown",
+      1: "SHA1",
+      2: "SHA256",
+      3: "GOST_R_34_11_94",
+      4: "SHA384",
+    },
+  },
+  SSHFP: {
+    algorithm: {
+      0: "Reserved",
+      1: "RSA",
+      2: "DSA",
+      3: "ECDSA",
+      4: "Ed25519",
+      6: "Ed448",
+    },
+    fingerprintType: { 0: "Reserved", 1: "SHA1", 2: "SHA256" },
+  },
+  TLSA: {
+    certificateUsage: {
+      0: "PKIX_TA",
+      1: "PKIX_EE",
+      2: "DANE_TA",
+      3: "DANE_EE",
+      255: "PrivCert",
+    },
+    selector: { 0: "Cert", 1: "SPKI", 255: "PrivSel" },
+    matchingType: {
+      0: "Full",
+      1: "SHA2_256",
+      2: "SHA2_512",
+      255: "PrivMatch",
+    },
+  },
+};
+
+/**
+ * A caller's enum value in the form Technitium reads it back: a number becomes
+ * its name. Technitium prints some names with `-` for `_` (TLSA `PKIX-TA`) and
+ * accepts either on write, so both sides compare with `_`.
+ */
+function enumComparable(
+  type: string,
+  key: string,
+  v: unknown,
+): string | undefined {
+  const names = ENUM_NAMES[type.toUpperCase()]?.[key];
+  if (!names) return undefined;
+  const s = String(v ?? "").trim();
+  const name = /^\d+$/.test(s) ? names[Number(s)] ?? s : s;
+  return name.toLowerCase().replace(/-/g, "_");
+}
+
+/** Write options that change how a record is added but are not part of it. */
+const WRITE_ONLY_PARAMS = new Set([
+  "ptr",
+  "createPtrZone",
+  "glue",
+  "updateSvcbHints",
+  "overwrite",
+]);
+
+/**
+ * One rData value in a form the caller's and the server's copies agree on.
+ * Technitium trims a trailing dot from names, prints hex in capitals and
+ * prints IPv6 addresses compressed. TXT text is case-sensitive, so it is
+ * compared as it is.
+ */
+function comparableValue(key: string, v: unknown): string {
+  const s = String(v ?? "");
+  if (key === "text") return s;
+  if (key === "ipAddress" && s.includes(":")) {
+    // The URL parser prints an IPv6 address in the same compressed form.
+    try {
+      return new URL(`http://[${s}]`).hostname;
+    } catch {
+      return s;
+    }
+  }
+  return s.toLowerCase().replace(/\.$/, "");
+}
+
+/**
+ * Does a live `type` record's rData satisfy every field in `want`? `want` is
+ * the caller's rData, in the write endpoints' parameter names and as typed, so
+ * each field is renamed and normalised to the read shape first, and a DS,
+ * SSHFP or TLSA enum given as a number is compared by its name. Write-only
+ * options are skipped, and so are structured live values (SVCB `svcParams`,
+ * APL lists): the caller sends those as a string the server parses. APP
+ * content is reported under `data` but written via `recordData`, so the two
+ * compare equal.
  */
 function rDataMatches(
   want: Record<string, unknown> | undefined,
   live: Record<string, unknown> | undefined,
-  isApp: boolean,
+  type: string,
 ): boolean {
   if (!want) return true;
   const got = live ?? {};
   const eq = (a: unknown, b: unknown) => String(a ?? "") === String(b ?? "");
-  if (isApp) {
+  if (type.toUpperCase() === "APP") {
     const wantData = want.recordData ?? want.data;
     return (want.appName == null || eq(got.appName, want.appName)) &&
       (want.classPath == null || eq(got.classPath, want.classPath)) &&
       (wantData == null || eq(got.recordData ?? got.data, wantData));
   }
   for (const [k, v] of Object.entries(want)) {
-    if (v === undefined || v === null) continue;
-    if (!eq(got[k], v)) return false;
+    if (v === undefined || v === null || WRITE_ONLY_PARAMS.has(k)) continue;
+    const key = READ_KEY[k] ?? k;
+    const liveValue = got[key];
+    if (typeof liveValue === "object" && liveValue !== null) continue;
+    const wantEnum = enumComparable(type, key, v);
+    if (wantEnum !== undefined) {
+      if (enumComparable(type, key, liveValue) !== wantEnum) return false;
+    } else if (comparableValue(key, liveValue) !== comparableValue(key, v)) {
+      return false;
+    }
   }
   return true;
 }
@@ -678,8 +918,16 @@ function rDataMatches(
  * Read the record back after a mutation and assert it reflects the intended
  * state. Technitium can return `ok` while writing empty data, and an APP record
  * with empty data makes the whole zone answer SERVFAIL: for add/update assert a `type` record
- * matching `want` now exists at `domain`; for delete assert none remains. Throws
- * on mismatch so the method reports an error instead of success.
+ * matching the write now exists at `domain`; for delete assert none remains. Throws
+ * on mismatch so the method reports an error instead of success. Returns the
+ * zone Technitium reports and, for add/update, the matching live record, so the
+ * caller names its data from the server's record as `record_list` does.
+ *
+ * `known` is the server's own copy of the record when the caller has one: the
+ * record a write response returned, or the record read before a delete. It is
+ * compared exactly, since both copies come from the same server code. Without
+ * it the caller's `want` is compared field by field. APP records always
+ * compare `want`, since that is what catches the empty-data write.
  */
 async function verifyRecordWrite(
   g: GlobalArgsT,
@@ -688,12 +936,15 @@ async function verifyRecordWrite(
   type: string,
   want: Record<string, unknown> | undefined,
   zone?: string,
-): Promise<string> {
-  const isApp = type.toUpperCase() === "APP";
+  known?: LiveRecord,
+): Promise<{ zone: string; record?: LiveRecord }> {
   const live = await getDomainRecords(g, domain, zone);
-  const matched = live.records
-    .filter((r) => r.type.toUpperCase() === type.toUpperCase())
-    .some((r) => rDataMatches(want, r.rData, isApp));
+  const matched = known && type.toUpperCase() !== "APP"
+    ? live.records.find((r) =>
+      r.type.toUpperCase() === type.toUpperCase() &&
+      canonicalRData(r.rData) === canonicalRData(known.rData)
+    )
+    : findRecord(live.records, type, want);
   if (op === "deleted") {
     if (matched) {
       throw new Error(
@@ -701,7 +952,7 @@ async function verifyRecordWrite(
           `matches the deleted data — Technitium reported success but the record persists.`,
       );
     }
-    return live.zone;
+    return { zone: live.zone };
   }
   if (!matched) {
     throw new Error(
@@ -710,7 +961,90 @@ async function verifyRecordWrite(
         `or has different/empty data (e.g. an APP record written with empty recordData).`,
     );
   }
-  return live.zone;
+  return { zone: live.zone, record: matched };
+}
+
+/** The first live `type` record whose rData satisfies `want`. */
+function findRecord(
+  records: LiveRecord[],
+  type: string,
+  want: Record<string, unknown> | undefined,
+): LiveRecord | undefined {
+  return records
+    .filter((r) => r.type.toUpperCase() === type.toUpperCase())
+    .find((r) => rDataMatches(want, r.rData, type));
+}
+
+/**
+ * Every domain in the built-in Allowed or Blocked zone at or under `root`.
+ * `/allowed/list` and `/blocked/list` browse a label tree one node at a time:
+ * `zones` holds the node's children as full names, and `records` is non-empty
+ * when the node is itself an entry. The server skips nodes with one child and
+ * no entry, and reports the node it stopped at as `domain`.
+ */
+async function listZoneEntries(
+  g: GlobalArgsT,
+  list: "allowed" | "blocked",
+  root?: string,
+): Promise<string[]> {
+  const entries: string[] = [];
+  const visited = new Set<string>();
+  const pending: (string | undefined)[] = [root];
+  while (pending.length > 0) {
+    const r = await apiCall(g, "GET", `/${list}/list`, {
+      domain: pending.pop(),
+    });
+    const node = asString(pick(r, "domain")) ?? "";
+    // A tree has no cycles, but a server that repeated a node would loop forever.
+    if (visited.has(node)) continue;
+    visited.add(node);
+    if (node !== "" && coerceArray(r, "records").length > 0) entries.push(node);
+    pending.push(...(toStringArray(r.zones) ?? []));
+  }
+  return entries.sort();
+}
+
+type ZoneFields = Omit<z.infer<typeof ZoneResource>, "action" | "observedAt">;
+
+/** The stored fields of a zone as Technitium describes it (`zones/list`, `records/get`). */
+function zoneFields(z: Json): ZoneFields {
+  return {
+    name: asString(pick(z, "name")) ?? "unnamed",
+    type: asString(pick(z, "type")),
+    disabled: pick(z, "disabled") as boolean | undefined,
+    internal: pick(z, "internal") as boolean | undefined,
+    dnssecStatus: asString(pick(z, "dnssecStatus")),
+    catalog: asString(pick(z, "catalog")),
+  };
+}
+
+/**
+ * Read one zone's description from the server, so zone methods can store the
+ * whole zone rather than only the field they changed. `records/get` at the
+ * zone apex returns it. That endpoint falls back to the closest enclosing zone
+ * when the named one does not exist, so a different name means "not found",
+ * as does its "No such zone" error. Undefined when the zone does not exist.
+ */
+async function readZone(
+  g: GlobalArgsT,
+  zone: string,
+): Promise<ZoneFields | undefined> {
+  let r: Json;
+  try {
+    r = await apiCall(g, "GET", "/zones/records/get", {
+      domain: zone,
+      zone,
+      listZone: false,
+    });
+  } catch (e) {
+    // With no enclosing zone either, the server answers with this error.
+    if ((e as Error).message.includes("No such zone was found")) {
+      return undefined;
+    }
+    throw e;
+  }
+  const fields = zoneFields((r.zone ?? {}) as Json);
+  return dnsKey(fields.name) === dnsKey(zone) ? fields : undefined;
 }
 
 /** Build a multipart/form-data body for a single file part. */
@@ -740,6 +1074,34 @@ export function buildMultipart(
 }
 
 /**
+ * Reject list URLs that `blockListUrls` cannot hold as given. The setting is
+ * one comma-separated string in which a leading `!` marks an allow list, so a
+ * URL with a comma would be split in two, a block URL starting with `!` would
+ * become an allow list, and an allow URL passed with its `!` would get a second.
+ */
+export function checkListUrls(block?: string[], allow?: string[]): void {
+  const problems: string[] = [];
+  for (const u of [...(block ?? []), ...(allow ?? [])]) {
+    if (u.includes(",")) problems.push(`${u} contains a comma`);
+  }
+  for (const u of block ?? []) {
+    if (u.startsWith("!")) {
+      problems.push(
+        `${u} starts with "!"; pass it in allowListUrls without it`,
+      );
+    }
+  }
+  for (const u of allow ?? []) {
+    if (u.startsWith("!")) {
+      problems.push(`${u} starts with "!"; pass allow-list URLs without it`);
+    }
+  }
+  if (problems.length > 0) {
+    throw new Error(`Invalid list URL(s): ${problems.join("; ")}`);
+  }
+}
+
+/**
  * Split Technitium's single `blockListUrls` setting into block and allow lists.
  * Technitium has no separate allow-list setting: an allow list is an entry in
  * `blockListUrls` with a `!` in front.
@@ -752,7 +1114,10 @@ function splitListUrls(r: Json): { block: string[]; allow: string[] } {
   };
 }
 
-/** Extract the blocking-relevant subset of a Technitium settings response. */
+/**
+ * Extract the stored subset of a Technitium settings response: blocking,
+ * web-service TLS, DNSSEC validation and DNS-over-TLS.
+ */
 function extractSettings(
   r: Json,
   observedAt: string,
@@ -766,7 +1131,7 @@ function extractSettings(
     blockListUrls: lists.block,
     allowListUrls: lists.allow,
     blockListUrlUpdateIntervalHours: asNumber(
-      pick(r, "blockListUrlUpdateIntervalHours"),
+      pick(r, "blockListUpdateIntervalHours"),
     ),
     webServiceEnableTls: pick(r, "webServiceEnableTls") as boolean | undefined,
     webServiceTlsPort: asNumber(pick(r, "webServiceTlsPort")),
@@ -803,13 +1168,26 @@ function opResult(
   };
 }
 
-/** Structured info log when a logger is present (no-op otherwise). Never pass secrets. */
+/**
+ * Structured info log when a logger is present (no-op otherwise). swamp's
+ * logger prints only the props named as `{placeholders}` in the message, so
+ * every prop worth reading belongs in the message. Never pass secrets.
+ */
 function logInfo(
   context: Pick<MethodContext<GlobalArgsT>, "logger">,
   message: string,
   props?: Record<string, unknown>,
 ): void {
   context.logger?.info?.(message, props ?? {});
+}
+
+/** As {@link logInfo}, at warning level. */
+function logWarning(
+  context: Pick<MethodContext<GlobalArgsT>, "logger">,
+  message: string,
+  props?: Record<string, unknown>,
+): void {
+  context.logger?.warn?.(message, props ?? {});
 }
 
 // Only the types zone_create can make with the arguments it takes. Secondary,
@@ -841,6 +1219,11 @@ const DomainArgs = z.object({ domain: z.string() });
 const DomainOptArgs = z.object({
   domain: z.string().optional().describe("Sub-tree to list; root if omitted"),
 });
+const ListEntriesArgs = z.object({
+  domain: z.string().optional().describe(
+    "List only this domain and the domains under it; the whole zone if omitted",
+  ),
+});
 
 const BlockingSetStateArgs = z.object({ enable: z.boolean() });
 
@@ -861,7 +1244,8 @@ const WebServiceSetTlsArgs = z.object({
       "against Technitium's config dir (e.g. `wildcard.example.com.pfx` → /etc/dns).",
   ),
   certificatePassword: z.string().meta({ sensitive: true }).optional().describe(
-    "Export password for the PKCS#12 file. Supply via vault expression.",
+    "Export password for the PKCS#12 file. Supply via vault expression. " +
+      "Without certificatePath it applies to the certificate already configured.",
   ),
   useSelfSignedCertificate: z.boolean().optional().describe(
     "Set false when installing a real cert via certificatePath.",
@@ -1080,7 +1464,7 @@ const SettingsRestoreArgs = z.object({
     }). Defaults to DNS data and settings; authConfig, clusterConfig and webServiceSettings must be asked for explicitly.`,
   ),
   deleteExistingFiles: z.boolean().optional().describe(
-    "Delete existing config files not present in the backup",
+    "Delete the server's existing files for each section being restored",
   ),
 });
 
@@ -1091,12 +1475,24 @@ const SettingsRestoreArgs = z.object({
 /** The `@thomas/technitium` swamp model: schema, methods, and lifecycle for managing a Technitium DNS server. */
 export const model = {
   type: "@thomas/technitium",
-  version: "2026.09.01.1",
+  version: "2026.10.11.1",
   globalArguments: GlobalArgs,
+  upgrades: [
+    {
+      toVersion: "2026.10.11.1",
+      description:
+        "Global arguments are unchanged. Stored data is renamed to <spec>:<key> (or <spec>), with DNS names keeping their dots; records under the old names are left as they are and are not migrated. The API token goes only in the Authorization header, so Technitium before 15 is not supported. Several methods change behaviour; see the README's Breaking changes.",
+      upgradeAttributes: (
+        old: Record<string, unknown>,
+      ): Record<string, unknown> => old,
+    },
+  ],
   checks: {
     "reachable": {
+      // `user/session/get` needs no permission beyond a valid token, so a
+      // token scoped to zones alone still passes.
       description:
-        "Verify the Technitium API authenticates (GET /api/settings/get)",
+        "Verify the Technitium API authenticates (GET /api/user/session/get)",
       labels: ["live"],
       execute: async (
         context: Pick<MethodContext<GlobalArgsT>, "globalArgs">,
@@ -1108,7 +1504,7 @@ export const model = {
         }
         const g = parsed.data;
         try {
-          await apiCall(g, "GET", "/settings/get");
+          await apiCall(g, "GET", "/user/session/get");
           return { pass: true };
         } catch (e) {
           return {
@@ -1127,7 +1523,9 @@ export const model = {
     "zone": {
       description: "An authoritative DNS zone",
       schema: ZoneResource,
-      lifetime: "infinite",
+      // As for zoneRecord: zone_list refreshes the zones that still exist, and
+      // one removed outside swamp expires instead of reading as current.
+      lifetime: "30d",
       garbageCollection: 10,
     },
     "zoneRecord": {
@@ -1142,7 +1540,7 @@ export const model = {
     },
     "settings": {
       description:
-        "Blocking-relevant server settings (enable state, temp-disable, list URLs)",
+        "Selected server settings: blocking, web-service TLS, DNSSEC validation and DNS-over-TLS",
       schema: SettingsResource,
       lifetime: "infinite",
       garbageCollection: 10,
@@ -1156,7 +1554,8 @@ export const model = {
     "listEntry": {
       description: "A domain in the built-in Allowed or Blocked zone",
       schema: ListEntryResource,
-      lifetime: "infinite",
+      // As for zoneRecord: _list refreshes entries that still exist.
+      lifetime: "30d",
       garbageCollection: 10,
     },
     "dnsResponse": {
@@ -1168,6 +1567,13 @@ export const model = {
     "queryLog": {
       description: "A query-log entry (requires the Query Logs (Sqlite) app)",
       schema: QueryLogResource,
+      lifetime: "7d",
+      garbageCollection: 5,
+    },
+    "queryLogPage": {
+      description:
+        "Which page the last logs_query read, and how many entries and pages its query matched",
+      schema: QueryLogPageResource,
       lifetime: "7d",
       garbageCollection: 5,
     },
@@ -1198,7 +1604,7 @@ export const model = {
     // ----- blocking_ (built-in) ------------------------------------------
     blocking_get_settings: {
       description:
-        "Get the blocking-relevant server settings (enable state, temp-disable expiry, list URLs).",
+        "Get the stored subset of the server settings (blocking, web-service TLS, DNSSEC validation, DNS-over-TLS).",
       arguments: NoArgs,
       execute: async (
         _args,
@@ -1206,11 +1612,15 @@ export const model = {
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const g: GlobalArgsT = context.globalArgs;
         const r = await apiCall(g, "GET", "/settings/get");
+        const settings = extractSettings(r, new Date().toISOString());
         const handle = await context.writeResource(
           "settings",
-          "current",
-          extractSettings(r, new Date().toISOString()),
+          dataName("settings"),
+          settings,
         );
+        logInfo(context, "Read settings: blocking enabled {enableBlocking}", {
+          enableBlocking: settings.enableBlocking,
+        });
         return { dataHandles: [handle] };
       },
     },
@@ -1224,13 +1634,18 @@ export const model = {
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const g: GlobalArgsT = context.globalArgs;
-        logInfo(context, "Setting blocking state", { enable: args.enable });
+        logInfo(context, "Setting blocking enabled to {enable}", {
+          enable: args.enable,
+        });
         const r = await apiCall(g, "POST", "/settings/set", {
           enableBlocking: args.enable,
         });
+        logInfo(context, "Set blocking enabled to {enable}", {
+          enable: args.enable,
+        });
         const handle = await context.writeResource(
           "settings",
-          "current",
+          dataName("settings"),
           extractSettings(r, new Date().toISOString()),
         );
         return { dataHandles: [handle] };
@@ -1246,7 +1661,7 @@ export const model = {
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const g: GlobalArgsT = context.globalArgs;
-        logInfo(context, "Temporarily disabling blocking", {
+        logInfo(context, "Disabling blocking for {minutes} minutes", {
           minutes: args.minutes,
         });
         const r = await apiCall(
@@ -1258,9 +1673,10 @@ export const model = {
           },
         );
         const till = asString(pick(r, "temporaryDisableBlockingTill"));
+        logInfo(context, "Blocking disabled until {till}", { till });
         const handle = await context.writeResource(
           "operationResult",
-          "blocking-temporary-disable",
+          dataName("operationResult", "blocking_temporary_disable"),
           opResult(
             "blocking_temporary_disable",
             true,
@@ -1287,6 +1703,7 @@ export const model = {
             "Provide at least one of blockListUrls / allowListUrls",
           );
         }
+        checkListUrls(args.blockListUrls, args.allowListUrls);
         // Both lists live in the one blockListUrls setting, so keep the side
         // that was not passed as it is now.
         const current = splitListUrls(
@@ -1299,15 +1716,23 @@ export const model = {
           ...allow.map((u) => `!${u}`),
         ]);
         if (tooLong.length) {
-          logInfo(context, "List URL(s) exceed Technitium's 255-char limit", {
-            count: tooLong.length,
-          });
+          logWarning(
+            context,
+            "{count} list URL(s) exceed Technitium's 255-character limit",
+            { count: tooLong.length },
+          );
         }
+        logInfo(
+          context,
+          "Setting {blockCount} block-list and {allowCount} allow-list URLs",
+          { blockCount: block.length, allowCount: allow.length },
+        );
         const params: Params = { blockListUrls: joined };
         const r = await apiCall(g, "POST", "/settings/set", params);
+        logInfo(context, "Set the block-list and allow-list URLs");
         const handle = await context.writeResource(
           "settings",
-          "current",
+          dataName("settings"),
           extractSettings(r, new Date().toISOString()),
         );
         return { dataHandles: [handle] };
@@ -1323,11 +1748,12 @@ export const model = {
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const g: GlobalArgsT = context.globalArgs;
-        logInfo(context, "Forcing block-list update");
+        logInfo(context, "Forcing a block-list update");
         await apiCall(g, "POST", "/settings/forceUpdateBlockLists");
+        logInfo(context, "Block-list update started");
         const handle = await context.writeResource(
           "operationResult",
-          "blocking-force-update-lists",
+          dataName("operationResult", "blocking_force_update_lists"),
           opResult("blocking_force_update_lists", true),
         );
         return { dataHandles: [handle] };
@@ -1373,19 +1799,36 @@ export const model = {
             "Provide at least one web-service TLS field to change",
           );
         }
-        // Log the change WITHOUT the password.
-        logInfo(context, "Setting web-service TLS", {
-          certificatePath: args.certificatePath,
-          useSelfSignedCertificate: args.useSelfSignedCertificate,
-          enableTls: args.enableTls,
-          tlsPort: args.tlsPort,
-          httpToTlsRedirect: args.httpToTlsRedirect,
-          certificatePasswordProvided: args.certificatePassword !== undefined,
+        // Technitium reads the password only alongside a path, and ignores it
+        // otherwise. A password on its own means "the current certificate's
+        // new password", so send the current path with it.
+        if (
+          args.certificatePassword !== undefined &&
+          args.certificatePath === undefined
+        ) {
+          const current = asString(
+            pick(
+              await apiCall(g, "GET", "/settings/get"),
+              "webServiceTlsCertificatePath",
+            ),
+          );
+          if (!current) {
+            throw new Error(
+              "certificatePassword was given without certificatePath, and no " +
+                "certificate is configured to apply it to",
+            );
+          }
+          params.webServiceTlsCertificatePath = current;
+        }
+        // Log which fields change, never the password itself.
+        logInfo(context, "Setting web-service TLS fields: {fields}", {
+          fields: Object.keys(params).join(", "),
         });
         const r = await apiCall(g, "POST", "/settings/set", params);
+        logInfo(context, "Set web-service TLS");
         const handle = await context.writeResource(
           "settings",
-          "current",
+          dataName("settings"),
           extractSettings(r, new Date().toISOString()),
         );
         return { dataHandles: [handle] };
@@ -1401,13 +1844,18 @@ export const model = {
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const g: GlobalArgsT = context.globalArgs;
-        logInfo(context, "Setting DNSSEC validation", { enable: args.enable });
+        logInfo(context, "Setting DNSSEC validation to {enable}", {
+          enable: args.enable,
+        });
         const r = await apiCall(g, "POST", "/settings/set", {
           dnssecValidation: args.enable,
         });
+        logInfo(context, "Set DNSSEC validation to {enable}", {
+          enable: args.enable,
+        });
         const handle = await context.writeResource(
           "settings",
-          "current",
+          dataName("settings"),
           extractSettings(r, new Date().toISOString()),
         );
         return { dataHandles: [handle] };
@@ -1428,48 +1876,83 @@ export const model = {
         const observedAt = new Date().toISOString();
         const handles: DataHandle[] = [];
         for (const z of coerceArray(r, "zones")) {
-          const name = asString(pick(z, "name")) ?? "unnamed";
+          const fields = zoneFields(z);
           handles.push(
-            await context.writeResource("zone", `zone-${slug(name)}`, {
-              name,
-              type: asString(pick(z, "type")),
-              disabled: pick(z, "disabled") as boolean | undefined,
-              internal: pick(z, "internal") as boolean | undefined,
-              dnssecStatus: asString(pick(z, "dnssecStatus")),
-              catalog: asString(pick(z, "catalog")),
-              action: "observed",
-              observedAt,
-            }),
+            await context.writeResource(
+              "zone",
+              dataName("zone", dnsKey(fields.name)),
+              { ...fields, action: "observed", observedAt },
+            ),
           );
         }
-        logInfo(context, "Listed zones", { count: handles.length });
+        logInfo(context, "Listed {count} zones", { count: handles.length });
         return { dataHandles: handles };
       },
     },
 
     zone_create: {
-      description: "Create an authoritative zone.",
+      description:
+        "Create an authoritative zone. If a zone of the same type, in the `catalog` given if any, already exists it is left as it is (`unchanged`); any other existing zone is an error.",
       arguments: ZoneCreateArgs,
       execute: async (
         args: z.infer<typeof ZoneCreateArgs>,
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const g: GlobalArgsT = context.globalArgs;
-        logInfo(context, "Creating zone", {
+        logInfo(context, "Creating {type} zone {zone}", {
           zone: args.zone,
           type: args.type,
-          catalog: args.catalog,
         });
-        await apiCall(g, "POST", "/zones/create", {
-          zone: args.zone,
-          type: args.type,
-          ...(args.catalog ? { catalog: args.catalog } : {}),
-        });
+        let r: Json;
+        try {
+          r = await apiCall(g, "POST", "/zones/create", {
+            zone: args.zone,
+            type: args.type,
+            ...(args.catalog ? { catalog: args.catalog } : {}),
+          });
+        } catch (e) {
+          // A rerun finds the zone it made last time. A zone of the same type
+          // (in the catalog asked for, if any) is the outcome asked for;
+          // anything else is a real conflict.
+          if (!(e as Error).message.includes("Zone already exists")) throw e;
+          const existing = await readZone(g, args.zone);
+          if (existing?.type !== args.type) throw e;
+          if (
+            args.catalog &&
+            dnsKey(existing.catalog ?? "") !== dnsKey(args.catalog)
+          ) {
+            throw new Error(
+              `${(e as Error).message}, and it is ${
+                existing.catalog
+                  ? `in catalog ${existing.catalog}`
+                  : "in no catalog"
+              }, not ${args.catalog}`,
+            );
+          }
+          logInfo(context, "Zone {zone} already exists as {type}", {
+            zone: existing.name,
+            type: existing.type,
+          });
+          const handle = await context.writeResource(
+            "zone",
+            dataName("zone", dnsKey(existing.name)),
+            {
+              ...existing,
+              action: "unchanged",
+              observedAt: new Date().toISOString(),
+            },
+          );
+          return { dataHandles: [handle] };
+        }
+        // The server names the zone it made: an IP address or a CIDR range
+        // (`192.0.2.0/24`) becomes its reverse zone (`2.0.192.in-addr.arpa`).
+        const name = asString(pick(r, "domain")) ?? args.zone;
+        logInfo(context, "Created zone {name}", { name });
         const handle = await context.writeResource(
           "zone",
-          `zone-${slug(args.zone)}`,
+          dataName("zone", dnsKey(name)),
           {
-            name: args.zone,
+            name,
             type: args.type,
             catalog: args.catalog,
             disabled: false,
@@ -1482,20 +1965,32 @@ export const model = {
     },
 
     zone_delete: {
-      description: "Delete a zone.",
+      description:
+        "Delete a zone. A zone that does not exist is reported as deleted.",
       arguments: ZoneRefArgs,
       execute: async (
         args: z.infer<typeof ZoneRefArgs>,
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const g: GlobalArgsT = context.globalArgs;
-        logInfo(context, "Deleting zone", { zone: args.zone });
-        await apiCall(g, "POST", "/zones/delete", { zone: args.zone });
+        logInfo(context, "Deleting zone {zone}", { zone: args.zone });
+        // Read the zone first: once deleted, the server can no longer
+        // describe it, and the deleted record should still say what it was.
+        const before = await readZone(g, args.zone);
+        if (before) {
+          await apiCall(g, "POST", "/zones/delete", { zone: args.zone });
+          logInfo(context, "Deleted zone {zone}", { zone: args.zone });
+        } else {
+          // Already gone, which is the outcome asked for.
+          logInfo(context, "Zone {zone} does not exist; nothing to delete", {
+            zone: args.zone,
+          });
+        }
         const handle = await context.writeResource(
           "zone",
-          `zone-${slug(args.zone)}`,
+          dataName("zone", dnsKey(args.zone)),
           {
-            name: args.zone,
+            ...(before ?? { name: args.zone }),
             action: "deleted",
             observedAt: new Date().toISOString(),
           },
@@ -1512,12 +2007,17 @@ export const model = {
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const g: GlobalArgsT = context.globalArgs;
+        logInfo(context, "Enabling zone {zone}", { zone: args.zone });
         await apiCall(g, "POST", "/zones/enable", { zone: args.zone });
+        logInfo(context, "Enabled zone {zone}", { zone: args.zone });
+        // Store the whole zone, not only `disabled`, so its type and catalog
+        // stay readable from the latest version.
+        const after = await readZone(g, args.zone);
         const handle = await context.writeResource(
           "zone",
-          `zone-${slug(args.zone)}`,
+          dataName("zone", dnsKey(args.zone)),
           {
-            name: args.zone,
+            ...(after ?? { name: args.zone }),
             disabled: false,
             action: "updated",
             observedAt: new Date().toISOString(),
@@ -1535,12 +2035,17 @@ export const model = {
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const g: GlobalArgsT = context.globalArgs;
+        logInfo(context, "Disabling zone {zone}", { zone: args.zone });
         await apiCall(g, "POST", "/zones/disable", { zone: args.zone });
+        logInfo(context, "Disabled zone {zone}", { zone: args.zone });
+        // Store the whole zone, not only `disabled`, so its type and catalog
+        // stay readable from the latest version.
+        const after = await readZone(g, args.zone);
         const handle = await context.writeResource(
           "zone",
-          `zone-${slug(args.zone)}`,
+          dataName("zone", dnsKey(args.zone)),
           {
-            name: args.zone,
+            ...(after ?? { name: args.zone }),
             disabled: true,
             action: "updated",
             observedAt: new Date().toISOString(),
@@ -1565,33 +2070,33 @@ export const model = {
           zone: args.zone,
           listZone: true,
         });
+        // Store the zone's name as the server spells it, as the other record
+        // methods do, not as the caller typed it.
+        const zone = asString(pick((r.zone ?? {}) as Json, "name")) ??
+          args.zone;
         const observedAt = new Date().toISOString();
         const handles: DataHandle[] = [];
-        for (const rec of coerceArray(r, "records")) {
-          const name = asString(pick(rec, "name")) ?? args.zone;
-          const type = asString(pick(rec, "type")) ?? "UNKNOWN";
-          const rData =
-            (pick(rec, "rData") as Record<string, unknown> | undefined) ??
-              undefined;
+        for (const raw of coerceArray(r, "records")) {
+          const rec = toLiveRecord(raw, zone);
           handles.push(
             await context.writeResource(
               "zoneRecord",
-              recordInstanceName(args.zone, name, type, rData),
+              recordInstanceName(zone, rec.name, rec.type, rec.rData),
               {
-                zone: args.zone,
-                name,
-                type,
-                ttl: asNumber(pick(rec, "ttl")),
-                disabled: pick(rec, "disabled") as boolean | undefined,
-                rData,
+                zone,
+                name: rec.name,
+                type: rec.type,
+                ttl: rec.ttl,
+                disabled: rec.disabled,
+                rData: rec.rData,
                 action: "observed",
                 observedAt,
               },
             ),
           );
         }
-        logInfo(context, "Listed zone records", {
-          zone: args.zone,
+        logInfo(context, "Listed {count} records in zone {zone}", {
+          zone,
           count: handles.length,
         });
         return { dataHandles: handles };
@@ -1637,7 +2142,7 @@ export const model = {
             ),
           );
         }
-        logInfo(context, "Read domain records", {
+        logInfo(context, "Read {count} records at {domain}", {
           domain: args.domain,
           count: handles.length,
         });
@@ -1662,29 +2167,39 @@ export const model = {
         } else {
           spreadRData(params, args.rData);
         }
-        logInfo(context, "Adding record", {
+        logInfo(context, "Adding {type} record at {domain}", {
           domain: args.domain,
           type: args.type,
         });
-        await apiCall(g, "POST", "/zones/records/add", params);
-        // The zone Technitium reports, so the name matches record_list's.
-        const zone = await verifyRecordWrite(
+        const resp = await apiCall(g, "POST", "/zones/records/add", params);
+        // Name and store the record as Technitium reports it, so the name
+        // matches the one record_list and record_get write.
+        const { zone, record } = await verifyRecordWrite(
           g,
           "added",
           args.domain,
           args.type,
           args.rData,
           args.zone,
+          writtenRecord(resp, "addedRecord", args.domain),
         );
+        const name = record?.name ?? args.domain;
+        const rData = record?.rData ?? args.rData;
+        logInfo(context, "Added {type} record at {name}", {
+          name,
+          type: args.type,
+        });
         const handle = await context.writeResource(
           "zoneRecord",
-          recordInstanceName(zone, args.domain, args.type, args.rData),
+          recordInstanceName(zone, name, args.type, rData),
           {
             zone,
-            name: args.domain,
+            name,
             type: args.type,
-            ttl: args.ttl,
-            rData: args.rData,
+            // The server's TTL, which is its default when none was passed.
+            ttl: record?.ttl ?? args.ttl,
+            disabled: record?.disabled,
+            rData,
             action: "created",
             observedAt: new Date().toISOString(),
           },
@@ -1695,7 +2210,7 @@ export const model = {
 
     record_update: {
       description:
-        "Update a record. `rData` identifies the existing record; `newRData` carries the new values (mapped to Technitium's new* params).",
+        "Update a record. `rData` identifies the existing record; `newRData` carries the new values (mapped to Technitium's new* params, except for APP, CNAME and DNAME, which take the new values as they are).",
       arguments: RecordUpdateArgs,
       execute: async (
         args: z.infer<typeof RecordUpdateArgs>,
@@ -1711,7 +2226,7 @@ export const model = {
           .records.filter((r) =>
             r.type.toUpperCase() === args.type.toUpperCase()
           )
-          .find((r) => isApp || rDataMatches(args.rData, r.rData, false));
+          .find((r) => isApp || rDataMatches(args.rData, r.rData, args.type));
         if (!existing) {
           throw new Error(
             `record_update: no ${args.type} record at ${args.domain} matches the given rData`,
@@ -1728,41 +2243,54 @@ export const model = {
         if (comments !== undefined) params.comments = comments;
         if (expiryTtl !== undefined) params.expiryTtl = expiryTtl;
         if (args.newDomain) params.newDomain = args.newDomain;
+        // An APP update rewrites the whole record from the params, and a
+        // missing `recordData` becomes empty data. Start from the record as it
+        // is, so a `newRData` without `data` (or none at all) keeps the content.
+        const appRData = isApp
+          ? { ...existing.rData, ...(args.newRData ?? args.rData) }
+          : undefined;
         if (isApp) {
           // APP records have no `new*` params: write the desired final state directly.
-          spreadAppRData(params, args.newRData ?? args.rData);
+          spreadAppRData(params, appRData);
+        } else if (hasNoNewParams(args.type)) {
+          // Technitium has no newCname/newDname: it reads the new target from
+          // `cname`/`dname` and replaces the name's only record with it.
+          spreadRData(params, args.newRData ?? args.rData);
         } else {
           spreadRData(params, args.rData);
           if (args.newRData) Object.assign(params, prefixNew(args.newRData));
         }
-        logInfo(context, "Updating record", {
+        logInfo(context, "Updating {type} record at {domain}", {
           domain: args.domain,
           type: args.type,
         });
-        await apiCall(g, "POST", "/zones/records/update", params);
-        const zone = await verifyRecordWrite(
+        const resp = await apiCall(g, "POST", "/zones/records/update", params);
+        // Name and store the record as Technitium reports it (see record_add).
+        const { zone, record } = await verifyRecordWrite(
           g,
           "updated",
           args.newDomain ?? args.domain,
           args.type,
-          args.newRData ?? args.rData,
+          appRData ?? args.newRData ?? args.rData,
           args.zone,
+          writtenRecord(resp, "updatedRecord", args.newDomain ?? args.domain),
         );
+        const name = record?.name ?? args.newDomain ?? args.domain;
+        const rData = record?.rData ?? args.newRData ?? args.rData;
+        logInfo(context, "Updated {type} record at {name}", {
+          name,
+          type: args.type,
+        });
         const handle = await context.writeResource(
           "zoneRecord",
-          recordInstanceName(
-            zone,
-            args.newDomain ?? args.domain,
-            args.type,
-            args.newRData ?? args.rData,
-          ),
+          recordInstanceName(zone, name, args.type, rData),
           {
             zone,
-            name: args.newDomain ?? args.domain,
+            name,
             type: args.type,
             ttl,
             disabled: disable,
-            rData: args.newRData ?? args.rData,
+            rData,
             action: "updated",
             observedAt: new Date().toISOString(),
           },
@@ -1780,30 +2308,42 @@ export const model = {
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const g: GlobalArgsT = context.globalArgs;
+        // Find the live record first: once deleted, the server can no longer
+        // say how it names the record, and the data name must match the one
+        // record_list wrote. With no match, fall back to the caller's rData.
+        const before = await getDomainRecords(g, args.domain, args.zone);
+        const target = findRecord(before.records, args.type, args.rData);
         const params: Params = { domain: args.domain, type: args.type };
         if (args.zone) params.zone = args.zone;
         spreadRData(params, args.rData);
-        logInfo(context, "Deleting record", {
+        logInfo(context, "Deleting {type} record at {domain}", {
           domain: args.domain,
           type: args.type,
         });
         await apiCall(g, "POST", "/zones/records/delete", params);
-        const zone = await verifyRecordWrite(
+        const { zone } = await verifyRecordWrite(
           g,
           "deleted",
           args.domain,
           args.type,
           args.rData,
           args.zone,
+          target,
         );
+        const name = target?.name ?? args.domain;
+        const rData = target?.rData ?? args.rData;
+        logInfo(context, "Deleted {type} record at {name}", {
+          name,
+          type: args.type,
+        });
         const handle = await context.writeResource(
           "zoneRecord",
-          recordInstanceName(zone, args.domain, args.type, args.rData),
+          recordInstanceName(zone, name, args.type, rData),
           {
             zone,
-            name: args.domain,
+            name,
             type: args.type,
-            rData: args.rData,
+            rData,
             action: "deleted",
             observedAt: new Date().toISOString(),
           },
@@ -1821,10 +2361,16 @@ export const model = {
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const g: GlobalArgsT = context.globalArgs;
+        logInfo(context, "Adding {domain} to the Allowed zone", {
+          domain: args.domain,
+        });
         await apiCall(g, "POST", "/allowed/add", { domain: args.domain });
+        logInfo(context, "Added {domain} to the Allowed zone", {
+          domain: args.domain,
+        });
         const handle = await context.writeResource(
           "listEntry",
-          `allowed-${slug(args.domain)}`,
+          dataName("listEntry", `allowed:${dnsKey(args.domain)}`),
           {
             list: "allowed",
             domain: args.domain,
@@ -1844,10 +2390,16 @@ export const model = {
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const g: GlobalArgsT = context.globalArgs;
+        logInfo(context, "Removing {domain} from the Allowed zone", {
+          domain: args.domain,
+        });
         await apiCall(g, "POST", "/allowed/delete", { domain: args.domain });
+        logInfo(context, "Removed {domain} from the Allowed zone", {
+          domain: args.domain,
+        });
         const handle = await context.writeResource(
           "listEntry",
-          `allowed-${slug(args.domain)}`,
+          dataName("listEntry", `allowed:${dnsKey(args.domain)}`),
           {
             list: "allowed",
             domain: args.domain,
@@ -1861,26 +2413,31 @@ export const model = {
 
     allowed_list: {
       description:
-        "List domains in the built-in Allowed zone (factory: one `listEntry` per domain).",
-      arguments: DomainOptArgs,
+        "List every domain in the built-in Allowed zone, or under `domain` (factory: one `listEntry` per domain). Walks the zone's label tree, one API call per branching node.",
+      arguments: ListEntriesArgs,
       execute: async (
-        args: z.infer<typeof DomainOptArgs>,
+        args: z.infer<typeof ListEntriesArgs>,
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const g: GlobalArgsT = context.globalArgs;
-        const r = await apiCall(g, "GET", "/allowed/list", {
-          domain: args.domain,
+        const domains = await listZoneEntries(g, "allowed", args.domain);
+        logInfo(context, "Listed {count} domains in the Allowed zone", {
+          count: domains.length,
         });
         const observedAt = new Date().toISOString();
         const handles: DataHandle[] = [];
-        for (const d of namesFrom(r, "zones", "records")) {
+        for (const d of domains) {
           handles.push(
-            await context.writeResource("listEntry", `allowed-${slug(d)}`, {
-              list: "allowed",
-              domain: d,
-              action: "observed",
-              observedAt,
-            }),
+            await context.writeResource(
+              "listEntry",
+              dataName("listEntry", `allowed:${dnsKey(d)}`),
+              {
+                list: "allowed",
+                domain: d,
+                action: "observed",
+                observedAt,
+              },
+            ),
           );
         }
         return { dataHandles: handles };
@@ -1895,10 +2452,12 @@ export const model = {
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const g: GlobalArgsT = context.globalArgs;
+        logInfo(context, "Flushing the Allowed zone");
         await apiCall(g, "POST", "/allowed/flush");
+        logInfo(context, "Flushed the Allowed zone");
         const handle = await context.writeResource(
           "operationResult",
-          "allowed-flush",
+          dataName("operationResult", "allowed_flush"),
           opResult("allowed_flush", true),
         );
         return { dataHandles: [handle] };
@@ -1913,10 +2472,16 @@ export const model = {
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const g: GlobalArgsT = context.globalArgs;
+        logInfo(context, "Adding {domain} to the Blocked zone", {
+          domain: args.domain,
+        });
         await apiCall(g, "POST", "/blocked/add", { domain: args.domain });
+        logInfo(context, "Added {domain} to the Blocked zone", {
+          domain: args.domain,
+        });
         const handle = await context.writeResource(
           "listEntry",
-          `blocked-${slug(args.domain)}`,
+          dataName("listEntry", `blocked:${dnsKey(args.domain)}`),
           {
             list: "blocked",
             domain: args.domain,
@@ -1936,10 +2501,16 @@ export const model = {
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const g: GlobalArgsT = context.globalArgs;
+        logInfo(context, "Removing {domain} from the Blocked zone", {
+          domain: args.domain,
+        });
         await apiCall(g, "POST", "/blocked/delete", { domain: args.domain });
+        logInfo(context, "Removed {domain} from the Blocked zone", {
+          domain: args.domain,
+        });
         const handle = await context.writeResource(
           "listEntry",
-          `blocked-${slug(args.domain)}`,
+          dataName("listEntry", `blocked:${dnsKey(args.domain)}`),
           {
             list: "blocked",
             domain: args.domain,
@@ -1953,26 +2524,31 @@ export const model = {
 
     blocked_list: {
       description:
-        "List domains in the built-in Blocked zone (factory: one `listEntry` per domain).",
-      arguments: DomainOptArgs,
+        "List every domain in the built-in Blocked zone, or under `domain` (factory: one `listEntry` per domain). Walks the zone's label tree, one API call per branching node.",
+      arguments: ListEntriesArgs,
       execute: async (
-        args: z.infer<typeof DomainOptArgs>,
+        args: z.infer<typeof ListEntriesArgs>,
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const g: GlobalArgsT = context.globalArgs;
-        const r = await apiCall(g, "GET", "/blocked/list", {
-          domain: args.domain,
+        const domains = await listZoneEntries(g, "blocked", args.domain);
+        logInfo(context, "Listed {count} domains in the Blocked zone", {
+          count: domains.length,
         });
         const observedAt = new Date().toISOString();
         const handles: DataHandle[] = [];
-        for (const d of namesFrom(r, "zones", "records")) {
+        for (const d of domains) {
           handles.push(
-            await context.writeResource("listEntry", `blocked-${slug(d)}`, {
-              list: "blocked",
-              domain: d,
-              action: "observed",
-              observedAt,
-            }),
+            await context.writeResource(
+              "listEntry",
+              dataName("listEntry", `blocked:${dnsKey(d)}`),
+              {
+                list: "blocked",
+                domain: d,
+                action: "observed",
+                observedAt,
+              },
+            ),
           );
         }
         return { dataHandles: handles };
@@ -1987,10 +2563,12 @@ export const model = {
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const g: GlobalArgsT = context.globalArgs;
+        logInfo(context, "Flushing the Blocked zone");
         await apiCall(g, "POST", "/blocked/flush");
+        logInfo(context, "Flushed the Blocked zone");
         const handle = await context.writeResource(
           "operationResult",
-          "blocked-flush",
+          dataName("operationResult", "blocked_flush"),
           opResult("blocked_flush", true),
         );
         return { dataHandles: [handle] };
@@ -2007,6 +2585,11 @@ export const model = {
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const g: GlobalArgsT = context.globalArgs;
+        logInfo(context, "Resolving {domain} {type} via {server}", {
+          domain: args.domain,
+          type: args.type,
+          server: args.server,
+        });
         const r = await apiCall(g, "GET", "/dnsClient/resolve", {
           server: args.server,
           domain: args.domain,
@@ -2017,19 +2600,27 @@ export const model = {
         });
         // The parsed DNS datagram (RCODE, Answer, ...) is nested under `result`.
         const result = (pick(r, "result") as Json | undefined) ?? r;
+        const rcode = asString(pick(result, "RCODE", "rcode"));
+        logInfo(context, "Resolved {domain}: {rcode}", {
+          domain: args.domain,
+          rcode,
+        });
         const handle = await context.writeResource(
           "dnsResponse",
-          `resolve-${slug(args.domain)}-${args.type}`,
+          dataName("dnsResponse", `${dnsKey(args.domain)}:${args.type}`),
           {
-            ...r,
             server: args.server,
             domain: args.domain,
             type: args.type,
             protocol: args.protocol,
-            rcode: asString(pick(result, "RCODE", "rcode")),
+            rcode,
             answer:
               (pick(result, "Answer", "answer") as unknown[] | undefined) ??
                 undefined,
+            result: r.result,
+            rawResponses: Array.isArray(r.rawResponses)
+              ? r.rawResponses
+              : undefined,
             observedAt: new Date().toISOString(),
           },
         );
@@ -2040,7 +2631,7 @@ export const model = {
     // ----- logs_ ----------------------------------------------------------
     logs_query: {
       description:
-        "Query recent DNS query logs (factory: one `queryLog` per entry). Requires the Query Logs (Sqlite) DNS app to be installed.",
+        "Query recent DNS query logs, one page per call (factory: one `queryLog` per entry, keyed on its content, plus a `queryLogPage` with the page and the totals). Requires the Query Logs (Sqlite) DNS app to be installed.",
       arguments: LogsQueryArgs,
       execute: async (
         args: z.infer<typeof LogsQueryArgs>,
@@ -2065,25 +2656,56 @@ export const model = {
         });
         const observedAt = new Date().toISOString();
         const handles: DataHandle[] = [];
-        let i = 0;
+        const seen = new Set<string>();
         for (const e of coerceArray(r, "entries")) {
+          const { rowNumber, ...entry } = {
+            rowNumber: asNumber(pick(e, "rowNumber")),
+            timestamp: asString(pick(e, "timestamp")),
+            clientIpAddress: asString(pick(e, "clientIpAddress")),
+            protocol: asString(pick(e, "protocol")),
+            responseType: asString(pick(e, "responseType")),
+            rcode: asString(pick(e, "rcode")),
+            qname: asString(pick(e, "qname")),
+            qtype: asString(pick(e, "qtype")),
+            qclass: asString(pick(e, "qclass")),
+            answer: asString(pick(e, "answer")),
+          };
+          // The log has no entry id, and `rowNumber` is only the position in
+          // this query's results, so the entry is keyed on its own content:
+          // the same entry gets the same name whichever query returns it.
+          const key = shortHash(JSON.stringify(entry));
+          // Two entries identical to the millisecond are the same fact, and a
+          // second write under one name in one run would fail.
+          if (seen.has(key)) continue;
+          seen.add(key);
           handles.push(
-            await context.writeResource("queryLog", `log-${i++}`, {
-              rowNumber: asNumber(pick(e, "rowNumber")),
-              timestamp: asString(pick(e, "timestamp")),
-              clientIpAddress: asString(pick(e, "clientIpAddress")),
-              protocol: asString(pick(e, "protocol")),
-              responseType: asString(pick(e, "responseType")),
-              rcode: asString(pick(e, "rcode")),
-              qname: asString(pick(e, "qname")),
-              qtype: asString(pick(e, "qtype")),
-              qclass: asString(pick(e, "qclass")),
-              answer: asString(pick(e, "answer")),
-              observedAt,
-            }),
+            await context.writeResource(
+              "queryLog",
+              dataName("queryLog", key),
+              { rowNumber, ...entry, observedAt },
+            ),
           );
         }
-        logInfo(context, "Queried DNS logs", { count: handles.length });
+        // Only one page is read, so record how much the query matched in all.
+        const page = {
+          pageNumber: asNumber(pick(r, "pageNumber")),
+          totalPages: asNumber(pick(r, "totalPages")),
+          totalEntries: asNumber(pick(r, "totalEntries")),
+          entriesOnPage: handles.length,
+          observedAt,
+        };
+        handles.push(
+          await context.writeResource(
+            "queryLogPage",
+            dataName("queryLogPage"),
+            page,
+          ),
+        );
+        logInfo(
+          context,
+          "Read {entriesOnPage} query-log entries: page {pageNumber} of {totalPages}, {totalEntries} matching",
+          page,
+        );
         return { dataHandles: handles };
       },
     },
@@ -2097,11 +2719,12 @@ export const model = {
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const g: GlobalArgsT = context.globalArgs;
-        logInfo(context, "Flushing DNS cache");
+        logInfo(context, "Flushing the DNS cache");
         await apiCall(g, "POST", "/cache/flush");
+        logInfo(context, "Flushed the DNS cache");
         const handle = await context.writeResource(
           "operationResult",
-          "cache-flush",
+          dataName("operationResult", "cache_flush"),
           opResult("cache_flush", true),
         );
         return { dataHandles: [handle] };
@@ -2124,24 +2747,35 @@ export const model = {
         const handles: DataHandle[] = [];
         for (const n of namesFrom(r, "zones")) {
           handles.push(
-            await context.writeResource("cacheEntry", `cache-zone-${slug(n)}`, {
-              name: n,
-              kind: "zone",
-              action: "observed",
-              observedAt,
-            }),
+            await context.writeResource(
+              "cacheEntry",
+              dataName("cacheEntry", `zone:${dnsKey(n)}`),
+              {
+                name: n,
+                kind: "zone",
+                action: "observed",
+                observedAt,
+              },
+            ),
           );
         }
         for (const n of namesFrom(r, "records")) {
           handles.push(
-            await context.writeResource("cacheEntry", `cache-rec-${slug(n)}`, {
-              name: n,
-              kind: "record",
-              action: "observed",
-              observedAt,
-            }),
+            await context.writeResource(
+              "cacheEntry",
+              dataName("cacheEntry", `record:${dnsKey(n)}`),
+              {
+                name: n,
+                kind: "record",
+                action: "observed",
+                observedAt,
+              },
+            ),
           );
         }
+        logInfo(context, "Listed {count} cache entries", {
+          count: handles.length,
+        });
         return { dataHandles: handles };
       },
     },
@@ -2154,10 +2788,16 @@ export const model = {
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const g: GlobalArgsT = context.globalArgs;
+        logInfo(context, "Deleting {domain} from the DNS cache", {
+          domain: args.domain,
+        });
         await apiCall(g, "POST", "/cache/delete", { domain: args.domain });
+        logInfo(context, "Deleted {domain} from the DNS cache", {
+          domain: args.domain,
+        });
         const handle = await context.writeResource(
           "operationResult",
-          `cache-delete-${slug(args.domain)}`,
+          dataName("operationResult", `cache_delete:${dnsKey(args.domain)}`),
           opResult("cache_delete", true, args.domain),
         );
         return { dataHandles: [handle] };
@@ -2180,11 +2820,18 @@ export const model = {
           utc: true,
         });
         const s = (pick(r, "stats") as Json | undefined) ?? {};
+        logInfo(context, "Read {range} stats: {totalQueries} queries", {
+          range: args.type,
+          totalQueries: asNumber(pick(s, "totalQueries")),
+        });
         const handle = await context.writeResource(
           "stats",
-          `stats-${args.type}`,
+          dataName("stats", args.type),
           {
             range: args.type,
+            // Stored so two Custom ranges, which share one name, can be told apart.
+            start: args.start,
+            end: args.end,
             totalQueries: asNumber(pick(s, "totalQueries")),
             totalNoError: asNumber(pick(s, "totalNoError")),
             totalServerFailure: asNumber(pick(s, "totalServerFailure")),
@@ -2216,10 +2863,15 @@ export const model = {
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const g: GlobalArgsT = context.globalArgs;
         const flags = settingsSectionFlags(BACKUP_DEFAULTS, args.options);
-        logInfo(context, "Downloading settings backup");
+        logInfo(context, "Downloading a settings backup");
         const bytes = await apiDownload(g, "/settings/backup", flags);
-        const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-        const writer = context.createFileWriter("backup", `backup-${stamp}`);
+        logInfo(context, "Downloaded a {bytes}-byte settings backup", {
+          bytes: bytes.length,
+        });
+        const writer = context.createFileWriter(
+          "backup",
+          dataName("backup", new Date().toISOString()),
+        );
         const handle = await writer.writeAll(bytes);
         return { dataHandles: [handle] };
       },
@@ -2239,13 +2891,22 @@ export const model = {
           deleteExistingFiles: args.deleteExistingFiles ?? false,
         };
         const bytes = new Uint8Array(await readFile(args.filePath));
-        logInfo(context, "Restoring settings from backup", {
+        // Refuse anything that is not a zip before sending it, as
+        // settings_backup refuses one on download.
+        if (!isZip(bytes)) {
+          throw new Error(`${args.filePath} is not a zip file`);
+        }
+        logInfo(context, "Restoring settings from {filePath} ({bytes} bytes)", {
+          filePath: args.filePath,
           bytes: bytes.length,
         });
         await apiUpload(g, "/settings/restore", flags, bytes, "backup.zip");
+        logInfo(context, "Restored settings from {filePath}", {
+          filePath: args.filePath,
+        });
         const handle = await context.writeResource(
           "operationResult",
-          "settings-restore",
+          dataName("operationResult", "settings_restore"),
           opResult("settings_restore", true, args.filePath),
         );
         return { dataHandles: [handle] };

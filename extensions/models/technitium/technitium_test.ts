@@ -10,15 +10,19 @@
 import {
   __setTechnitiumTransport,
   buildMultipart,
+  buildRequest,
+  checkListUrls,
   coerceArray,
+  dataName,
+  dnsKey,
   joinListUrls,
   model,
   namesFrom,
   prefixNew,
   recordInstanceName,
+  requestTarget,
   SETTINGS_SECTIONS,
   settingsSectionFlags,
-  slug,
   unwrapEnvelope,
 } from "./technitium.ts";
 
@@ -144,16 +148,27 @@ Deno.test("prefixNew maps rData keys to Technitium new* params", () => {
   assertEquals(prefixNew({ cname: "x.com" }), { newCname: "x.com" });
 });
 
-Deno.test("slug flattens dotted domains into a safe instance-name fragment", () => {
-  assertEquals(slug("foo.example.com"), "foo-example-com");
-  assertEquals(slug("_dmarc.example.com"), "_dmarc-example-com");
-  assertEquals(slug(""), "root");
-  // wildcard label must NOT collapse onto its bare form
-  assertEquals(slug("*.s3.example.com"), "star-s3-example-com");
-  assert(slug("*.s3.example.com") !== slug("s3.example.com"));
+Deno.test("dataName prefixes the spec, so two specs sharing a key differ", () => {
+  assertEquals(dataName("settings"), "settings");
+  assertEquals(dataName("zone", "example.com"), "zone:example.com");
+  assert(
+    dataName("zone", "example.com") !== dataName("cacheEntry", "example.com"),
+  );
 });
 
-Deno.test("recordInstanceName is identity-stable, case-normalized, and collision-free per record", () => {
+Deno.test("dnsKey keeps dots, so a-b and a.b do not collide", () => {
+  assertEquals(dnsKey("Foo.Example.com."), "foo.example.com");
+  assert(dnsKey("a-b.example.com") !== dnsKey("a.b.example.com"));
+  assert(dnsKey("*.s3.example.com") !== dnsKey("s3.example.com"));
+  // characters swamp rejects, or that would blur the ':' separators, are escaped
+  assertEquals(
+    dnsKey("0/26.2.0.192.in-addr.arpa"),
+    "0%2F26.2.0.192.in-addr.arpa",
+  );
+  assertEquals(dnsKey("a:b\\c%d"), "a%3Ab%5Cc%25d");
+});
+
+Deno.test("recordInstanceName is identity-stable, case-normalized, and distinct per record", () => {
   // deterministic: same record → same name no matter which method produced it
   assertEquals(
     recordInstanceName("ex.com", "nas.ex.com", "A", { ipAddress: "10.0.0.5" }),
@@ -182,9 +197,9 @@ Deno.test("recordInstanceName is identity-stable, case-normalized, and collision
       }),
     "distinct rData must yield distinct instance names",
   );
-  // shape: rec-<zone>-<name>-<TYPE>-<hash>
+  // shape: zoneRecord:<zone>:<name>:<TYPE>:<hash>
   assert(
-    /^rec-ex-com-nas-ex-com-A-[0-9a-z]+$/.test(
+    /^zoneRecord:ex\.com:nas\.ex\.com:A:[0-9a-z]+$/.test(
       recordInstanceName("ex.com", "nas.ex.com", "A", {
         ipAddress: "10.0.0.5",
       }),
@@ -198,6 +213,18 @@ Deno.test("recordInstanceName is identity-stable, case-normalized, and collision
     recordInstanceName("ex.com", "*.s3.ex.com", "APP", appData) !==
       recordInstanceName("ex.com", "s3.ex.com", "APP", appData),
     "wildcard and bare record must yield distinct instance names",
+  );
+  // a-b and a.b with identical rData stay distinct (slug used to map both to a-b)
+  assert(
+    recordInstanceName("ex.com", "a-b.ex.com", "A", {
+      ipAddress: "1.2.3.4",
+    }) !==
+      recordInstanceName("ex.com", "a.b.ex.com", "A", { ipAddress: "1.2.3.4" }),
+  );
+  // rData values keep their case: TXT data is case-sensitive
+  assert(
+    recordInstanceName("ex.com", "t.ex.com", "TXT", { text: "Hello" }) !==
+      recordInstanceName("ex.com", "t.ex.com", "TXT", { text: "hello" }),
   );
 });
 
@@ -234,13 +261,29 @@ const TEST_GLOBALS = {
   skipTlsVerify: false,
 };
 
+type LogCall = {
+  level: string;
+  message: string;
+  props: Record<string, unknown>;
+};
+
 function makeContext() {
   const written: WriteCall[] = [];
+  const logs: LogCall[] = [];
   const seen = new Set<string>();
-  const noop = (_m: string, _p?: unknown): void => {};
+  const log =
+    (level: string) =>
+    (message: string, props?: Record<string, unknown>): void => {
+      logs.push({ level, message, props: props ?? {} });
+    };
   const context = {
     globalArgs: TEST_GLOBALS,
-    logger: { info: noop, debug: noop, warning: noop, error: noop },
+    logger: {
+      info: log("info"),
+      debug: log("debug"),
+      warn: log("warn"),
+      error: log("error"),
+    },
     writeResource: (
       specName: string,
       name: string,
@@ -257,7 +300,7 @@ function makeContext() {
       return Promise.resolve(h);
     },
   };
-  return { context, written };
+  return { context, written, logs };
 }
 
 type MethodDef = {
@@ -480,7 +523,7 @@ Deno.test("zone_create posts zone+type and writes a created zone", async () => {
     }, context);
     assertEquals(calls[0].path, "/zones/create");
     assertEquals(calls[0].params, { zone: "lab.example.com", type: "Primary" });
-    assertEquals(written[0].name, "zone-lab-example-com");
+    assertEquals(written[0].name, "zone:lab.example.com");
     assertEquals(written[0].data.action, "created");
   } finally {
     __setTechnitiumTransport(null);
@@ -493,16 +536,16 @@ Deno.test("zone_create joins a catalog zone when catalog is given", async () => 
   try {
     const { context, written } = makeContext();
     await method("zone_create").execute({
-      zone: "40.168.192.in-addr.arpa",
+      zone: "2.0.192.in-addr.arpa",
       type: "Primary",
-      catalog: "cluster-catalog.example.internal",
+      catalog: "catalog.example.com",
     }, context);
     assertEquals(calls[0].params, {
-      zone: "40.168.192.in-addr.arpa",
+      zone: "2.0.192.in-addr.arpa",
       type: "Primary",
-      catalog: "cluster-catalog.example.internal",
+      catalog: "catalog.example.com",
     });
-    assertEquals(written[0].data.catalog, "cluster-catalog.example.internal");
+    assertEquals(written[0].data.catalog, "catalog.example.com");
   } finally {
     __setTechnitiumTransport(null);
   }
@@ -522,7 +565,7 @@ Deno.test("zone_list surfaces catalog membership", async () => {
   }
 });
 
-Deno.test("zone_list is a factory with unique slugged instance names", async () => {
+Deno.test("zone_list is a factory with unique spec-prefixed instance names", async () => {
   const calls: Call[] = [];
   scriptTransport(calls, () => ({
     zones: [{ name: "a.com", type: "Primary" }, {
@@ -534,7 +577,7 @@ Deno.test("zone_list is a factory with unique slugged instance names", async () 
     const { context, written } = makeContext();
     const out = await method("zone_list").execute({}, context);
     assertEquals(out.dataHandles.length, 2);
-    assertEquals(written.map((w) => w.name), ["zone-a-com", "zone-b-com"]);
+    assertEquals(written.map((w) => w.name), ["zone:a.com", "zone:b.com"]);
     assertEquals(written[1].data.disabled, true);
   } finally {
     __setTechnitiumTransport(null);
@@ -855,6 +898,56 @@ Deno.test("record_add and record_get address the same instance for one record (n
   }
 });
 
+// Technitium returns TXT rData with fields the caller never sent. Every writer
+// names the record from the server's rData, so all three names agree.
+Deno.test("record_add, record_list and record_delete name a TXT record alike", async () => {
+  const calls: Call[] = [];
+  const rec = {
+    name: "t.example.com",
+    type: "TXT",
+    rData: { text: "hello", splitText: false, characterStrings: ["hello"] },
+  };
+  let deleted = false;
+  scriptTransport(calls, (c) => {
+    if (c.path.endsWith("/zones/records/delete")) deleted = true;
+    return { zone: { name: "example.com" }, records: deleted ? [] : [rec] };
+  });
+  try {
+    const caller = {
+      domain: "t.example.com",
+      type: "TXT",
+      rData: { text: "hello" },
+    };
+    const add = makeContext();
+    await method("record_add").execute(caller, add.context);
+    const list = makeContext();
+    await method("record_list").execute({ zone: "example.com" }, list.context);
+    const del = makeContext();
+    await method("record_delete").execute(caller, del.context);
+    assertEquals(add.written[0].name, list.written[0].name);
+    assertEquals(del.written[0].name, list.written[0].name);
+    assertEquals(del.written[0].data.action, "deleted");
+  } finally {
+    __setTechnitiumTransport(null);
+  }
+});
+
+Deno.test("allowed_add and blocked_add on one domain write distinct names", async () => {
+  const calls: Call[] = [];
+  scriptTransport(calls, () => ({}));
+  try {
+    const { context, written } = makeContext();
+    await method("allowed_add").execute({ domain: "ads.example.com" }, context);
+    await method("blocked_add").execute({ domain: "ads.example.com" }, context);
+    assertEquals(written.map((w) => w.name), [
+      "listEntry:allowed:ads.example.com",
+      "listEntry:blocked:ads.example.com",
+    ]);
+  } finally {
+    __setTechnitiumTransport(null);
+  }
+});
+
 // Without a zone argument the zone is what Technitium reports, so the record
 // is filed under example.com, as record_list files it, not www.example.com.
 Deno.test("record_add without a zone and record_list address the same instance", async () => {
@@ -951,6 +1044,239 @@ Deno.test("record_delete throws when read-back shows the record still present", 
   }
 });
 
+// Technitium stores what it was sent in its own form: IPv6 compressed and in
+// lower case, names without the trailing dot. The write response's
+// `addedRecord` is that form, so the read-back compares like with like.
+for (
+  const [type, sent, stored] of [
+    ["AAAA", { ipAddress: "2001:DB8:0:0::1" }, { ipAddress: "2001:db8::1" }],
+    ["CNAME", { cname: "target.example.com." }, {
+      cname: "target.example.com",
+    }],
+    ["URI", { uriPriority: 10, uriWeight: 1, uri: "https://example.com/" }, {
+      priority: 10,
+      weight: 1,
+      uri: "https://example.com/",
+    }],
+    // Sent by number, read back by name: only the server's own copy matches.
+    ["DS", { keyTag: 12345, algorithm: 8, digestType: 2, digest: "ab12" }, {
+      keyTag: 12345,
+      algorithm: "RSASHA256",
+      algorithmNumber: 8,
+      digestType: "SHA256",
+      digestTypeNumber: 2,
+      digest: "AB12",
+    }],
+  ] as const
+) {
+  Deno.test(`record_add ${type}: read-back and data name use the server's record`, async () => {
+    const calls: Call[] = [];
+    const rec = { name: "r.example.com", type, ttl: 3600, rData: stored };
+    scriptTransport(
+      calls,
+      (c) =>
+        c.path.endsWith("/zones/records/add")
+          ? { zone: { name: "example.com" }, addedRecord: rec }
+          : { zone: { name: "example.com" }, records: [rec] },
+    );
+    try {
+      const { context, written } = makeContext();
+      await method("record_add").execute(
+        { domain: "r.example.com", type, rData: sent },
+        context,
+      );
+      assertEquals(
+        written[0].name,
+        recordInstanceName("example.com", "r.example.com", type, stored),
+      );
+      assertEquals(written[0].data.rData, stored);
+    } finally {
+      __setTechnitiumTransport(null);
+    }
+  });
+}
+
+// The pre-read must find the record from the caller's rData, which uses the
+// write parameter names and values as typed. Each case has a second record of
+// the same type so the right one has to be picked.
+for (
+  const [type, caller, match, other] of [
+    ["AAAA", { ipAddress: "2001:DB8:0:0::2" }, { ipAddress: "2001:db8::2" }, {
+      ipAddress: "2001:db8::3",
+    }],
+    ["MX", { exchange: "Mail.Example.com.", preference: 10 }, {
+      exchange: "mail.example.com",
+      preference: 10,
+    }, { exchange: "mail2.example.com", preference: 20 }],
+    ["URI", { uriPriority: 10, uriWeight: 1, uri: "https://a.example/" }, {
+      priority: 10,
+      weight: 1,
+      uri: "https://a.example/",
+    }, { priority: 20, weight: 1, uri: "https://a.example/" }],
+    ["NAPTR", {
+      naptrOrder: 100,
+      naptrPreference: 10,
+      naptrFlags: "U",
+      naptrServices: "E2U+sip",
+      naptrRegexp: "!^.*$!sip:x@example.com!",
+      naptrReplacement: ".",
+    }, {
+      order: 100,
+      preference: 10,
+      flags: "U",
+      services: "E2U+sip",
+      regexp: "!^.*$!sip:x@example.com!",
+      replacement: ".",
+    }, {
+      order: 200,
+      preference: 10,
+      flags: "U",
+      services: "E2U+sip",
+      regexp: "!^.*$!sip:y@example.com!",
+      replacement: ".",
+    }],
+    // Enum fields given as numbers; Technitium reads them back as names.
+    ["DS", { keyTag: 1, algorithm: 8, digestType: 2, digest: "ab" }, {
+      keyTag: 1,
+      algorithm: "RSASHA256",
+      algorithmNumber: 8,
+      digestType: "SHA256",
+      digestTypeNumber: 2,
+      digest: "AB",
+    }, {
+      keyTag: 1,
+      algorithm: "ECDSAP256SHA256",
+      algorithmNumber: 13,
+      digestType: "SHA256",
+      digestTypeNumber: 2,
+      digest: "AB",
+    }],
+    [
+      "SSHFP",
+      {
+        sshfpAlgorithm: 4,
+        sshfpFingerprintType: 2,
+        sshfpFingerprint: "ab",
+      },
+      { algorithm: "Ed25519", fingerprintType: "SHA256", fingerprint: "AB" },
+      {
+        algorithm: "RSA",
+        fingerprintType: "SHA256",
+        fingerprint: "AB",
+      },
+    ],
+    ["TLSA", {
+      tlsaCertificateUsage: 3,
+      tlsaSelector: 1,
+      tlsaMatchingType: 1,
+      tlsaCertificateAssociationData: "ab",
+    }, {
+      certificateUsage: "DANE-EE",
+      selector: "SPKI",
+      matchingType: "SHA2-256",
+      certificateAssociationData: "AB",
+    }, {
+      certificateUsage: "DANE-TA",
+      selector: "SPKI",
+      matchingType: "SHA2-256",
+      certificateAssociationData: "AB",
+    }],
+    // A name as the enum spells it (`_`) matches Technitium's `-` form.
+    ["TLSA", {
+      tlsaCertificateUsage: "DANE_EE",
+      tlsaSelector: "SPKI",
+      tlsaMatchingType: "SHA2_256",
+      tlsaCertificateAssociationData: "ab",
+    }, {
+      certificateUsage: "DANE-EE",
+      selector: "SPKI",
+      matchingType: "SHA2-256",
+      certificateAssociationData: "AB",
+    }, {
+      certificateUsage: "DANE-TA",
+      selector: "SPKI",
+      matchingType: "SHA2-256",
+      certificateAssociationData: "AB",
+    }],
+  ] as const
+) {
+  Deno.test(`record_update ${type}: the pre-read matches caller rData to the server's form`, async () => {
+    const calls: Call[] = [];
+    scriptTransport(
+      calls,
+      recordsResponder([
+        { type, ttl: 60, comments: "other", rData: other },
+        { type, ttl: 600, comments: "keep me", rData: match },
+      ]),
+    );
+    try {
+      const { context } = makeContext();
+      await method("record_update").execute(
+        {
+          zone: "example.com",
+          domain: "r.example.com",
+          type,
+          rData: caller,
+          // Unchanged, so the read-back finds the record as it was.
+          newRData: caller,
+        },
+        context,
+      );
+      assertEquals(calls[1].path, "/zones/records/update");
+      assertEquals(calls[1].params?.ttl, 600);
+      assertEquals(calls[1].params?.comments, "keep me");
+    } finally {
+      __setTechnitiumTransport(null);
+    }
+  });
+}
+
+// Technitium has no newCname: records/update reads the new target from
+// `cname` and replaces the record with it.
+Deno.test("record_update retargets a CNAME by sending the new target as cname", async () => {
+  const calls: Call[] = [];
+  let target = "old.example.com";
+  scriptTransport(calls, (c) => {
+    if (c.path.endsWith("/zones/records/update")) {
+      target = String(c.params?.cname);
+      return {
+        zone: { name: "example.com" },
+        updatedRecord: {
+          name: "www.example.com",
+          type: "CNAME",
+          rData: { cname: target },
+        },
+      };
+    }
+    return {
+      zone: { name: "example.com" },
+      records: [{
+        name: "www.example.com",
+        type: "CNAME",
+        rData: { cname: target },
+      }],
+    };
+  });
+  try {
+    const { context, written } = makeContext();
+    await method("record_update").execute(
+      {
+        domain: "www.example.com",
+        type: "CNAME",
+        rData: { cname: "old.example.com" },
+        newRData: { cname: "new.example.com" },
+      },
+      context,
+    );
+    const p = calls[1].params ?? {};
+    assertEquals(p.cname, "new.example.com");
+    assert(!("newCname" in p), "no newCname param");
+    assertEquals(written[0].data.rData, { cname: "new.example.com" });
+  } finally {
+    __setTechnitiumTransport(null);
+  }
+});
+
 Deno.test("client_resolve sends the API's `dnssec` flag, not the argument name", async () => {
   const calls: Call[] = [];
   scriptTransport(calls, () => ({ result: { RCODE: "NoError", Answer: [] } }));
@@ -1031,7 +1357,81 @@ Deno.test("settingsSectionFlags rejects a section name the API does not know", (
   );
 });
 
+// `/allowed/list` browses a label tree, one node per call. This fixture is the
+// server's answers with review-a.example.com, sub.review-a.example.com and
+// review-b.example.net allowed: the root holds only `com` and `net`, and the
+// server walks single-child chains (com → example.com → review-a.example.com)
+// itself.
+const ALLOWED_TREE: Record<string, Record<string, unknown>> = {
+  "": { domain: "", zones: ["com", "net"], records: [] },
+  "com": {
+    domain: "review-a.example.com",
+    zones: ["sub.review-a.example.com"],
+    records: [{ name: "review-a.example.com", type: "NS" }],
+  },
+  "sub.review-a.example.com": {
+    domain: "sub.review-a.example.com",
+    zones: [],
+    records: [{ name: "sub.review-a.example.com", type: "NS" }],
+  },
+  "net": {
+    domain: "review-b.example.net",
+    zones: [],
+    records: [{ name: "review-b.example.net", type: "NS" }],
+  },
+};
+
+Deno.test("allowed_list walks the label tree and writes one listEntry per allowed domain", async () => {
+  const calls: Call[] = [];
+  scriptTransport(
+    calls,
+    (c) => ALLOWED_TREE[String(c.params?.domain ?? "")] ?? {},
+  );
+  try {
+    const { context, written } = makeContext();
+    await method("allowed_list").execute({}, context);
+    assert(
+      calls.every((c) => c.path === "/allowed/list"),
+      "only list calls",
+    );
+    // Not `com` and `net`, the root's child labels.
+    assertEquals(written.map((w) => w.name), [
+      "listEntry:allowed:review-a.example.com",
+      "listEntry:allowed:review-b.example.net",
+      "listEntry:allowed:sub.review-a.example.com",
+    ]);
+    assertEquals(written[0].data.list, "allowed");
+  } finally {
+    __setTechnitiumTransport(null);
+  }
+});
+
+Deno.test("blocked_list with a domain lists only that branch", async () => {
+  const calls: Call[] = [];
+  scriptTransport(
+    calls,
+    (c) => ALLOWED_TREE[String(c.params?.domain ?? "")] ?? {},
+  );
+  try {
+    const { context, written } = makeContext();
+    await method("blocked_list").execute({ domain: "com" }, context);
+    assertEquals(calls[0].path, "/blocked/list");
+    assertEquals(written.map((w) => w.name), [
+      "listEntry:blocked:review-a.example.com",
+      "listEntry:blocked:sub.review-a.example.com",
+    ]);
+  } finally {
+    __setTechnitiumTransport(null);
+  }
+});
+
 // ----- reachable check -------------------------------------------------------
+
+type CheckDef = {
+  execute: (c: unknown) => Promise<{ pass: boolean; errors?: string[] }>;
+};
+const reachable = (model.checks as unknown as Record<string, CheckDef>)
+  .reachable;
 
 // A check receives globalArgs without the schema's defaults, so an unset
 // skipTlsVerify reached the transport as undefined.
@@ -1039,16 +1439,10 @@ Deno.test("reachable check applies the schema defaults to globalArgs", async () 
   let seenSkipTls: unknown;
   __setTechnitiumTransport((g) => {
     seenSkipTls = g.skipTlsVerify;
-    return Promise.resolve({ enableBlocking: true });
+    return Promise.resolve({ username: "swamp" });
   });
   try {
-    const checks = (model as unknown as {
-      checks: Record<
-        string,
-        { execute: (c: unknown) => Promise<{ pass: boolean }> }
-      >;
-    }).checks;
-    const res = await checks.reachable.execute({
+    const res = await reachable.execute({
       globalArgs: {
         baseUrl: TEST_GLOBALS.baseUrl,
         apiToken: TEST_GLOBALS.apiToken,
@@ -1061,33 +1455,21 @@ Deno.test("reachable check applies the schema defaults to globalArgs", async () 
   }
 });
 
-Deno.test("allowed_list factory writes one listEntry per domain", async () => {
+// `settings/get` needs Settings:View, which a token scoped to zones lacks; the
+// session read needs only a valid token.
+Deno.test("reachable check probes the session, which any valid token can read", async () => {
   const calls: Call[] = [];
-  scriptTransport(
-    calls,
-    () => ({ zones: ["ads.example.com", "track.example.com"] }),
-  );
+  scriptTransport(calls, () => ({ username: "swamp" }));
   try {
-    const { context, written } = makeContext();
-    await method("allowed_list").execute({}, context);
-    assertEquals(written.map((w) => w.specName), ["listEntry", "listEntry"]);
-    assertEquals(written.map((w) => w.name), [
-      "allowed-ads-example-com",
-      "allowed-track-example-com",
+    const res = await reachable.execute({ globalArgs: TEST_GLOBALS });
+    assertEquals(res.pass, true);
+    assertEquals(calls.map((c) => `${c.method} ${c.path}`), [
+      "GET /user/session/get",
     ]);
-    assertEquals(written[0].data.list, "allowed");
   } finally {
     __setTechnitiumTransport(null);
   }
 });
-
-// ─────────────────────────── reachable check ───────────────────────────
-
-type CheckDef = {
-  execute: (c: unknown) => Promise<{ pass: boolean; errors?: string[] }>;
-};
-const reachable = (model.checks as unknown as Record<string, CheckDef>)
-  .reachable;
 
 Deno.test("reachable check: a definition that fails the schema fails without probing", async () => {
   let called = false;
@@ -1104,4 +1486,649 @@ Deno.test("reachable check: a definition that fails the schema fails without pro
   } finally {
     __setTechnitiumTransport(null);
   }
+});
+
+// ----- transport -------------------------------------------------------------
+
+Deno.test("requestTarget drops the brackets URL keeps around an IPv6 literal", () => {
+  assertEquals(requestTarget(new URL("http://[::1]:5380/api/x?a=1")), {
+    hostname: "::1",
+    port: 5380,
+    path: "/api/x?a=1",
+  });
+  assertEquals(requestTarget(new URL("https://dns.example/api")), {
+    hostname: "dns.example",
+    port: 443,
+    path: "/api",
+  });
+});
+
+// ----- settings ---------------------------------------------------------------
+
+Deno.test("blocking_get_settings reads the block-list update interval under the server's key", async () => {
+  const calls: Call[] = [];
+  scriptTransport(calls, () => ({ blockListUpdateIntervalHours: 24 }));
+  try {
+    const { context, written } = makeContext();
+    await method("blocking_get_settings").execute({}, context);
+    assertEquals(written[0].data.blockListUrlUpdateIntervalHours, 24);
+  } finally {
+    __setTechnitiumTransport(null);
+  }
+});
+
+Deno.test("checkListUrls rejects URLs the one comma-separated setting cannot hold", () => {
+  checkListUrls(["https://a.example/list.txt"], ["https://b.example/allow"]);
+  assertThrows(() => checkListUrls(["https://a.example/x,y"]), "comma");
+  assertThrows(
+    () => checkListUrls(["!https://a.example/"]),
+    "pass it in allowListUrls",
+  );
+  assertThrows(
+    () => checkListUrls(undefined, ["!https://a.example/"]),
+    "without it",
+  );
+});
+
+Deno.test("blocking_set_lists refuses a bad URL before changing anything", async () => {
+  const calls: Call[] = [];
+  scriptTransport(calls, () => ({ blockListUrls: [] }));
+  try {
+    const { context } = makeContext();
+    await assertRejects(
+      () =>
+        method("blocking_set_lists").execute(
+          { allowListUrls: ["!https://a.example/"] },
+          context,
+        ),
+      "Invalid list URL",
+    );
+    assertEquals(calls.length, 0);
+  } finally {
+    __setTechnitiumTransport(null);
+  }
+});
+
+Deno.test("settings_restore refuses a file that is not a zip before uploading it", async () => {
+  const dir = await Deno.makeTempDir();
+  const file = `${dir}/not-a-backup.zip`;
+  await Deno.writeTextFile(file, "<html>login</html>");
+  try {
+    const { context } = makeContext();
+    await assertRejects(
+      () => method("settings_restore").execute({ filePath: file }, context),
+      "is not a zip file",
+    );
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+// ----- schemas ----------------------------------------------------------------
+
+Deno.test("stats, dnsResponse and queryLog store only the fields their schema names", () => {
+  const resources = model.resources as unknown as Record<
+    string,
+    { schema: { parse: (v: unknown) => Record<string, unknown> } }
+  >;
+  for (const spec of ["stats", "dnsResponse", "queryLog"]) {
+    const base = spec === "stats"
+      ? { range: "LastHour" }
+      : spec === "dnsResponse"
+      ? { server: "s", domain: "d", type: "A", protocol: "Udp" }
+      : {};
+    const parsed = resources[spec].schema.parse({
+      ...base,
+      observedAt: "2026-10-11T00:00:00Z",
+      unexpected: 1,
+    });
+    assert(!("unexpected" in parsed), `${spec} keeps an unknown field`);
+  }
+});
+
+Deno.test("client_resolve stores the parsed result but not other reply fields", async () => {
+  const calls: Call[] = [];
+  scriptTransport(calls, () => ({
+    result: { RCODE: "NoError", Answer: [{ Name: "example.com" }] },
+    rawResponses: [],
+    somethingNew: true,
+  }));
+  try {
+    const { context, written } = makeContext();
+    await method("client_resolve").execute({ domain: "example.com" }, context);
+    const data = written[0].data;
+    assertEquals(data.rcode, "NoError");
+    assertEquals(data.result, {
+      RCODE: "NoError",
+      Answer: [{ Name: "example.com" }],
+    });
+    assert(!("somethingNew" in data), "a reply field outside the schema");
+  } finally {
+    __setTechnitiumTransport(null);
+  }
+});
+
+Deno.test("dashboard_stats records a Custom range's start and end", async () => {
+  const calls: Call[] = [];
+  scriptTransport(calls, () => ({ stats: { totalQueries: 5 } }));
+  try {
+    const { context, written } = makeContext();
+    await method("dashboard_stats").execute({
+      type: "Custom",
+      start: "2026-10-01T00:00:00Z",
+      end: "2026-10-02T00:00:00Z",
+    }, context);
+    assertEquals(written[0].data.start, "2026-10-01T00:00:00Z");
+    assertEquals(written[0].data.end, "2026-10-02T00:00:00Z");
+  } finally {
+    __setTechnitiumTransport(null);
+  }
+});
+
+// ----- logging ----------------------------------------------------------------
+
+// swamp's logger prints only the props named in the message.
+Deno.test("logs name their props in the message, so the values are printed", async () => {
+  const calls: Call[] = [];
+  scriptTransport(calls, () => ({ zones: [{ name: "a.com" }] }));
+  try {
+    const { context, logs } = makeContext();
+    await method("zone_list").execute({}, context);
+    assertEquals(logs.map((l) => l.message), ["Listed {count} zones"]);
+    assertEquals(logs[0].props, { count: 1 });
+  } finally {
+    __setTechnitiumTransport(null);
+  }
+});
+
+Deno.test("blocking_set_lists warns about a URL over 255 characters", async () => {
+  const calls: Call[] = [];
+  scriptTransport(calls, () => ({ blockListUrls: [] }));
+  try {
+    const { context, logs } = makeContext();
+    const long = "https://a.example/" + "x".repeat(250);
+    await method("blocking_set_lists").execute(
+      { blockListUrls: [long] },
+      context,
+    );
+    const warnings = logs.filter((l) => l.level === "warn");
+    assertEquals(warnings.length, 1);
+    assertEquals(warnings[0].props, { count: 1 });
+  } finally {
+    __setTechnitiumTransport(null);
+  }
+});
+
+// ----- zones ------------------------------------------------------------------
+
+Deno.test("zone_create names the zone the server made, not the argument", async () => {
+  const calls: Call[] = [];
+  scriptTransport(calls, () => ({ domain: "2.0.192.in-addr.arpa" }));
+  try {
+    const { context, written } = makeContext();
+    await method("zone_create").execute({ zone: "192.0.2.0/24" }, context);
+    assertEquals(written[0].name, "zone:2.0.192.in-addr.arpa");
+    assertEquals(written[0].data.name, "2.0.192.in-addr.arpa");
+  } finally {
+    __setTechnitiumTransport(null);
+  }
+});
+
+const ZONE_INFO = {
+  name: "lab.example.com",
+  type: "Primary",
+  disabled: false,
+  dnssecStatus: "Unsigned",
+  catalog: "catalog.example.com",
+};
+
+for (
+  const [name, disabled] of [["zone_enable", false], [
+    "zone_disable",
+    true,
+  ]] as const
+) {
+  Deno.test(`${name} stores the whole zone, not only disabled`, async () => {
+    const calls: Call[] = [];
+    scriptTransport(
+      calls,
+      (c) =>
+        c.path === "/zones/records/get"
+          ? { zone: { ...ZONE_INFO, disabled }, records: [] }
+          : {},
+    );
+    try {
+      const { context, written } = makeContext();
+      await method(name).execute({ zone: "lab.example.com" }, context);
+      assertEquals(written[0].data.type, "Primary");
+      assertEquals(written[0].data.catalog, "catalog.example.com");
+      assertEquals(written[0].data.disabled, disabled);
+    } finally {
+      __setTechnitiumTransport(null);
+    }
+  });
+}
+
+Deno.test("zone_delete reads the zone first and stores what was deleted", async () => {
+  const calls: Call[] = [];
+  scriptTransport(
+    calls,
+    (c) =>
+      c.path === "/zones/records/get" ? { zone: ZONE_INFO, records: [] } : {},
+  );
+  try {
+    const { context, written } = makeContext();
+    await method("zone_delete").execute({ zone: "lab.example.com" }, context);
+    assertEquals(calls.map((c) => c.path), [
+      "/zones/records/get",
+      "/zones/delete",
+    ]);
+    assertEquals(written[0].data.type, "Primary");
+    assertEquals(written[0].data.action, "deleted");
+  } finally {
+    __setTechnitiumTransport(null);
+  }
+});
+
+// records/get answers with the closest enclosing zone when the named one is
+// missing; that zone's details must not be stored under this zone's name.
+Deno.test("zone_enable ignores a parent zone returned in place of the named one", async () => {
+  const calls: Call[] = [];
+  scriptTransport(
+    calls,
+    (c) =>
+      c.path === "/zones/records/get"
+        ? { zone: { name: "example.com", type: "Forwarder" }, records: [] }
+        : {},
+  );
+  try {
+    const { context, written } = makeContext();
+    await method("zone_enable").execute({ zone: "lab.example.com" }, context);
+    assertEquals(written[0].data.name, "lab.example.com");
+    assertEquals(written[0].data.type, undefined);
+  } finally {
+    __setTechnitiumTransport(null);
+  }
+});
+
+// ----- records ----------------------------------------------------------------
+
+Deno.test("record_get and record_list do not store a FWD record's proxy password", async () => {
+  const fwd = {
+    name: "corp.example",
+    type: "FWD",
+    rData: {
+      protocol: "Udp",
+      forwarder: "192.0.2.53",
+      proxyType: "Socks5",
+      proxyUsername: "u",
+      proxyPassword: "hunter2",
+    },
+  };
+  const calls: Call[] = [];
+  scriptTransport(
+    calls,
+    () => ({ zone: { name: "corp.example" }, records: [fwd] }),
+  );
+  try {
+    for (
+      const [name, args] of [
+        ["record_get", { domain: "corp.example" }],
+        ["record_list", { zone: "corp.example" }],
+      ] as const
+    ) {
+      const { context, written } = makeContext();
+      await method(name).execute(args, context);
+      const rData = written[0].data.rData as Record<string, unknown>;
+      assertEquals(rData.proxyUsername, "u");
+      assert(!("proxyPassword" in rData), `${name} stored the proxy password`);
+    }
+  } finally {
+    __setTechnitiumTransport(null);
+  }
+});
+
+Deno.test("record_add stores the server's TTL and disabled state", async () => {
+  const calls: Call[] = [];
+  const rec = {
+    name: "www.example.com",
+    type: "A",
+    ttl: 3600,
+    disabled: false,
+    rData: { ipAddress: "192.0.2.1" },
+  };
+  scriptTransport(
+    calls,
+    (c) =>
+      c.path === "/zones/records/add"
+        ? { zone: { name: "example.com" }, addedRecord: rec }
+        : { zone: { name: "example.com" }, records: [rec] },
+  );
+  try {
+    const { context, written } = makeContext();
+    await method("record_add").execute(
+      {
+        domain: "www.example.com",
+        type: "A",
+        rData: { ipAddress: "192.0.2.1" },
+      },
+      context,
+    );
+    assertEquals(written[0].data.ttl, 3600);
+    assertEquals(written[0].data.disabled, false);
+  } finally {
+    __setTechnitiumTransport(null);
+  }
+});
+
+Deno.test("record_list stores the zone as the server names it", async () => {
+  const calls: Call[] = [];
+  scriptTransport(calls, () => ({
+    zone: { name: "example.com" },
+    records: [{ name: "example.com", type: "NS", rData: { nameServer: "ns" } }],
+  }));
+  try {
+    const { context, written } = makeContext();
+    await method("record_list").execute({ zone: "Example.COM." }, context);
+    assertEquals(written[0].data.zone, "example.com");
+  } finally {
+    __setTechnitiumTransport(null);
+  }
+});
+
+// An APP update rewrites the whole record; without the current content, a
+// newRData with no `data` would leave the record empty (zone SERVFAIL).
+Deno.test("record_update on APP keeps the current data when newRData leaves it out", async () => {
+  const calls: Call[] = [];
+  scriptTransport(
+    calls,
+    recordsResponder([{
+      type: "APP",
+      rData: { appName: "Split", classPath: "Split.Simple", data: '{"a":1}' },
+    }]),
+  );
+  try {
+    const { context } = makeContext();
+    await method("record_update").execute(
+      {
+        zone: "zone",
+        domain: "x.zone",
+        type: "APP",
+        newRData: { appName: "Split", classPath: "Split.Simple" },
+      },
+      context,
+    );
+    assertEquals(calls[1].path, "/zones/records/update");
+    assertEquals(calls[1].params?.recordData, '{"a":1}');
+  } finally {
+    __setTechnitiumTransport(null);
+  }
+});
+
+// record_delete names its data from the live record it found; a number in the
+// caller's DS rData has to find the record Technitium lists by name.
+Deno.test("record_delete finds a DS record given its algorithm as a number", async () => {
+  const live = {
+    name: "child.example.com",
+    type: "DS",
+    rData: {
+      keyTag: 1,
+      algorithm: "RSASHA256",
+      algorithmNumber: 8,
+      digestType: "SHA256",
+      digestTypeNumber: 2,
+      digest: "AB",
+    },
+  };
+  let deleted = false;
+  const calls: Call[] = [];
+  scriptTransport(calls, (c) => {
+    if (c.path === "/zones/records/delete") deleted = true;
+    return c.path === "/zones/records/get"
+      ? { zone: { name: "example.com" }, records: deleted ? [] : [live] }
+      : {};
+  });
+  try {
+    const { context, written } = makeContext();
+    await method("record_delete").execute(
+      {
+        domain: "child.example.com",
+        type: "DS",
+        rData: { keyTag: 1, algorithm: 8, digestType: 2, digest: "ab" },
+      },
+      context,
+    );
+    assertEquals(
+      written[0].name,
+      recordInstanceName("example.com", "child.example.com", "DS", live.rData),
+    );
+  } finally {
+    __setTechnitiumTransport(null);
+  }
+});
+
+// ----- decisions applied 2026-10-11 ------------------------------------------
+
+Deno.test("buildRequest sends the token only in the Authorization header", () => {
+  const { url, headers } = buildRequest(TEST_GLOBALS, "/zones/list", {
+    a: 1,
+  });
+  assertEquals(url.searchParams.get("token"), null);
+  assert(!url.href.includes(TEST_GLOBALS.apiToken), "token in the URL");
+  assertEquals(headers.Authorization, `Bearer ${TEST_GLOBALS.apiToken}`);
+  assertEquals(url.searchParams.get("a"), "1");
+});
+
+const LOG_ENTRY = {
+  rowNumber: 1,
+  timestamp: "2026-10-11T00:00:00.000Z",
+  clientIpAddress: "192.0.2.10",
+  protocol: "Udp",
+  responseType: "Recursive",
+  rcode: "NoError",
+  qname: "example.com",
+  qtype: "A",
+  qclass: "IN",
+  answer: "192.0.2.1",
+};
+
+Deno.test("logs_query keys entries on their content and records the page totals", async () => {
+  const other = { ...LOG_ENTRY, rowNumber: 2, qname: "example.net" };
+  const runQuery = async (entries: unknown[]) => {
+    const calls: Call[] = [];
+    scriptTransport(calls, () => ({
+      pageNumber: 1,
+      totalPages: 3,
+      totalEntries: 150,
+      entries,
+    }));
+    try {
+      const { context, written } = makeContext();
+      await method("logs_query").execute({}, context);
+      return written;
+    } finally {
+      __setTechnitiumTransport(null);
+    }
+  };
+  const first = await runQuery([LOG_ENTRY, other]);
+  // The same entry at another position in a later query keeps its name.
+  const second = await runQuery([{ ...other, rowNumber: 1 }]);
+  const firstOther = first.find((w) => w.data.qname === "example.net");
+  assertEquals(second[0].name, firstOther?.name);
+  assert(second[0].name.startsWith("queryLog:"));
+  assert(first[0].name !== first[1].name, "distinct entries share a name");
+  const page = first.find((w) => w.specName === "queryLogPage");
+  assertEquals(page?.name, "queryLogPage");
+  assertEquals(page?.data.totalPages, 3);
+  assertEquals(page?.data.totalEntries, 150);
+  assertEquals(page?.data.entriesOnPage, 2);
+});
+
+Deno.test("logs_query writes an entry repeated to the millisecond once", async () => {
+  const calls: Call[] = [];
+  scriptTransport(calls, () => ({ entries: [LOG_ENTRY, LOG_ENTRY] }));
+  try {
+    const { context, written } = makeContext();
+    await method("logs_query").execute({}, context);
+    assertEquals(written.filter((w) => w.specName === "queryLog").length, 1);
+  } finally {
+    __setTechnitiumTransport(null);
+  }
+});
+
+// Technitium reads the password only alongside a path.
+Deno.test("web_service_set_tls sends the current path with a password given alone", async () => {
+  const calls: Call[] = [];
+  scriptTransport(
+    calls,
+    (c) =>
+      c.path === "/settings/get"
+        ? { webServiceTlsCertificatePath: "cert.pfx" }
+        : {},
+  );
+  try {
+    const { context } = makeContext();
+    await method("web_service_set_tls").execute(
+      { certificatePassword: "pw" },
+      context,
+    );
+    const set = calls.find((c) => c.path === "/settings/set");
+    assertEquals(set?.params?.webServiceTlsCertificatePath, "cert.pfx");
+    assertEquals(set?.params?.webServiceTlsCertificatePassword, "pw");
+  } finally {
+    __setTechnitiumTransport(null);
+  }
+});
+
+Deno.test("web_service_set_tls rejects a password alone when no certificate is configured", async () => {
+  const calls: Call[] = [];
+  scriptTransport(calls, () => ({ webServiceTlsCertificatePath: "" }));
+  try {
+    const { context } = makeContext();
+    await assertRejects(
+      () =>
+        method("web_service_set_tls").execute(
+          { certificatePassword: "pw" },
+          context,
+        ),
+      "no certificate is configured",
+    );
+    assert(!calls.some((c) => c.path === "/settings/set"), "settings changed");
+  } finally {
+    __setTechnitiumTransport(null);
+  }
+});
+
+Deno.test("zone_delete on a missing zone reports deleted without deleting", async () => {
+  const calls: Call[] = [];
+  __setTechnitiumTransport((_g, m, p, params) => {
+    calls.push({ method: m, path: p, params });
+    return p === "/zones/records/get"
+      ? Promise.reject(
+        new Error(
+          "Technitium GET /zones/records/get: No such zone was found: gone.example",
+        ),
+      )
+      : Promise.resolve({});
+  });
+  try {
+    const { context, written } = makeContext();
+    await method("zone_delete").execute({ zone: "gone.example" }, context);
+    assertEquals(calls.map((c) => c.path), ["/zones/records/get"]);
+    assertEquals(written[0].data.action, "deleted");
+    assertEquals(written[0].name, "zone:gone.example");
+  } finally {
+    __setTechnitiumTransport(null);
+  }
+});
+
+function existingZoneTransport(calls: Call[], type: string): void {
+  __setTechnitiumTransport((_g, m, p, params) => {
+    calls.push({ method: m, path: p, params });
+    if (p === "/zones/create") {
+      return Promise.reject(
+        new Error(
+          "Technitium POST /zones/create: Zone already exists: lab.example.com",
+        ),
+      );
+    }
+    return Promise.resolve({ zone: { ...ZONE_INFO, type }, records: [] });
+  });
+}
+
+Deno.test("zone_create on an existing zone of the same type reports unchanged", async () => {
+  const calls: Call[] = [];
+  existingZoneTransport(calls, "Primary");
+  try {
+    const { context, written } = makeContext();
+    await method("zone_create").execute({ zone: "lab.example.com" }, context);
+    assertEquals(written[0].data.action, "unchanged");
+    assertEquals(written[0].data.type, "Primary");
+  } finally {
+    __setTechnitiumTransport(null);
+  }
+});
+
+Deno.test("zone_create on an existing zone of another type still fails", async () => {
+  const calls: Call[] = [];
+  existingZoneTransport(calls, "Forwarder");
+  try {
+    const { context, written } = makeContext();
+    await assertRejects(
+      () => method("zone_create").execute({ zone: "lab.example.com" }, context),
+      "Zone already exists",
+    );
+    assertEquals(written.length, 0);
+  } finally {
+    __setTechnitiumTransport(null);
+  }
+});
+
+Deno.test("zone_create on an existing zone in another catalog fails", async () => {
+  const calls: Call[] = [];
+  existingZoneTransport(calls, "Primary");
+  try {
+    const { context, written } = makeContext();
+    await assertRejects(
+      () =>
+        method("zone_create").execute(
+          { zone: "lab.example.com", catalog: "cat.example.com" },
+          context,
+        ),
+      "in catalog catalog.example.com, not cat.example.com",
+    );
+    assertEquals(written.length, 0);
+  } finally {
+    __setTechnitiumTransport(null);
+  }
+});
+
+Deno.test("zone_create on an existing member of the catalog asked for reports unchanged", async () => {
+  __setTechnitiumTransport((_g, _m, p) =>
+    p === "/zones/create"
+      ? Promise.reject(new Error("Zone already exists: lab.example.com"))
+      : Promise.resolve({
+        zone: { ...ZONE_INFO, type: "Primary", catalog: "cat.example.com" },
+        records: [],
+      })
+  );
+  try {
+    const { context, written } = makeContext();
+    await method("zone_create").execute(
+      { zone: "lab.example.com", catalog: "Cat.Example.com." },
+      context,
+    );
+    assertEquals(written[0].data.action, "unchanged");
+  } finally {
+    __setTechnitiumTransport(null);
+  }
+});
+
+Deno.test("zone and listEntry expire after 30 days, like zoneRecord", () => {
+  const resources = model.resources as unknown as Record<
+    string,
+    { lifetime: string }
+  >;
+  assertEquals(resources.zone.lifetime, "30d");
+  assertEquals(resources.listEntry.lifetime, "30d");
 });
