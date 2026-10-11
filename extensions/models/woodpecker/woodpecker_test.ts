@@ -6,11 +6,13 @@
  * never written to a resource), and the idempotent delete-on-404. No live
  * server: the API caller is faked via the __setCaller seam.
  */
+import { z } from "npm:zod@4";
 import {
   __setCaller,
   type ApiCall,
   type ApiResult,
   type CallerFn,
+  dataName,
   model,
 } from "./woodpecker.ts";
 
@@ -52,7 +54,9 @@ type Recorded = { method: string; path: string; body?: unknown };
 /**
  * A fake API caller. `respond` returns either a body or a `{status, body}` per
  * (method, path) match; a bare body implies status 200, undefined implies a 404
- * empty result (so existence probes can be exercised).
+ * empty result (so existence probes can be exercised). The one exception is
+ * `GET /api/repos/1`, which falls back to {@link repoObj}: most tests address
+ * repo `1`, and methods fetch it to store its full name.
  */
 function makeFakeApi(
   respond?: (
@@ -65,7 +69,8 @@ function makeFakeApi(
   const calls: Recorded[] = [];
   const caller: CallerFn = (_g, c): Promise<ApiResult> => {
     calls.push({ method: c.method, path: c.path, body: c.body });
-    const r = respond?.(c);
+    const r = respond?.(c) ??
+      (c.method === "GET" && c.path === "/api/repos/1" ? repoObj() : undefined);
     if (r === undefined) return Promise.resolve({ status: 404, body: {} });
     if (typeof r === "object" && r !== null && "status" in r && "body" in r) {
       return Promise.resolve(r as ApiResult);
@@ -82,7 +87,7 @@ function makeContext() {
   const noop = () => {};
   const context = {
     globalArgs: GLOBALS,
-    logger: { info: noop, debug: noop, warning: noop, error: noop },
+    logger: { info: noop, debug: noop, warn: noop, error: noop },
     writeResource: (
       specName: string,
       name: string,
@@ -189,6 +194,78 @@ Deno.test("repo_enable: already-active + no settings -> unchanged, no PATCH", as
       "no activate POST when already active",
     );
     assertEquals(written[0].data.action, "unchanged");
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("repo_enable: a disabled repo (lookup active:false) is re-activated", async () => {
+  // Upstream keeps a disabled repo's row with active=false, and the lookup
+  // returns it; PostRepo re-activates such a repo (`enabledOnce`).
+  const { caller, calls } = makeFakeApi((c) => {
+    if (c.path.startsWith("/api/repos/lookup/")) {
+      return repoObj({ active: false });
+    }
+    if (c.path === "/api/user/repos?all=true") {
+      return {
+        status: 200,
+        body: ([{
+          full_name: "octo-org/web",
+          forge_remote_id: "586125582",
+          active: false,
+        }] as unknown) as Record<string, unknown>,
+      };
+    }
+    if (c.method === "POST") return repoObj();
+    return undefined;
+  });
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("repo_enable").execute({ repo: "octo-org/web" }, context);
+    assert(
+      calls.some((c) =>
+        c.method === "POST" &&
+        c.path === "/api/repos?forge_remote_id=586125582"
+      ),
+      "issued the activate POST",
+    );
+    assertEquals(written[0].data.action, "enabled");
+    assertEquals(written[0].data.active, true);
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("repo_enable: requireApproval takes upstream's all_events, not all", async () => {
+  const { caller, calls } = makeFakeApi((c) => {
+    if (c.path.startsWith("/api/repos/lookup/")) return repoObj();
+    if (c.method === "PATCH") {
+      return repoObj({ require_approval: "all_events" });
+    }
+    return undefined;
+  });
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await rejects(
+      () =>
+        method("repo_enable").execute(
+          { repo: "octo-org/web", requireApproval: "all" },
+          context,
+        ),
+      /invalid option/i,
+    );
+    assertEquals(calls.length, 0, "rejected before any API call");
+    await method("repo_enable").execute(
+      { repo: "octo-org/web", requireApproval: "all_events" },
+      context,
+    );
+    assertEquals(
+      calls.find((c) => c.method === "PATCH")?.body,
+      { require_approval: "all_events" },
+    );
+    assertEquals(written[0].data.requireApproval, "all_events");
   } finally {
     __setCaller(null);
   }
@@ -420,7 +497,7 @@ Deno.test("resolveRepoId: bare name (no slash, non-numeric) is rejected", async 
   }
 });
 
-Deno.test("repo_available: instance names sanitize the slash in owner/name", async () => {
+Deno.test("repo_available: instance name is the spec plus the escaped full name", async () => {
   const caller: CallerFn = (_g, c) => {
     if (c.path === "/api/user/repos?all=true") {
       return Promise.resolve({
@@ -438,19 +515,16 @@ Deno.test("repo_available: instance names sanitize the slash in owner/name", asy
   try {
     const { context, written } = makeContext();
     await method("repo_available").execute({}, context);
-    // swamp rejects '/' in instance names, so the data name must be sanitized,
+    // swamp rejects '/' in instance names, so the data name escapes it,
     // while the stored fullName field keeps the real slash.
-    assert(
-      !written[0].name.includes("/"),
-      `instance name must not contain '/': ${written[0].name}`,
-    );
+    assertEquals(written[0].name, "available-repo:octo-org%2Fweb");
     assertEquals(written[0].data.fullName, "octo-org/web");
   } finally {
     __setCaller(null);
   }
 });
 
-Deno.test("repo_secret_list: secret instance name sanitizes the repo full name", async () => {
+Deno.test("repo_secret_list: secret instance name uses the repo id", async () => {
   const caller: CallerFn = (_g, c) => {
     if (c.path === "/api/repos/1") {
       return Promise.resolve({ status: 200, body: repoObj() });
@@ -472,10 +546,7 @@ Deno.test("repo_secret_list: secret instance name sanitizes the repo full name",
   try {
     const { context, written } = makeContext();
     await method("repo_secret_list").execute({ repo: "1" }, context);
-    assert(
-      !written[0].name.includes("/"),
-      `secret instance name must not contain '/': ${written[0].name}`,
-    );
+    assertEquals(written[0].name, "secret:repo:1:ghcr_token");
     assertEquals(written[0].data.owner, "octo-org/web");
   } finally {
     __setCaller(null);
@@ -545,10 +616,11 @@ Deno.test("pipeline_steps: number omitted -> resolves latest, then flattens step
     assertEquals(written[0].data.name, "go");
     assertEquals(written[0].data.state, "success");
     assertEquals(written[1].data.state, "failure");
-    assert(
-      !written[1].name.includes("/"),
-      "step instance name is slash-safe",
+    assertEquals(
+      written.map((w) => w.name),
+      ["pipeline-step:1:5:10", "pipeline-step:1:5:11"],
     );
+    assertEquals(written[1].data.stepId, 11);
   } finally {
     __setCaller(null);
   }
@@ -615,7 +687,7 @@ Deno.test("pipeline_wait: terminal on first poll -> no wait, writes pipeline + s
   try {
     const { context, written } = makeContext();
     await method("pipeline_wait").execute(
-      { repo: "1", number: 5, pollIntervalSec: 0 },
+      { repo: "1", number: 5 },
       context,
     );
     // exactly one status fetch (already terminal, so no re-poll)
@@ -637,7 +709,7 @@ Deno.test("pipeline_wait: terminal on first poll -> no wait, writes pipeline + s
   }
 });
 
-Deno.test("status_all: per-repo latest; 404 latest -> status 'none'", async () => {
+Deno.test("status_all: per-repo latest; no pipelines -> status 'none'", async () => {
   const { caller } = makeFakeApi((c) => {
     if (c.path.startsWith("/api/repos?")) {
       return {
@@ -784,6 +856,157 @@ Deno.test("cron_set: no existing -> POST create; identical -> unchanged (no writ
   }
 });
 
+Deno.test("cron_set: create sends enabled:true (v3.13+ binds an omitted field to false)", async () => {
+  const { caller, calls } = makeFakeApi((c) => {
+    if (c.method === "GET" && c.path.startsWith("/api/repos/1/cron?")) {
+      return { status: 200, body: ([] as unknown) as Record<string, unknown> };
+    }
+    if (c.method === "POST" && c.path === "/api/repos/1/cron") {
+      return { id: 7, name: "nightly", schedule: "@daily", enabled: true };
+    }
+    return undefined;
+  });
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("cron_set").execute(
+      { repo: "1", name: "nightly", schedule: "@daily" },
+      context,
+    );
+    const post = calls.find((c) => c.method === "POST");
+    assertEquals(post?.body, {
+      name: "nightly",
+      schedule: "@daily",
+      enabled: true,
+    });
+    assertEquals(written[0].data.enabled, true);
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("cron_set: a disabled cron with a matching schedule is re-enabled by PATCH", async () => {
+  const { caller, calls } = makeFakeApi((c) => {
+    if (c.method === "GET" && c.path.startsWith("/api/repos/1/cron?")) {
+      return {
+        status: 200,
+        body: ([{
+          id: 7,
+          name: "nightly",
+          schedule: "@daily",
+          branch: "",
+          enabled: false,
+        }] as unknown) as Record<string, unknown>,
+      };
+    }
+    if (c.method === "PATCH" && c.path === "/api/repos/1/cron/7") {
+      return { id: 7, name: "nightly", schedule: "@daily", enabled: true };
+    }
+    return undefined;
+  });
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("cron_set").execute(
+      { repo: "1", name: "nightly", schedule: "@daily" },
+      context,
+    );
+    const patch = calls.find((c) => c.method === "PATCH");
+    assertEquals(
+      (patch?.body as Record<string, unknown> | undefined)?.enabled,
+      true,
+    );
+    assertEquals(written[0].data.action, "updated");
+    assertEquals(written[0].data.enabled, true);
+  } finally {
+    __setCaller(null);
+  }
+});
+
+/** A fake API whose repo 1 holds the given crons; POST and PATCH echo the body. */
+function fakeCronApi(crons: Record<string, unknown>[]) {
+  return makeFakeApi((c) => {
+    if (c.method === "GET" && c.path.startsWith("/api/repos/1/cron?")) {
+      return {
+        status: 200,
+        body: (crons as unknown) as Record<string, unknown>,
+      };
+    }
+    if (c.method === "POST" && c.path === "/api/repos/1/cron") {
+      return { id: 7, ...(c.body as Record<string, unknown>) };
+    }
+    if (c.method === "PATCH" && c.path === "/api/repos/1/cron/7") {
+      return { ...(c.body as Record<string, unknown>) };
+    }
+    return undefined;
+  });
+}
+
+Deno.test("cron_set: enabled=false creates the cron disabled", async () => {
+  const { caller, calls } = fakeCronApi([]);
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("cron_set").execute(
+      { repo: "1", name: "nightly", schedule: "@daily", enabled: false },
+      context,
+    );
+    const post = calls.find((c) => c.method === "POST");
+    assertEquals(
+      (post?.body as Record<string, unknown> | undefined)?.enabled,
+      false,
+    );
+    assertEquals(written[0].data.action, "created");
+    assertEquals(written[0].data.enabled, false);
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("cron_set: enabled=false leaves a disabled cron unchanged", async () => {
+  const { caller, calls } = fakeCronApi([
+    { id: 7, name: "nightly", schedule: "@daily", branch: "", enabled: false },
+  ]);
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("cron_set").execute(
+      { repo: "1", name: "nightly", schedule: "@daily", enabled: false },
+      context,
+    );
+    assert(
+      !calls.some((c) => c.method === "POST" || c.method === "PATCH"),
+      "no write when the cron is already disabled",
+    );
+    assertEquals(written[0].data.action, "unchanged");
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("cron_set: enabled=false disables an enabled cron by PATCH", async () => {
+  const { caller, calls } = fakeCronApi([
+    { id: 7, name: "nightly", schedule: "@daily", branch: "", enabled: true },
+  ]);
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("cron_set").execute(
+      { repo: "1", name: "nightly", schedule: "@daily", enabled: false },
+      context,
+    );
+    const patch = calls.find((c) => c.method === "PATCH");
+    assertEquals(
+      (patch?.body as Record<string, unknown> | undefined)?.enabled,
+      false,
+    );
+    assertEquals(written[0].data.action, "updated");
+    assertEquals(written[0].data.enabled, false);
+  } finally {
+    __setCaller(null);
+  }
+});
+
 Deno.test("cron_delete: already-absent is an idempotent no-op (no DELETE)", async () => {
   const { caller, calls } = makeFakeApi((c) => {
     if (c.method === "GET" && c.path.startsWith("/api/repos/1/cron?")) {
@@ -848,7 +1071,7 @@ Deno.test("repo_enable: a cross-forge repo explains the forge binding", async ()
         status: 200,
         body: ([
           { id: 1, type: "github", url: "https://github.com" },
-          { id: 2, type: "forgejo", url: "https://git.smol.cloud" },
+          { id: 2, type: "forgejo", url: "https://forgejo.example.com" },
         ] as unknown) as Record<string, unknown>,
       };
     }
@@ -858,7 +1081,7 @@ Deno.test("repo_enable: a cross-forge repo explains the forge binding", async ()
   try {
     const { context } = makeContext();
     await rejects(
-      () => method("repo_enable").execute({ repo: "telliott/web" }, context),
+      () => method("repo_enable").execute({ repo: "other-org/web" }, context),
       /bound to the forge it authenticated against.*octo-org on forge 1 \(github/s,
     );
   } finally {
@@ -879,8 +1102,8 @@ Deno.test("repo_enable: a broken diagnostic never masks the real error", async (
   try {
     const { context } = makeContext();
     await rejects(
-      () => method("repo_enable").execute({ repo: "telliott/web" }, context),
-      /not found among forge repos the token can access\.$/,
+      () => method("repo_enable").execute({ repo: "other-org/web" }, context),
+      /not found among forge repos the token can access\. .*admin of it on the forge\.$/,
     );
   } finally {
     __setCaller(null);
@@ -889,13 +1112,13 @@ Deno.test("repo_enable: a broken diagnostic never masks the real error", async (
 
 Deno.test("forge_list: flags the token's own forge", async () => {
   const { caller } = makeFakeApi((c) => {
-    if (c.path === "/api/user") return { login: "telliott", forge_id: 2 };
+    if (c.path === "/api/user") return { login: "octo-user", forge_id: 2 };
     if (c.path.startsWith("/api/forges?")) {
       return {
         status: 200,
         body: ([
           { id: 1, type: "github", url: "https://github.com" },
-          { id: 2, type: "forgejo", url: "https://git.smol.cloud" },
+          { id: 2, type: "forgejo", url: "https://forgejo.example.com" },
         ] as unknown) as Record<string, unknown>,
       };
     }
@@ -918,7 +1141,7 @@ Deno.test("repo_available: carries forge_id through to the resource", async () =
       return {
         status: 200,
         body: ([{
-          full_name: "telliott/web",
+          full_name: "octo-org/web",
           forge_remote_id: "42",
           forge_id: 2,
           active: false,
@@ -1007,9 +1230,10 @@ Deno.test("pipeline_list: limit above 50 spans pages and is trimmed exactly", as
       /^\/api\/repos\/1\/pipelines\?page=(\d+)&perPage=(\d+)$/,
     );
     if (m) {
+      // Upstream `paginate`: the offset is perPage * (page - 1).
       const page = Number(m[1]);
       const perPage = Number(m[2]);
-      const start = (page - 1) * 50;
+      const start = (page - 1) * perPage;
       const body = Array.from(
         { length: perPage },
         (_, i) => pipe(start + i + 1),
@@ -1023,10 +1247,32 @@ Deno.test("pipeline_list: limit above 50 spans pages and is trimmed exactly", as
     const { context, written } = makeContext();
     await method("pipeline_list").execute({ repo: "1", limit: 60 }, context);
     assertEquals(calls.map((c) => c.path), [
+      "/api/repos/1", // the repo's full name, for the records
       "/api/repos/1/pipelines?page=1&perPage=50",
-      "/api/repos/1/pipelines?page=2&perPage=10",
+      "/api/repos/1/pipelines?page=2&perPage=50",
     ]);
-    assertEquals(written.length, 60);
+    assertEquals(
+      written.map((w) => w.data.number),
+      Array.from({ length: 60 }, (_, i) => i + 1),
+      "pipelines 1-60, each once",
+    );
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("pipeline_list: a limit below 1 is rejected", async () => {
+  const { caller, calls } = makeFakeApi(() => undefined);
+  __setCaller(caller);
+  try {
+    const { context } = makeContext();
+    for (const limit of [0, -5]) {
+      await rejects(
+        () => method("pipeline_list").execute({ repo: "1", limit }, context),
+        /expected number to be >=1/i,
+      );
+    }
+    assertEquals(calls.length, 0, "rejected before any API call");
   } finally {
     __setCaller(null);
   }
@@ -1069,7 +1315,7 @@ Deno.test("pipeline_wait: a cancelled pipeline reports killed and stops on the f
   try {
     const { context, written } = makeContext();
     await method("pipeline_wait").execute(
-      { repo: "1", number: 5, pollIntervalSec: 0, timeoutSec: 1 },
+      { repo: "1", number: 5, timeoutSec: 1 },
       context,
     );
     assertEquals(
@@ -1082,30 +1328,173 @@ Deno.test("pipeline_wait: a cancelled pipeline reports killed and stops on the f
   }
 });
 
+Deno.test("pipeline_wait: a pipeline cancelled before it started (canceled) stops on the first poll", async () => {
+  const { caller, calls } = makeFakeApi((c) => {
+    if (c.path === "/api/repos/1/pipelines/5") {
+      return pipelineWithSteps({ status: "canceled" });
+    }
+    return undefined;
+  });
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("pipeline_wait").execute(
+      { repo: "1", number: 5, timeoutSec: 1 },
+      context,
+    );
+    assertEquals(
+      calls.filter((c) => c.path === "/api/repos/1/pipelines/5").length,
+      1,
+    );
+    assertEquals(written[0].data.status, "canceled");
+  } finally {
+    __setCaller(null);
+  }
+});
+
 // ─────────────────────────── strict booleans ───────────────────────────
 
-Deno.test("trusted flags: '0' and 'False' are rejected, not coerced to true", async () => {
+Deno.test("trusted flags: strings are rejected, not coerced", async () => {
   const { caller, calls } = makeFakeApi(() => repoObj());
   __setCaller(caller);
   try {
     const { context } = makeContext();
-    for (const bad of ["0", "False", "1", "yes", null]) {
+    // swamp turns `--input trusted=true` into a boolean before execute runs,
+    // so a string reaching execute is never valid.
+    for (const bad of ["0", "False", "1", "yes", "true", "false", null]) {
       await rejects(
         () =>
           method("repo_update").execute(
             { repo: "1", trustedVolumes: bad },
             context,
           ),
-        /expected true or false/,
+        /expected boolean/,
       );
     }
     assertEquals(calls.length, 0, "rejected before any API call");
-    // The canonical spellings still work, string or boolean.
     const { context: ctx2 } = makeContext();
     await method("repo_update").execute(
-      { repo: "1", trusted: "false", trustedVolumes: true },
+      { repo: "1", trusted: false, trustedVolumes: true },
       ctx2,
     );
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("model: every method's arguments convert to JSON Schema", () => {
+  // A .transform() cannot be converted, and swamp then drops every
+  // description, default and enum for that method.
+  for (const [name, m] of Object.entries(model.methods)) {
+    const schema = z.toJSONSchema(m.arguments);
+    assert(schema.$schema, `${name}: arguments have no JSON Schema`);
+  }
+});
+
+Deno.test("model: the apiUrl example is a placeholder host, not a real one", () => {
+  const description = model.globalArguments.shape.apiUrl.description ?? "";
+  assert(
+    description.includes("https://woodpecker.example.com"),
+    `apiUrl example should use example.com: ${description}`,
+  );
+  assert(!description.includes(".ts.net"), "no tailnet hostname");
+});
+
+// ─────────────────────────── data names ───────────────────────────
+
+Deno.test("dataName: spec prefix keeps specs that share a key apart", () => {
+  assertEquals(dataName("repo", "1"), "repo:1");
+  assertEquals(dataName("repo-status", "1"), "repo-status:1");
+  assertEquals(dataName("server"), "server");
+});
+
+Deno.test("dataName: escaping is reversible, so different keys never share a name", () => {
+  assertEquals(dataName("cron", "1:a/b"), "cron:1:a%2Fb");
+  assertEquals(dataName("cron", "1:a%2Fb"), "cron:1:a%252Fb");
+  assertEquals(dataName("cron", "1:a..b"), "cron:1:a.%2Eb");
+  assertEquals(dataName("cron", "1:a\\b"), "cron:1:a%5Cb");
+  for (const key of ["a..b", "a...b", "a/b", "x\\y", "n\0ul"]) {
+    const name = dataName("cron", key);
+    assert(!/[\\/\0]|\.\./.test(name), `unsafe name ${name}`);
+  }
+});
+
+Deno.test("repo_get and status_all write the same repo id under distinct names", async () => {
+  const { caller } = makeFakeApi((c) => {
+    if (c.path === "/api/repos/1") return repoObj();
+    if (c.path.startsWith("/api/repos?active=true")) {
+      return (c.path.includes("page=1")
+        ? [repoObj()]
+        : []) as unknown as Record<
+          string,
+          unknown
+        >;
+    }
+    if (c.path === "/api/repos/1/pipelines?perPage=1") {
+      return { status: 200, body: [] as unknown as Record<string, unknown> };
+    }
+    return undefined;
+  });
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("repo_get").execute({ repo: "1" }, context);
+    await method("status_all").execute({}, context);
+    assertEquals(written.map((w) => w.name), ["repo:1", "repo-status:1"]);
+  } finally {
+    __setCaller(null);
+  }
+});
+
+// A matrix pipeline: two workflows with the same name and the same step names.
+function matrixPipeline(): Record<string, unknown> {
+  return {
+    number: 5,
+    status: "success",
+    workflows: [
+      { name: "build", children: [{ id: 20, name: "test", state: "success" }] },
+      { name: "build", children: [{ id: 21, name: "test", state: "failure" }] },
+    ],
+  };
+}
+
+Deno.test("pipeline_steps: matrix workflows with the same step name get distinct names", async () => {
+  const { caller } = makeFakeApi((c) =>
+    c.path === "/api/repos/1/pipelines/5" ? matrixPipeline() : undefined
+  );
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("pipeline_steps").execute({ repo: "1", number: 5 }, context);
+    assertEquals(
+      written.map((w) => w.name),
+      ["pipeline-step:1:5:20", "pipeline-step:1:5:21"],
+    );
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("pipeline_logs: a step id picks the exact matrix step and names the log by id", async () => {
+  const { caller, calls } = makeFakeApi((c) => {
+    if (c.path === "/api/repos/1/pipelines/5") return matrixPipeline();
+    if (c.path === "/api/repos/1/logs/5/21") {
+      return {
+        status: 200,
+        body: [{ data: btoa("x") }] as unknown as Record<string, unknown>,
+      };
+    }
+    return undefined;
+  });
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("pipeline_logs").execute(
+      { repo: "1", number: 5, step: "21" },
+      context,
+    );
+    assert(calls.some((c) => c.path === "/api/repos/1/logs/5/21"));
+    assertEquals(written[0].name, "pipeline-log:1:5:21");
   } finally {
     __setCaller(null);
   }
@@ -1166,6 +1555,567 @@ Deno.test("repo_list asks for enabled repos only", async () => {
     await method("repo_list").execute({}, context);
     assertEquals(written.length, 1);
     assert(calls[0].path.startsWith("/api/repos?active=true&"));
+  } finally {
+    __setCaller(null);
+  }
+});
+
+// ─────────────────────────── stage 3 (low findings) ───────────────────────────
+
+Deno.test("repo_disable: an already-disabled repo is unchanged, with no second DELETE", async () => {
+  // Upstream keeps a disabled repo's row with active=false, so the lookup and
+  // GET still find it.
+  const { caller, calls } = makeFakeApi((c) => {
+    if (c.path === "/api/repos/1") return repoObj({ active: false });
+    return undefined;
+  });
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("repo_disable").execute({ repo: "1" }, context);
+    assert(!calls.some((c) => c.method === "DELETE"), "no DELETE sent");
+    assertEquals(written[0].data.action, "unchanged");
+    assertEquals(written[0].data.active, false);
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("repo_disable: an active repo is deleted and reported disabled", async () => {
+  const { caller, calls } = makeFakeApi((c) => {
+    if (c.path === "/api/repos/1") return repoObj();
+    return undefined;
+  });
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("repo_disable").execute({ repo: "1" }, context);
+    assert(
+      calls.some((c) => c.method === "DELETE" && c.path === "/api/repos/1"),
+      "DELETE sent",
+    );
+    assertEquals(written[0].data.action, "disabled");
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("pipeline_wait: a pollIntervalSec below 1 is rejected", async () => {
+  const { caller, calls } = makeFakeApi(() => pipelineWithSteps());
+  __setCaller(caller);
+  try {
+    const { context } = makeContext();
+    await rejects(
+      () =>
+        method("pipeline_wait").execute(
+          { repo: "1", number: 5, pollIntervalSec: 0 },
+          context,
+        ),
+      /pollIntervalSec|>=1|too small/i,
+    );
+    assertEquals(calls.length, 0, "rejected before any API call");
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("reachable check rejects an httpTimeoutMs below 1", async () => {
+  __setCaller(() => Promise.resolve({ status: 200, body: { login: "bot" } }));
+  try {
+    const checks = (model as unknown as {
+      checks: Record<
+        string,
+        { execute: (c: unknown) => Promise<{ pass: boolean }> }
+      >;
+    }).checks;
+    const res = await checks.reachable.execute({
+      globalArgs: { ...GLOBALS, httpTimeoutMs: 0 },
+    });
+    assertEquals(res.pass, false);
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("repo_update: cancelPreviousPipelineEvents takes only Woodpecker's events", async () => {
+  const { caller, calls } = makeFakeApi(() => repoObj());
+  __setCaller(caller);
+  try {
+    const { context } = makeContext();
+    await rejects(
+      () =>
+        method("repo_update").execute(
+          { repo: "1", cancelPreviousPipelineEvents: ["push", "pull-request"] },
+          context,
+        ),
+      /pull_request/,
+    );
+    assertEquals(calls.length, 0, "rejected before any API call");
+    await method("repo_update").execute(
+      { repo: "1", cancelPreviousPipelineEvents: ["push", "pull_request"] },
+      context,
+    );
+    const patch = calls.find((c) => c.method === "PATCH");
+    assertEquals(
+      (patch?.body as Record<string, unknown>)
+        ?.cancel_previous_pipeline_events,
+      ["push", "pull_request"],
+    );
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("pipeline_wait: a timeout is recorded as timedOut: true", async () => {
+  const { caller } = makeFakeApi((c) => {
+    if (c.path === "/api/repos/1/pipelines/5") {
+      return pipelineWithSteps({ status: "running" });
+    }
+    return undefined;
+  });
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    // timeoutSec 0: the deadline has passed by the first poll, so no sleep.
+    await method("pipeline_wait").execute(
+      { repo: "1", number: 5, timeoutSec: 0 },
+      context,
+    );
+    assertEquals(written[0].data.status, "running");
+    assertEquals(written[0].data.timedOut, true);
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("pipeline_wait: a finished pipeline is recorded as timedOut: false", async () => {
+  const { caller } = makeFakeApi(() =>
+    pipelineWithSteps({ status: "success" })
+  );
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("pipeline_wait").execute({ repo: "1", number: 5 }, context);
+    assertEquals(written[0].data.timedOut, false);
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("pipeline_trigger: a response with no number fails instead of naming a record 'undefined'", async () => {
+  const { caller } = makeFakeApi((c) => {
+    if (c.method === "POST") return { status: "pending" };
+    return undefined;
+  });
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await rejects(
+      () =>
+        method("pipeline_trigger").execute(
+          { repo: "1", branch: "main" },
+          context,
+        ),
+      /no pipeline number/,
+    );
+    assertEquals(written.length, 0, "nothing written");
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("org_get: a lookup with no id fails instead of naming a record 'undefined'", async () => {
+  const { caller } = makeFakeApi(() => ({ name: "octo-org" }));
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await rejects(
+      () => method("org_get").execute({ owner: "octo-org" }, context),
+      /no id for org octo-org/,
+    );
+    assertEquals(written.length, 0, "nothing written");
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("pipeline_logs: a line that is not base64 is marked, not blanked", async () => {
+  const { caller } = makeFakeApi((c) => {
+    if (c.path === "/api/repos/1/pipelines/5") return pipelineWithSteps();
+    if (c.path === "/api/repos/1/logs/5/10") {
+      return {
+        status: 200,
+        body: ([
+          { data: btoa("before") },
+          { data: "not base64!" },
+          { data: btoa("after") },
+        ] as unknown) as Record<string, unknown>,
+      };
+    }
+    return undefined;
+  });
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("pipeline_logs").execute(
+      { repo: "1", number: 5, step: "go" },
+      context,
+    );
+    assertEquals(
+      written[0].data.text,
+      "before\n[undecodable log line]\nafter",
+    );
+  } finally {
+    __setCaller(null);
+  }
+});
+
+// A context whose logger records each info message, for the logging tests.
+function makeLoggingContext() {
+  const { context, written } = makeContext();
+  const infos: Array<{ message: string; props: Record<string, unknown> }> = [];
+  context.logger.info = ((
+    message: string,
+    props: Record<string, unknown>,
+  ) => {
+    infos.push({ message, props });
+  }) as typeof context.logger.info;
+  return { context, written, infos };
+}
+
+Deno.test("read methods log what they are about to do", async () => {
+  // Every call answers 200 with a bare id, which is enough for each method to
+  // get past its first log line; a later failure does not matter here.
+  __setCaller(() => Promise.resolve({ status: 200, body: { id: 1 } }));
+  try {
+    const cases: Array<[string, Record<string, unknown>]> = [
+      ["repo_get", { repo: "1" }],
+      ["org_get", { owner: "octo-org" }],
+      ["org_secret_list", { owner: "1" }],
+      ["repo_secret_list", { repo: "1" }],
+      ["pipeline_list", { repo: "1" }],
+      ["pipeline_last", { repo: "1" }],
+      ["pipeline_steps", { repo: "1", number: 5 }],
+      ["pipeline_logs", { repo: "1", number: 5, step: "go" }],
+      ["repo_update", { repo: "1" }],
+      ["queue_info", {}],
+      ["server_info", {}],
+      ["cron_list", { repo: "1" }],
+    ];
+    for (const [name, args] of cases) {
+      const { context, infos } = makeLoggingContext();
+      await method(name).execute(args, context).catch(() => {});
+      assert(infos.length > 0, `${name} logged nothing`);
+    }
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("repo_update: logs the PATCH body before sending it", async () => {
+  const { caller } = makeFakeApi(() => repoObj());
+  __setCaller(caller);
+  try {
+    const { context, infos } = makeLoggingContext();
+    await method("repo_update").execute(
+      { repo: "1", trustedVolumes: true },
+      context,
+    );
+    const update = infos.find((i) => i.message === "Updating repo settings");
+    assert(update, "logged the update");
+    assertEquals(
+      (update?.props.body as Record<string, unknown>).trusted,
+      { network: false, volumes: true, security: false },
+    );
+  } finally {
+    __setCaller(null);
+  }
+});
+
+// ─────────────────────────── approve / decline ───────────────────────────
+
+Deno.test("pipeline_approve: a numbered pipeline that is not blocked is unchanged, no POST", async () => {
+  const { caller, calls } = makeFakeApi((c) => {
+    if (c.path === "/api/repos/1/pipelines/5") {
+      return pipelineWithSteps({ status: "success" });
+    }
+    return undefined;
+  });
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("pipeline_approve").execute({ repo: "1", number: 5 }, context);
+    assert(!calls.some((c) => c.method === "POST"), "no approve POST");
+    assertEquals(written[0].data.action, "unchanged");
+    assertEquals(written[0].data.number, 5);
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("pipeline_approve: a numbered blocked pipeline is approved", async () => {
+  const { caller, calls } = makeFakeApi((c) => {
+    if (c.path === "/api/repos/1/pipelines/5") {
+      return pipelineWithSteps({ status: "blocked" });
+    }
+    if (c.method === "POST" && c.path === "/api/repos/1/pipelines/5/approve") {
+      return pipelineWithSteps({ status: "pending" });
+    }
+    return undefined;
+  });
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("pipeline_approve").execute({ repo: "1", number: 5 }, context);
+    assert(
+      calls.some((c) => c.path === "/api/repos/1/pipelines/5/approve"),
+      "approve POST sent",
+    );
+    assertEquals(written[0].data.action, "approved");
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("pipeline_decline: without a number, targets the newest blocked pipeline, not the newest", async () => {
+  // Pipeline 5 is a later push that succeeded; 4 is waiting for approval.
+  const { caller, calls } = makeFakeApi((c) => {
+    if (c.path === "/api/repos/1/pipelines?status=blocked&perPage=1") {
+      return {
+        status: 200,
+        body: ([{ number: 4, status: "blocked" }] as unknown) as Record<
+          string,
+          unknown
+        >,
+      };
+    }
+    if (c.path === "/api/repos/1/pipelines?perPage=1") {
+      return {
+        status: 200,
+        body: ([{ number: 5, status: "success" }] as unknown) as Record<
+          string,
+          unknown
+        >,
+      };
+    }
+    if (c.method === "POST" && c.path === "/api/repos/1/pipelines/4/decline") {
+      return { number: 4, status: "declined" };
+    }
+    return undefined;
+  });
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("pipeline_decline").execute({ repo: "1" }, context);
+    assert(
+      calls.some((c) => c.path === "/api/repos/1/pipelines/4/decline"),
+      "declined pipeline 4",
+    );
+    assertEquals(written[0].data.action, "declined");
+    assertEquals(written[0].data.number, 4);
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("pipeline_approve: without a number and nothing blocked, reports the newest unchanged", async () => {
+  const { caller, calls } = makeFakeApi((c) => {
+    if (c.path === "/api/repos/1/pipelines?status=blocked&perPage=1") {
+      return { status: 200, body: ([] as unknown) as Record<string, unknown> };
+    }
+    if (c.path === "/api/repos/1/pipelines?perPage=1") {
+      return {
+        status: 200,
+        body: ([{ number: 5, status: "success" }] as unknown) as Record<
+          string,
+          unknown
+        >,
+      };
+    }
+    return undefined;
+  });
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("pipeline_approve").execute({ repo: "1" }, context);
+    assert(!calls.some((c) => c.method === "POST"), "no approve POST");
+    assertEquals(written[0].data.action, "unchanged");
+    assertEquals(written[0].data.number, 5);
+  } finally {
+    __setCaller(null);
+  }
+});
+
+// ─────────────────────────── plain-http warning ───────────────────────────
+
+Deno.test("every run warns when apiUrl is plain http, and not when it is https", async () => {
+  __setCaller(() => Promise.resolve({ status: 200, body: { version: "x" } }));
+  try {
+    const warnings = (apiUrl: string) => {
+      const { context } = makeContext();
+      const seen: string[] = [];
+      context.globalArgs = { ...GLOBALS, apiUrl };
+      context.logger.warn = ((message: string) => {
+        seen.push(message);
+      }) as typeof context.logger.warn;
+      return { context, seen };
+    };
+    const http = warnings("http://woodpecker.example.com:8000");
+    await method("server_info").execute({}, http.context);
+    assertEquals(http.seen.length, 1);
+    assert(/not https/.test(http.seen[0]), http.seen[0]);
+    const https = warnings("https://woodpecker.example.com");
+    await method("server_info").execute({}, https.context);
+    assertEquals(https.seen.length, 0);
+  } finally {
+    __setCaller(null);
+  }
+});
+
+// ─────────────────────────── stored references ───────────────────────────
+
+Deno.test("pipeline records store the repo's full name when an id is passed", async () => {
+  const { caller } = makeFakeApi((c) => {
+    if (c.path === "/api/repos/1/pipelines?perPage=1") {
+      return {
+        status: 200,
+        body: ([{ number: 5, status: "success" }] as unknown) as Record<
+          string,
+          unknown
+        >,
+      };
+    }
+    return undefined;
+  });
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("pipeline_last").execute({ repo: "1" }, context);
+    assertEquals(written[0].data.repo, "octo-org/web");
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("cron records store the repo's full name when an id is passed", async () => {
+  const { caller } = makeFakeApi((c) => {
+    if (c.path.startsWith("/api/repos/1/cron?")) {
+      return {
+        status: 200,
+        body: ([{
+          id: 3,
+          name: "nightly",
+          schedule: "@daily",
+        }] as unknown) as Record<string, unknown>,
+      };
+    }
+    return undefined;
+  });
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("cron_list").execute({ repo: "1" }, context);
+    assertEquals(written[0].data.repo, "octo-org/web");
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("org secrets store the org's name when an id is passed", async () => {
+  const { caller, calls } = makeFakeApi((c) => {
+    if (c.path === "/api/orgs/7") return { id: 7, name: "octo-org" };
+    if (c.path.startsWith("/api/orgs/7/secrets?")) {
+      return {
+        status: 200,
+        body: ([{ id: 1, name: "ghcr_token" }] as unknown) as Record<
+          string,
+          unknown
+        >,
+      };
+    }
+    return undefined;
+  });
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("org_secret_list").execute({ owner: "7" }, context);
+    assert(calls.some((c) => c.path === "/api/orgs/7"), "fetched the org");
+    assertEquals(written[0].data.owner, "octo-org");
+  } finally {
+    __setCaller(null);
+  }
+});
+
+// ─────────────────────────── publish review, 2026-10-11 ───────────────────────────
+
+Deno.test("a server that stalls mid-body fails at httpTimeoutMs instead of hanging", async () => {
+  // Headers and the first byte arrive at once; the rest never does.
+  const server = Deno.serve(
+    { port: 0, hostname: "127.0.0.1", onListen: () => {} },
+    () =>
+      new Response(
+        new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode("{"));
+          },
+        }),
+        { headers: { "content-type": "application/json" } },
+      ),
+  );
+  try {
+    const { context } = makeContext();
+    const stalled = {
+      ...context,
+      globalArgs: {
+        ...GLOBALS,
+        apiUrl: `http://127.0.0.1:${server.addr.port}`,
+        httpTimeoutMs: 200,
+      },
+    };
+    await rejects(
+      () => method("server_info").execute({}, stalled),
+      /timed out after 200 ms/,
+    );
+  } finally {
+    await server.shutdown();
+  }
+});
+
+Deno.test("org_get: a numeric owner is fetched by id, not looked up as a login", async () => {
+  const { caller, calls } = makeFakeApi((c) => {
+    if (c.path === "/api/orgs/7") {
+      return { id: 7, name: "octo-org", is_user: false };
+    }
+    return undefined;
+  });
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("org_get").execute({ owner: "7" }, context);
+    assertEquals(calls.map((c) => c.path), ["/api/orgs/7"]);
+    assertEquals(written[0].name, "org:7");
+    assertEquals(written[0].data.name, "octo-org");
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("pipeline_restart: a response without a number fails instead of overwriting the old run", async () => {
+  const { caller } = makeFakeApi((c) => {
+    if (c.method === "POST" && c.path === "/api/repos/1/pipelines/5") {
+      return { status: "pending" };
+    }
+    return undefined;
+  });
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await rejects(
+      () =>
+        method("pipeline_restart").execute({ repo: "1", number: 5 }, context),
+      /no pipeline number/,
+    );
+    assertEquals(written.length, 0, "nothing written");
   } finally {
     __setCaller(null);
   }
