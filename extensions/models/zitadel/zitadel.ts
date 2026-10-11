@@ -18,15 +18,16 @@ import type {
  * `@thomas/zitadel`: non-destructive administration of a Zitadel instance over
  * its Management API (v1 REST).
  *
- * Scope: this holds an IAM admin credential, so its methods are limited. It never
- * deletes a project, application or user; those are disabled with the reversible
- * deactivate/reactivate pair. Two methods do delete: `role_remove`, because a
- * role has no deactivate state (it also revokes every grant that uses the role),
- * and `pat_revoke`, because revoking a token removes it. Both verify the target
- * first. It manages machine identities only: service users and their PATs, keys
- * and secrets, never human users or their passwords or MFA. Every secret it
- * creates is returned once in the method output, marked sensitive, and never
- * logged.
+ * Scope: this holds an org admin credential (an org manager such as ORG_OWNER),
+ * so its methods are limited. It never deletes a project, application or user;
+ * those are disabled with the reversible deactivate/reactivate pair. Two methods
+ * do delete: `role_remove`, because a role has no deactivate state (it also
+ * revokes every grant that uses the role), and `pat_revoke`, because revoking a
+ * token removes it. Both verify the target first. It creates machine identities
+ * only (service users and their PATs, keys and secrets). It can grant roles to,
+ * and deactivate, any user, but never creates a human user or changes a
+ * password or MFA. Every secret it creates is returned once in the method
+ * output, marked sensitive, and never logged.
  *
  * Auth: a JWT private-key service account. The model holds a machine-user key
  * JSON (`keyJson`); per run it signs a short-lived RS256 assertion and exchanges
@@ -34,16 +35,19 @@ import type {
  * scope) for an access token, then sends that as a Bearer token to the Management
  * API. No long-lived bearer token is stored.
  *
- * Idempotency: provision/ensure methods find-or-create by human name (project
- * name, app name, username) and converge config in place, returning an `action`
- * of created/updated/unchanged. They accept friendly names, not just opaque IDs.
+ * Idempotency: ensure methods find-or-create by human name (project name, app
+ * name, username, role key) and return an `action` of created/updated/unchanged.
+ * `oidc_app_ensure`, `role_ensure` and `grant_ensure` also converge an existing
+ * object's config; `project_ensure`, `api_app_ensure` and `machine_user_ensure`
+ * only find or create, and leave an existing object as it is.
  */
 
 // ─────────────────────────── global arguments ───────────────────────────
 
 const GlobalArgs = z.object({
   apiUrl: z.string().describe(
-    "Zitadel base URL / issuer, e.g. https://zitadel.example.com",
+    "Zitadel base URL / issuer, e.g. https://zitadel.example.com. Plain http " +
+      "sends the access token unencrypted; methods log a warning for it.",
   ),
   keyJson: z.string().meta({ sensitive: true }).describe(
     "Service-user machine key JSON (the whole blob downloaded from Zitadel; " +
@@ -53,7 +57,7 @@ const GlobalArgs = z.object({
   orgId: z.string().optional().describe(
     "Target org id (x-zitadel-orgid header). Omit to use the service user's own org.",
   ),
-  httpTimeoutMs: z.coerce.number().int().default(30000).describe(
+  httpTimeoutMs: z.coerce.number().int().positive().default(30000).describe(
     "Per-request timeout (ms) for token exchange and API calls",
   ),
   // An OAuth scope string, not a secret.
@@ -182,7 +186,7 @@ const ProjectInfo = z.object({
   id: z.string(),
   name: z.string(),
   state: z.string(),
-  // Authorization flags. Without `roleAssertion`, granted project roles do NOT
+  // Authorization flags. Without `roleAssertion`, granted project roles do not
   // appear in the user's tokens/userinfo.
   roleAssertion: z.boolean().optional().describe(
     "Assert the user's project roles into their tokens/userinfo",
@@ -247,7 +251,7 @@ const AppCredential = z.object({
   appId: z.string(),
   name: z.string().optional(),
   clientId: z.string().optional(),
-  // Present ONLY on create/rotate, returned exactly once.
+  // Present only on create/rotate, returned exactly once.
   clientSecret: z.string().meta({ sensitive: true }).optional(),
   kind: z.string(),
   action: Action,
@@ -498,15 +502,20 @@ interface CachedToken {
 }
 const _tokenCache = new Map<string, CachedToken>();
 
+/**
+ * Fetch and read the whole body under one timeout. The body read is inside the
+ * timer because a server can send headers promptly and then stall the body.
+ */
 async function fetchWithTimeout(
   url: string,
   init: RequestInit,
   timeoutMs: number,
-): Promise<Response> {
+): Promise<{ status: number; text: string }> {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
-    return await fetch(url, { ...init, signal: ctrl.signal });
+    const res = await fetch(url, { ...init, signal: ctrl.signal });
+    return { status: res.status, text: await res.text() };
   } finally {
     clearTimeout(t);
   }
@@ -532,13 +541,23 @@ async function getToken(g: GlobalArgsT): Promise<string> {
     },
     g.httpTimeoutMs,
   );
-  const text = await res.text();
-  if (res.status >= 400) {
+  const { status, text } = res;
+  if (status >= 400) {
     throw new Error(
-      `Zitadel token exchange failed: HTTP ${res.status}: ${text}`,
+      `Zitadel token exchange failed: HTTP ${status}: ${text}`,
     );
   }
-  const j = JSON.parse(text) as { access_token?: string; expires_in?: number };
+  // A proxy in front of Zitadel can answer 200 with an HTML page.
+  let j: { access_token?: string; expires_in?: number };
+  try {
+    j = JSON.parse(text);
+  } catch {
+    throw new Error(
+      `Zitadel token exchange returned non-JSON (HTTP ${status}): ${
+        text.slice(0, 200)
+      }`,
+    );
+  }
   if (!j.access_token) {
     throw new Error("token exchange returned no access_token");
   }
@@ -567,7 +586,7 @@ async function realCaller(g: GlobalArgsT, c: ApiCall): Promise<ApiResult> {
     { method: c.method, headers, body },
     g.httpTimeoutMs,
   );
-  const text = await res.text();
+  const { status, text } = res;
   let parsed: Json = {};
   if (text) {
     try {
@@ -576,13 +595,13 @@ async function realCaller(g: GlobalArgsT, c: ApiCall): Promise<ApiResult> {
       parsed = { raw: text };
     }
   }
-  if (res.status >= 400) {
+  if (status >= 400) {
     const msg = typeof parsed.message === "string" ? parsed.message : text;
     throw new Error(
-      `Zitadel API ${c.method} ${c.path} -> HTTP ${res.status}: ${msg}`,
+      `Zitadel API ${c.method} ${c.path} -> HTTP ${status}: ${msg}`,
     );
   }
-  return { status: res.status, body: parsed };
+  return { status, body: parsed };
 }
 
 function call(g: GlobalArgsT, c: ApiCall): Promise<ApiResult> {
@@ -601,6 +620,34 @@ function logInfo(
   context.logger?.info?.(message, props ?? {});
 }
 
+/**
+ * The method's global args. Warns when `apiUrl` is plain http, because the
+ * signed assertion and the access token then cross the network unencrypted.
+ * Only a warning: a test instance on a private network may run without TLS.
+ */
+function globalsOf(context: Pick<Ctx, "globalArgs" | "logger">): GlobalArgsT {
+  const g = context.globalArgs;
+  if (/^http:\/\//i.test(g.apiUrl)) {
+    context.logger?.warn?.(
+      "apiUrl {apiUrl} is plain http: the access token is sent unencrypted",
+      { apiUrl: g.apiUrl },
+    );
+  }
+  return g;
+}
+
+/**
+ * Read the new object's id from a create response. The object already exists
+ * by then, so a missing id must fail loudly rather than be recorded as "".
+ */
+function requireId(body: Json, field: string, op: string): string {
+  const id = body[field];
+  if (typeof id !== "string" || !id) {
+    throw new Error(`${op} returned no ${field}`);
+  }
+  return id;
+}
+
 function mgmt(path: string): string {
   return `/management/v1${path}`;
 }
@@ -614,7 +661,27 @@ function nowIso(): string {
 }
 
 /**
- * Page through a Zitadel `_search` endpoint and return ALL results (not just the
+ * The data name for a record: `<spec>:<key>`. swamp keys stored data by model +
+ * name, not spec, so without the prefix `user_list` would overwrite the client
+ * secret `machine_secret_generate` stored under the same user id.
+ *
+ * swamp rejects `/`, `\`, `..` and NUL in a name, and a role key is free text,
+ * so the key is percent-escaped. `%` is escaped first, so the mapping is
+ * reversible and two different keys never share a name. Zitadel ids are
+ * digits and pass through unchanged.
+ */
+function dataName(spec: string, key: string): string {
+  const safeKey = key
+    .replaceAll("%", "%25")
+    .replaceAll("/", "%2F")
+    .replaceAll("\\", "%5C")
+    .replaceAll("\0", "%00")
+    .replaceAll("..", ".%2E");
+  return `${spec}:${safeKey}`;
+}
+
+/**
+ * Page through a Zitadel `_search` endpoint and return all results (not just the
  * first page). Zitadel returns `details.totalResult` as a string; we loop on
  * offset until the accumulated count reaches it or a short page is returned.
  */
@@ -840,7 +907,7 @@ function shapeApp(
     kind,
     clientId,
     // OIDC config fields use proto3 zero-value omission: appType=web,
-    // accessTokenType=bearer and devMode=false come back ABSENT. Normalize to
+    // accessTokenType=bearer and devMode=false come back absent. Normalise to
     // the effective default for OIDC apps so reads show the complete config and
     // a read-then-converge changes only what's intended. Left undefined for
     // non-OIDC (api/saml) apps, where these fields don't apply.
@@ -855,8 +922,11 @@ function shapeApp(
           friendlyState(oidc.accessTokenType))
         : "bearer")
       : undefined,
-    authMethod: (oidc.authMethodType ?? api.authMethodType)
-      ? friendlyState(oidc.authMethodType ?? api.authMethodType)
+    // BASIC is enum value 0 for both OIDC and API apps, so it is omitted too.
+    authMethod: a.oidcConfig || a.apiConfig
+      ? (typeof (oidc.authMethodType ?? api.authMethodType) === "string"
+        ? friendlyState(oidc.authMethodType ?? api.authMethodType)
+        : "basic")
       : undefined,
     redirectUris: Array.isArray(oidc.redirectUris)
       ? (oidc.redirectUris as string[])
@@ -911,10 +981,10 @@ const OidcAppRedirectSetArgs = z.object({
   projectId: z.string().describe("Project id (from app_list / project_list)"),
   appId: z.string().describe("Application id (from app_list)"),
   add: jsonArray(z.string()).default([]).describe(
-    "Redirect URIs to ENSURE PRESENT (idempotent append)",
+    "Redirect URIs that must be present (idempotent append)",
   ),
   remove: jsonArray(z.string()).default([]).describe(
-    "Redirect URIs to ENSURE ABSENT (for cleanup)",
+    "Redirect URIs that must be absent (for cleanup)",
   ),
 }).refine(
   (a) => a.add.length > 0 || a.remove.length > 0,
@@ -930,15 +1000,6 @@ const UserListArgs = z.object({
 const ProjectEnsureArgs = z.object({
   name: z.string().describe("Project name (find-or-create by exact name)"),
 });
-
-/**
- * A strict boolean. `z.coerce.boolean()` runs `Boolean(v)`, so `"0"` and
- * `"False"` become true; this accepts only true/false and their strings.
- */
-const StrictBool = z.union(
-  [z.boolean(), z.literal("true"), z.literal("false")],
-  { error: 'expected true or false (or the strings "true" / "false")' },
-).transform((v) => v === true || v === "true");
 
 const OidcAppEnsureArgs = z.object({
   project: z.string().describe(
@@ -966,7 +1027,7 @@ const OidcAppEnsureArgs = z.object({
   responseTypes: jsonArray(z.enum(["code", "id_token", "id_token_token"]))
     .optional(),
   accessTokenType: z.enum(["bearer", "jwt"]).optional(),
-  devMode: StrictBool.optional().describe(
+  devMode: z.boolean().optional().describe(
     "Relax redirect-URI checks (non-https/localhost). Test only.",
   ),
 });
@@ -1053,7 +1114,11 @@ const ApiAppEnsureArgs = z.object({
 const AppSecretRotateArgs = z.object({
   projectId: z.string(),
   appId: z.string(),
-  kind: z.enum(["oidc", "api"]).default("oidc"),
+  // No default: the kind is read from the app. A passed kind is checked
+  // against it.
+  kind: z.enum(["oidc", "api"]).optional().describe(
+    "Optional check: the method refuses if the app is not of this kind",
+  ),
 });
 
 const MachineUserEnsureArgs = z.object({
@@ -1128,7 +1193,9 @@ const GrantEnsureArgs = z.object({
   user: z.string().describe(
     "User id or login name (e.g. alice@example.com) to grant roles to",
   ),
-  project: z.string().describe("Project name or project id"),
+  project: z.string().describe(
+    "Project name or project id (the project must exist)",
+  ),
   // No default: an empty default would read as "strip every role" on a re-run.
   roleKeys: jsonArray(z.string()).optional().describe(
     "The exact set of role keys the user should hold on this project (converged). " +
@@ -1146,13 +1213,13 @@ const GrantSetStateArgs = z.object({
 
 const ProjectAuthzSetArgs = z.object({
   project: z.string().describe("Project name or project id"),
-  roleAssertion: StrictBool.optional().describe(
+  roleAssertion: z.boolean().optional().describe(
     "Assert project roles into tokens/userinfo (the flag that surfaces grants)",
   ),
-  roleCheck: StrictBool.optional().describe(
+  roleCheck: z.boolean().optional().describe(
     "Require a project role to authenticate",
   ),
-  hasProjectCheck: StrictBool.optional().describe(
+  hasProjectCheck: z.boolean().optional().describe(
     "Require the user's org to have the project granted",
   ),
 });
@@ -1160,15 +1227,32 @@ const ProjectAuthzSetArgs = z.object({
 // ─────────────────────────── model ───────────────────────────
 
 /**
- * The `@thomas/zitadel` model definition — see the file header for the scope
+ * The `@thomas/zitadel` model definition. See the file header for the scope
  * guarantee. Read methods never emit secrets; mutating methods are idempotent
- * where possible and emit minted secrets exactly once as sensitive output; there
- * are deliberately no hard-delete methods.
+ * where possible and emit minted secrets exactly once as sensitive output. The
+ * only deletes are `role_remove` and `pat_revoke`, both verify-first.
  */
 export const model = {
   type: "@thomas/zitadel",
-  version: "2026.06.24.1",
+  version: "2026.10.11.1",
   globalArguments: GlobalArgs,
+  upgrades: [
+    {
+      toVersion: "2026.10.11.1",
+      description:
+        "httpTimeoutMs must now be positive; a zero or negative value is dropped so the 30000 ms default applies. Stored data is renamed to <spec>:<key> (or <spec>); records under the old names are left as they are and are not migrated.",
+      upgradeAttributes: (
+        old: Record<string, unknown>,
+      ): Record<string, unknown> => {
+        // Zero or negative aborted every request at once, so nobody relied on it.
+        if (Number(old.httpTimeoutMs) <= 0) {
+          const { httpTimeoutMs: _, ...rest } = old;
+          return rest;
+        }
+        return old;
+      },
+    },
+  ],
   checks: {
     "reachable": {
       description:
@@ -1237,7 +1321,7 @@ export const model = {
     },
     "machine-credential": {
       description:
-        "Result of minting a machine credential (PAT / key / secret) — secret once",
+        "Result of minting a machine credential (PAT / key / secret); secret once",
       schema: MachineCredential,
       lifetime: "infinite",
       garbageCollection: 10,
@@ -1255,7 +1339,7 @@ export const model = {
       garbageCollection: 10,
     },
     "grant": {
-      description: "A user grant — which roles a user holds on a project",
+      description: "A user grant: which roles a user holds on a project",
       schema: GrantInfo,
       lifetime: "infinite",
       garbageCollection: 10,
@@ -1277,13 +1361,14 @@ export const model = {
         _rawArgs,
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
-        const g = context.globalArgs;
-        logInfo(context, "Getting org");
+        const g = globalsOf(context);
+        logInfo(context, "Reading the service user's org");
         const r = await call(g, { method: "GET", path: mgmt("/orgs/me") });
         const o = (r.body.org ?? {}) as Json;
+        logInfo(context, "Read org {name} ({id})", { name: o.name, id: o.id });
         const handle = await context.writeResource(
           "org",
-          String(o.id ?? "me"),
+          dataName("org", String(o.id ?? "me")),
           {
             id: String(o.id ?? ""),
             name: String(o.name ?? ""),
@@ -1306,31 +1391,32 @@ export const model = {
         _rawArgs,
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
-        const g = context.globalArgs;
+        const g = globalsOf(context);
         logInfo(context, "Listing projects");
         const result = await searchAll(g, mgmt("/projects/_search"));
         const ts = nowIso();
         const handles: DataHandle[] = [];
         for (const p of result) {
           handles.push(
-            await context.writeResource("project", String(p.id), {
-              id: String(p.id ?? ""),
-              name: String(p.name ?? ""),
-              state: friendlyState(p.state),
-              roleAssertion: typeof p.projectRoleAssertion === "boolean"
-                ? p.projectRoleAssertion
-                : undefined,
-              roleCheck: typeof p.projectRoleCheck === "boolean"
-                ? p.projectRoleCheck
-                : undefined,
-              hasProjectCheck: typeof p.hasProjectCheck === "boolean"
-                ? p.hasProjectCheck
-                : undefined,
-              action: "observed",
-              timestamp: ts,
-            }),
+            await context.writeResource(
+              "project",
+              dataName("project", String(p.id)),
+              {
+                id: String(p.id ?? ""),
+                name: String(p.name ?? ""),
+                state: friendlyState(p.state),
+                // The API omits a false flag (proto3 zero value), so absent
+                // means false, as in project_authz_set.
+                roleAssertion: p.projectRoleAssertion === true,
+                roleCheck: p.projectRoleCheck === true,
+                hasProjectCheck: p.hasProjectCheck === true,
+                action: "observed",
+                timestamp: ts,
+              },
+            ),
           );
         }
+        logInfo(context, "Listed {count} projects", { count: handles.length });
         return { dataHandles: handles };
       },
     },
@@ -1343,8 +1429,10 @@ export const model = {
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const a = AppListArgs.parse(rawArgs);
-        const g = context.globalArgs;
-        logInfo(context, "Listing apps", { projectId: a.projectId });
+        const g = globalsOf(context);
+        logInfo(context, "Listing apps in project {projectId}", {
+          projectId: a.projectId,
+        });
         const result = await searchAll(
           g,
           mgmt(`/projects/${encodeURIComponent(a.projectId)}/apps/_search`),
@@ -1355,11 +1443,12 @@ export const model = {
           handles.push(
             await context.writeResource(
               "app",
-              String(app.id),
+              dataName("app", String(app.id)),
               shapeApp(a.projectId, app, "observed", ts),
             ),
           );
         }
+        logInfo(context, "Listed {count} apps", { count: handles.length });
         return { dataHandles: handles };
       },
     },
@@ -1371,7 +1460,11 @@ export const model = {
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const a = AppGetArgs.parse(rawArgs);
-        const g = context.globalArgs;
+        const g = globalsOf(context);
+        logInfo(context, "Reading app {appId} in project {projectId}", {
+          appId: a.appId,
+          projectId: a.projectId,
+        });
         const r = await call(g, {
           method: "GET",
           path: mgmt(
@@ -1381,9 +1474,10 @@ export const model = {
           ),
         });
         const app = (r.body.app ?? {}) as Json;
+        logInfo(context, "Read app {name}", { name: app.name });
         const handle = await context.writeResource(
           "app",
-          a.appId,
+          dataName("app", a.appId),
           shapeApp(a.projectId, app, "observed", nowIso()),
         );
         return { dataHandles: [handle] };
@@ -1391,8 +1485,8 @@ export const model = {
     },
     oidc_app_redirect_set: {
       description:
-        "Add and/or remove redirect URIs on an OIDC app's allowlist via READ-MODIFY-" +
-        "WRITE: fetches the live oidc_config and re-PUTs it with ONLY redirectUris " +
+        "Add and/or remove redirect URIs on an OIDC app's allowlist via read-modify-" +
+        "write: fetches the live oidc_config and re-PUTs it with only redirectUris " +
         "changed, preserving every other field (PKCE/auth method/response types/…). " +
         "Safe on shared clients where a full converge would risk clobbering. Idempotent.",
       arguments: OidcAppRedirectSetArgs,
@@ -1401,8 +1495,11 @@ export const model = {
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const a = OidcAppRedirectSetArgs.parse(rawArgs);
-        const g = context.globalArgs;
+        const g = globalsOf(context);
         const ts = nowIso();
+        logInfo(context, "Reading the redirect URIs of app {appId}", {
+          appId: a.appId,
+        });
 
         const got = await call(g, {
           method: "GET",
@@ -1429,9 +1526,12 @@ export const model = {
         if (
           next.length === prev.length && next.every((u, i) => u === prev[i])
         ) {
+          logInfo(context, "Redirect URIs of app {appId} already match", {
+            appId: a.appId,
+          });
           const handle = await context.writeResource(
             "oidc-redirect-result",
-            a.appId,
+            dataName("oidc-redirect-result", a.appId),
             {
               projectId: a.projectId,
               appId: a.appId,
@@ -1454,7 +1554,7 @@ export const model = {
         }
         body.redirectUris = next;
 
-        logInfo(context, "Setting OIDC redirect URIs", {
+        logInfo(context, "Setting redirect URIs of app {appId}: {*}", {
           appId: a.appId,
           added: a.add,
           removed: a.remove,
@@ -1482,7 +1582,7 @@ export const model = {
           | undefined;
         const handle = await context.writeResource(
           "oidc-redirect-result",
-          a.appId,
+          dataName("oidc-redirect-result", a.appId),
           {
             projectId: a.projectId,
             appId: a.appId,
@@ -1505,7 +1605,8 @@ export const model = {
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const a = UserListArgs.parse(rawArgs);
-        const g = context.globalArgs;
+        const g = globalsOf(context);
+        logInfo(context, "Listing users of type {type}", { type: a.type });
         const queries: Json[] = [];
         if (a.type !== "any") {
           queries.push({
@@ -1526,46 +1627,59 @@ export const model = {
           const machine = (u.machine ?? {}) as Json;
           const profile = (human.profile ?? {}) as Json;
           handles.push(
-            await context.writeResource("user", String(u.userId ?? u.id), {
-              userId: String(u.userId ?? u.id ?? ""),
-              username: typeof u.userName === "string" ? u.userName : undefined,
-              type: u.human ? "human" : u.machine ? "machine" : "unknown",
-              state: friendlyState(u.state),
-              displayName: (machine.name as string) ??
-                (profile.displayName as string) ?? undefined,
-              action: "observed",
-              timestamp: ts,
-            }),
+            await context.writeResource(
+              "user",
+              dataName("user", String(u.userId ?? u.id)),
+              {
+                userId: String(u.userId ?? u.id ?? ""),
+                username: typeof u.userName === "string"
+                  ? u.userName
+                  : undefined,
+                type: u.human ? "human" : u.machine ? "machine" : "unknown",
+                state: friendlyState(u.state),
+                displayName: (machine.name as string) ??
+                  (profile.displayName as string) ?? undefined,
+                action: "observed",
+                timestamp: ts,
+              },
+            ),
           );
         }
+        logInfo(context, "Listed {count} users", { count: handles.length });
         return { dataHandles: handles };
       },
     },
     manager_audit: {
       description:
-        "List org managers (members) and their roles — who can administer this org. Read-only.",
+        "List org managers (members) and their roles: who can administer this org. Read-only.",
       arguments: Empty,
       execute: async (
         _rawArgs,
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
-        const g = context.globalArgs;
+        const g = globalsOf(context);
+        logInfo(context, "Listing org managers");
         const result = await searchAll(g, mgmt("/orgs/me/members/_search"));
         const ts = nowIso();
         const handles: DataHandle[] = [];
         for (const m of result) {
           handles.push(
-            await context.writeResource("manager", String(m.userId), {
-              userId: String(m.userId ?? ""),
-              displayName: typeof m.displayName === "string"
-                ? m.displayName
-                : undefined,
-              roles: Array.isArray(m.roles) ? (m.roles as string[]) : [],
-              action: "observed",
-              timestamp: ts,
-            }),
+            await context.writeResource(
+              "manager",
+              dataName("manager", String(m.userId)),
+              {
+                userId: String(m.userId ?? ""),
+                displayName: typeof m.displayName === "string"
+                  ? m.displayName
+                  : undefined,
+                roles: Array.isArray(m.roles) ? (m.roles as string[]) : [],
+                action: "observed",
+                timestamp: ts,
+              },
+            ),
           );
         }
+        logInfo(context, "Listed {count} managers", { count: handles.length });
         return { dataHandles: handles };
       },
     },
@@ -1579,7 +1693,7 @@ export const model = {
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const a = ProjectEnsureArgs.parse(rawArgs);
-        const g = context.globalArgs;
+        const g = globalsOf(context);
         const existing = await findProjectByName(g, a.name);
         let id: string;
         let action: z.infer<typeof Action>;
@@ -1588,41 +1702,61 @@ export const model = {
           id = existing.id;
           state = friendlyState(existing.state);
           action = "unchanged";
+          logInfo(context, "Project {name} already exists ({id})", {
+            name: a.name,
+            id,
+          });
         } else {
           const r = await call(g, {
             method: "POST",
             path: mgmt("/projects"),
             body: { name: a.name },
           });
-          id = String(r.body.id ?? "");
+          id = requireId(r.body, "id", "project create");
           action = "created";
-          logInfo(context, "Created project", { name: a.name, id });
+          logInfo(context, "Created project {name} ({id})", {
+            name: a.name,
+            id,
+          });
         }
-        const handle = await context.writeResource("project", id, {
-          id,
-          name: a.name,
-          state,
-          action,
-          timestamp: nowIso(),
-        });
+        const handle = await context.writeResource(
+          "project",
+          dataName("project", id),
+          {
+            id,
+            name: a.name,
+            state,
+            action,
+            timestamp: nowIso(),
+          },
+        );
         return { dataHandles: [handle] };
       },
     },
     oidc_app_ensure: {
       description:
-        "Ensure an OIDC application (find-or-create within an ensured project; converge config). " +
-        "Returns clientId, and clientSecret ONCE on create for confidential clients.",
+        "Ensure an OIDC application: find-or-create by name within the project " +
+        "(a project name with no match is created), then converge the passed " +
+        "config fields. Returns clientId, and clientSecret once on create for " +
+        "confidential clients. Refuses a name that belongs to a non-OIDC app.",
       arguments: OidcAppEnsureArgs,
       execute: async (
         rawArgs,
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const a = OidcAppEnsureArgs.parse(rawArgs);
-        const g = context.globalArgs;
-        const projectId = await ensureProjectId(g, a.project);
+        const g = globalsOf(context);
+        const projectId = await ensureProjectId(g, a.project, context);
         const existing = await findAppByName(g, projectId, a.name);
         const ts = nowIso();
         if (existing && typeof existing.id === "string") {
+          if (!existing.oidcConfig) {
+            throw new Error(
+              `App ${
+                JSON.stringify(a.name)
+              } (${existing.id}) is not an OIDC app`,
+            );
+          }
           // Converge only the fields that were passed. The update replaces
           // every field, so the rest are carried over from the current config.
           const current = (existing.oidcConfig ?? {}) as Json;
@@ -1651,14 +1785,14 @@ export const model = {
               throw e;
             }
           }
-          logInfo(context, "Converged OIDC app", {
+          logInfo(context, "Converged OIDC app {name} ({appId}): {action}", {
             name: a.name,
             appId: existing.id,
             action,
           });
           const handle = await context.writeResource(
             "app-credential",
-            existing.id,
+            dataName("app-credential", existing.id),
             {
               projectId,
               appId: existing.id,
@@ -1681,16 +1815,17 @@ export const model = {
             ...oidcWireConfig({ ...OIDC_APP_DEFAULTS, ...a }),
           },
         });
-        logInfo(context, "Created OIDC app", {
+        const appId = requireId(r.body, "appId", "OIDC app create");
+        logInfo(context, "Created OIDC app {name} ({appId})", {
           name: a.name,
-          appId: r.body.appId,
+          appId,
         });
         const handle = await context.writeResource(
           "app-credential",
-          String(r.body.appId),
+          dataName("app-credential", appId),
           {
             projectId,
-            appId: String(r.body.appId ?? ""),
+            appId,
             name: a.name,
             clientId: typeof r.body.clientId === "string"
               ? r.body.clientId
@@ -1708,22 +1843,37 @@ export const model = {
     },
     api_app_ensure: {
       description:
-        "Ensure an API application (resource server / M2M). Returns clientId, and clientSecret ONCE on create for the basic method.",
+        "Find-or-create an API application (resource server / M2M) by name " +
+        "within the project (a project name with no match is created). An " +
+        "existing app is left as it is: authMethod applies on create only. " +
+        "Returns clientId, and clientSecret once on create for the basic method. " +
+        "Refuses a name that belongs to a non-API app.",
       arguments: ApiAppEnsureArgs,
       execute: async (
         rawArgs,
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const a = ApiAppEnsureArgs.parse(rawArgs);
-        const g = context.globalArgs;
-        const projectId = await ensureProjectId(g, a.project);
+        const g = globalsOf(context);
+        const projectId = await ensureProjectId(g, a.project, context);
         const existing = await findAppByName(g, projectId, a.name);
         const ts = nowIso();
         if (existing && typeof existing.id === "string") {
-          const api = (existing.apiConfig ?? {}) as Json;
+          if (!existing.apiConfig) {
+            throw new Error(
+              `App ${
+                JSON.stringify(a.name)
+              } (${existing.id}) is not an API app`,
+            );
+          }
+          logInfo(context, "API app {name} already exists ({appId})", {
+            name: a.name,
+            appId: existing.id,
+          });
+          const api = existing.apiConfig as Json;
           const handle = await context.writeResource(
             "app-credential",
-            existing.id,
+            dataName("app-credential", existing.id),
             {
               projectId,
               appId: existing.id,
@@ -1750,16 +1900,17 @@ export const model = {
             ),
           },
         });
-        logInfo(context, "Created API app", {
+        const appId = requireId(r.body, "appId", "API app create");
+        logInfo(context, "Created API app {name} ({appId})", {
           name: a.name,
-          appId: r.body.appId,
+          appId,
         });
         const handle = await context.writeResource(
           "app-credential",
-          String(r.body.appId),
+          dataName("app-credential", appId),
           {
             projectId,
-            appId: String(r.body.appId ?? ""),
+            appId,
             name: a.name,
             clientId: typeof r.body.clientId === "string"
               ? r.body.clientId
@@ -1779,16 +1930,18 @@ export const model = {
     // ───────────── rotate ─────────────
     app_secret_rotate: {
       description:
-        "Regenerate an application's client secret (verify the app exists first). Returns the new secret ONCE.",
+        "Regenerate an application's client secret. Reads the app first and " +
+        "takes its kind (oidc or api) from it. Returns the new secret once.",
       arguments: AppSecretRotateArgs,
       execute: async (
         rawArgs,
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const a = AppSecretRotateArgs.parse(rawArgs);
-        const g = context.globalArgs;
-        // Verify-first: confirm the app exists before mutating.
-        await call(g, {
+        const g = globalsOf(context);
+        // Verify-first: confirm the app exists, and read its kind, before
+        // mutating. Each kind has its own regenerate endpoint.
+        const got = await call(g, {
           method: "GET",
           path: mgmt(
             `/projects/${encodeURIComponent(a.projectId)}/apps/${
@@ -1796,7 +1949,27 @@ export const model = {
             }`,
           ),
         });
-        const cfgPath = a.kind === "api" ? "api_config" : "oidc_config";
+        const app = (got.body.app ?? {}) as Json;
+        const kind = app.oidcConfig
+          ? "oidc"
+          : app.apiConfig
+          ? "api"
+          : undefined;
+        if (!kind) {
+          throw new Error(
+            `App ${a.appId} is neither an OIDC nor an API app; it has no client secret`,
+          );
+        }
+        if (a.kind !== undefined && a.kind !== kind) {
+          throw new Error(
+            `App ${a.appId} is an ${kind} app, not ${a.kind}; refusing to rotate`,
+          );
+        }
+        logInfo(context, "Rotating the secret of {kind} app {appId}", {
+          kind,
+          appId: a.appId,
+        });
+        const cfgPath = kind === "api" ? "api_config" : "oidc_config";
         const r = await call(g, {
           method: "POST",
           path: mgmt(
@@ -1806,23 +1979,26 @@ export const model = {
           ),
           body: {},
         });
-        logInfo(context, "Rotated app secret", {
+        logInfo(context, "Rotated the secret of app {appId}", {
           appId: a.appId,
-          kind: a.kind,
         });
-        const handle = await context.writeResource("app-credential", a.appId, {
-          projectId: a.projectId,
-          appId: a.appId,
-          clientId: typeof r.body.clientId === "string"
-            ? r.body.clientId
-            : undefined,
-          clientSecret: typeof r.body.clientSecret === "string"
-            ? r.body.clientSecret
-            : undefined,
-          kind: a.kind,
-          action: "rotated",
-          timestamp: nowIso(),
-        });
+        const handle = await context.writeResource(
+          "app-credential",
+          dataName("app-credential", a.appId),
+          {
+            projectId: a.projectId,
+            appId: a.appId,
+            clientId: typeof r.body.clientId === "string"
+              ? r.body.clientId
+              : undefined,
+            clientSecret: typeof r.body.clientSecret === "string"
+              ? r.body.clientSecret
+              : undefined,
+            kind,
+            action: "rotated",
+            timestamp: nowIso(),
+          },
+        );
         return { dataHandles: [handle] };
       },
     },
@@ -1835,7 +2011,7 @@ export const model = {
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const a = MachineUserEnsureArgs.parse(rawArgs);
-        const g = context.globalArgs;
+        const g = globalsOf(context);
         const existing = await findMachineUserByUsername(g, a.username);
         const ts = nowIso();
         // ListUsers results use `id`; tolerate `userId` too.
@@ -1843,19 +2019,31 @@ export const model = {
           ? (existing.id ?? existing.userId)
           : undefined;
         if (existing && typeof existingId === "string") {
-          const handle = await context.writeResource("user", existingId, {
-            userId: existingId,
-            username: a.username,
-            type: "machine",
-            state: friendlyState(existing.state),
-            // The user as it is, not the arguments: an existing user is not
-            // updated.
-            displayName: String(
-              (existing.machine as Json | undefined)?.name ?? a.name,
-            ),
-            action: "unchanged",
-            timestamp: ts,
-          });
+          logInfo(
+            context,
+            "Machine user {username} already exists ({userId})",
+            {
+              username: a.username,
+              userId: existingId,
+            },
+          );
+          const handle = await context.writeResource(
+            "user",
+            dataName("user", existingId),
+            {
+              userId: existingId,
+              username: a.username,
+              type: "machine",
+              state: friendlyState(existing.state),
+              // The user as it is, not the arguments: an existing user is not
+              // updated.
+              displayName: String(
+                (existing.machine as Json | undefined)?.name ?? a.name,
+              ),
+              action: "unchanged",
+              timestamp: ts,
+            },
+          );
           return { dataHandles: [handle] };
         }
         const r = await call(g, {
@@ -1870,15 +2058,16 @@ export const model = {
               : "ACCESS_TOKEN_TYPE_BEARER",
           },
         });
-        logInfo(context, "Created machine user", {
+        const userId = requireId(r.body, "userId", "machine user create");
+        logInfo(context, "Created machine user {username} ({userId})", {
           username: a.username,
-          userId: r.body.userId,
+          userId,
         });
         const handle = await context.writeResource(
           "user",
-          String(r.body.userId),
+          dataName("user", userId),
           {
-            userId: String(r.body.userId ?? ""),
+            userId,
             username: a.username,
             type: "machine",
             state: "active",
@@ -1892,29 +2081,31 @@ export const model = {
     },
     pat_create: {
       description:
-        "Add a personal access token to a machine user. Returns the token ONCE.",
+        "Add a personal access token to a machine user. Returns the token once.",
       arguments: PatCreateArgs,
       execute: async (
         rawArgs,
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const a = PatCreateArgs.parse(rawArgs);
-        const g = context.globalArgs;
+        const g = globalsOf(context);
         const userId = await resolveMachineUserId(g, a.user);
         const r = await call(g, {
           method: "POST",
           path: mgmt(`/users/${encodeURIComponent(userId)}/pats`),
           body: a.expirationDate ? { expirationDate: a.expirationDate } : {},
         });
-        logInfo(context, "Created PAT", { userId, tokenId: r.body.tokenId });
+        const tokenId = requireId(r.body, "tokenId", "PAT create");
+        logInfo(context, "Created PAT {tokenId} for user {userId}", {
+          userId,
+          tokenId,
+        });
         const handle = await context.writeResource(
           "machine-credential",
-          String(r.body.tokenId),
+          dataName("machine-credential", `pat:${tokenId}`),
           {
             userId,
-            tokenId: typeof r.body.tokenId === "string"
-              ? r.body.tokenId
-              : undefined,
+            tokenId,
             token: typeof r.body.token === "string" ? r.body.token : undefined,
             expirationDate: a.expirationDate,
             action: "created",
@@ -1926,24 +2117,22 @@ export const model = {
     },
     pat_revoke: {
       description:
-        "Revoke a PAT — verify-first: confirms the tokenId belongs to the user before deleting.",
+        "Revoke a PAT. Verify-first: confirms the tokenId belongs to the user before deleting.",
       arguments: PatRevokeArgs,
       execute: async (
         rawArgs,
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const a = PatRevokeArgs.parse(rawArgs);
-        const g = context.globalArgs;
+        const g = globalsOf(context);
         const userId = await resolveMachineUserId(g, a.user);
-        // Verify-first: the tokenId must exist under this user.
-        const list = await call(g, {
-          method: "POST",
-          path: mgmt(`/users/${encodeURIComponent(userId)}/pats/_search`),
-          body: {},
-        });
-        const owned = asArray(list.body.result).some((p) =>
-          String(p.id) === a.tokenId
+        // Verify-first: the tokenId must exist under this user. Every page is
+        // read: one request returns at most the server's query limit.
+        const pats = await searchAll(
+          g,
+          mgmt(`/users/${encodeURIComponent(userId)}/pats/_search`),
         );
+        const owned = pats.some((p) => String(p.id) === a.tokenId);
         if (!owned) {
           throw new Error(
             `PAT ${
@@ -1959,10 +2148,13 @@ export const model = {
             }`,
           ),
         });
-        logInfo(context, "Revoked PAT", { userId, tokenId: a.tokenId });
+        logInfo(context, "Revoked PAT {tokenId} of user {userId}", {
+          userId,
+          tokenId: a.tokenId,
+        });
         const handle = await context.writeResource(
           "machine-credential",
-          a.tokenId,
+          dataName("machine-credential", `pat:${a.tokenId}`),
           {
             userId,
             tokenId: a.tokenId,
@@ -1975,14 +2167,14 @@ export const model = {
     },
     machine_key_create: {
       description:
-        "Add a JSON private key to a machine user. Returns the downloadable key JSON ONCE.",
+        "Add a JSON private key to a machine user. Returns the downloadable key JSON once.",
       arguments: MachineKeyCreateArgs,
       execute: async (
         rawArgs,
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const a = MachineKeyCreateArgs.parse(rawArgs);
-        const g = context.globalArgs;
+        const g = globalsOf(context);
         const userId = await resolveMachineUserId(g, a.user);
         const r = await call(g, {
           method: "POST",
@@ -1992,6 +2184,7 @@ export const model = {
             expirationDate: a.expirationDate,
           },
         });
+        const keyId = requireId(r.body, "keyId", "machine key create");
         // keyDetails comes back base64-encoded; decode to the JSON the operator stores.
         let keyDetails: string | undefined;
         if (typeof r.body.keyDetails === "string") {
@@ -2003,16 +2196,16 @@ export const model = {
             keyDetails = r.body.keyDetails;
           }
         }
-        logInfo(context, "Created machine key", {
+        logInfo(context, "Created machine key {keyId} for user {userId}", {
           userId,
-          keyId: r.body.keyId,
+          keyId,
         });
         const handle = await context.writeResource(
           "machine-credential",
-          String(r.body.keyId),
+          dataName("machine-credential", `key:${keyId}`),
           {
             userId,
-            keyId: typeof r.body.keyId === "string" ? r.body.keyId : undefined,
+            keyId,
             keyDetails,
             expirationDate: a.expirationDate,
             action: "created",
@@ -2024,24 +2217,26 @@ export const model = {
     },
     machine_secret_generate: {
       description:
-        "Generate (rotate) a machine user's client secret. Returns the secret ONCE.",
+        "Generate (rotate) a machine user's client secret. Returns the secret once.",
       arguments: MachineSecretArgs,
       execute: async (
         rawArgs,
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const a = MachineSecretArgs.parse(rawArgs);
-        const g = context.globalArgs;
+        const g = globalsOf(context);
         const userId = await resolveMachineUserId(g, a.user);
         const r = await call(g, {
           method: "PUT",
           path: mgmt(`/users/${encodeURIComponent(userId)}/secret`),
           body: {},
         });
-        logInfo(context, "Generated machine secret", { userId });
+        logInfo(context, "Generated a client secret for user {userId}", {
+          userId,
+        });
         const handle = await context.writeResource(
           "machine-credential",
-          userId,
+          dataName("machine-credential", `secret:${userId}`),
           {
             userId,
             clientId: typeof r.body.clientId === "string"
@@ -2061,15 +2256,15 @@ export const model = {
     // ───────────── reversible lifecycle ─────────────
     app_set_state: {
       description:
-        "Deactivate or reactivate an application (reversible; verify-first). No hard delete.",
+        "Deactivate or reactivate an application (reversible; verify-first; idempotent). No hard delete.",
       arguments: AppSetStateArgs,
       execute: async (
         rawArgs,
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const a = AppSetStateArgs.parse(rawArgs);
-        const g = context.globalArgs;
-        await call(g, {
+        const g = globalsOf(context);
+        const r = await call(g, {
           method: "GET",
           path: mgmt(
             `/projects/${encodeURIComponent(a.projectId)}/apps/${
@@ -2077,60 +2272,97 @@ export const model = {
             }`,
           ),
         });
-        const verb = a.state === "inactive" ? "_deactivate" : "_reactivate";
-        await call(g, {
-          method: "POST",
-          path: mgmt(
-            `/projects/${encodeURIComponent(a.projectId)}/apps/${
-              encodeURIComponent(a.appId)
-            }/${verb}`,
-          ),
-          body: {},
-        });
-        const action: z.infer<typeof Action> = a.state === "inactive"
-          ? "deactivated"
-          : "reactivated";
-        logInfo(context, "Set app state", { appId: a.appId, state: a.state });
-        const handle = await context.writeResource("state-result", a.appId, {
-          kind: "app",
-          id: a.appId,
+        const current = friendlyState((r.body.app as Json | undefined)?.state);
+        let action: z.infer<typeof Action> = "unchanged";
+        // Zitadel refuses to deactivate an inactive app (or reactivate an
+        // active one) with PreconditionFailed, so a re-run would fail.
+        if (current !== a.state) {
+          const verb = a.state === "inactive" ? "_deactivate" : "_reactivate";
+          await call(g, {
+            method: "POST",
+            path: mgmt(
+              `/projects/${encodeURIComponent(a.projectId)}/apps/${
+                encodeURIComponent(a.appId)
+              }/${verb}`,
+            ),
+            body: {},
+          });
+          action = a.state === "inactive" ? "deactivated" : "reactivated";
+        }
+        logInfo(context, "App {appId} is {state}: {action}", {
+          appId: a.appId,
           state: a.state,
           action,
-          timestamp: nowIso(),
         });
+        const handle = await context.writeResource(
+          "state-result",
+          dataName("state-result", `app:${a.appId}`),
+          {
+            kind: "app",
+            id: a.appId,
+            state: a.state,
+            action,
+            timestamp: nowIso(),
+          },
+        );
         return { dataHandles: [handle] };
       },
     },
     user_set_state: {
       description:
-        "Deactivate or reactivate a user (reversible). No hard delete.",
+        "Deactivate or reactivate a user (reversible; verify-first; idempotent). " +
+        "No hard delete. Refuses to deactivate the model's own service user.",
       arguments: UserSetStateArgs,
       execute: async (
         rawArgs,
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const a = UserSetStateArgs.parse(rawArgs);
-        const g = context.globalArgs;
-        const verb = a.state === "inactive" ? "_deactivate" : "_reactivate";
-        await call(g, {
-          method: "POST",
-          path: mgmt(`/users/${encodeURIComponent(a.userId)}/${verb}`),
-          body: {},
+        const g = globalsOf(context);
+        // Zitadel lets a user deactivate itself, and a deactivated service user
+        // cannot sign in again to undo it, so this would lock the model out.
+        const self = parseKeyJson(g.keyJson);
+        if (
+          a.state === "inactive" && a.userId === (self.userId ?? self.clientId)
+        ) {
+          throw new Error(
+            `User ${a.userId} is this model's own service user; refusing to deactivate it`,
+          );
+        }
+        const r = await call(g, {
+          method: "GET",
+          path: mgmt(`/users/${encodeURIComponent(a.userId)}`),
         });
-        const action: z.infer<typeof Action> = a.state === "inactive"
-          ? "deactivated"
-          : "reactivated";
-        logInfo(context, "Set user state", {
+        const current = friendlyState((r.body.user as Json | undefined)?.state);
+        let action: z.infer<typeof Action> = "unchanged";
+        // As for apps, Zitadel answers PreconditionFailed when the user is
+        // already in the target state. Any other state (locked, initial) is
+        // left for Zitadel to accept or refuse.
+        if (current !== a.state) {
+          const verb = a.state === "inactive" ? "_deactivate" : "_reactivate";
+          await call(g, {
+            method: "POST",
+            path: mgmt(`/users/${encodeURIComponent(a.userId)}/${verb}`),
+            body: {},
+          });
+          action = a.state === "inactive" ? "deactivated" : "reactivated";
+        }
+        logInfo(context, "User {userId} is {state}: {action}", {
           userId: a.userId,
           state: a.state,
-        });
-        const handle = await context.writeResource("state-result", a.userId, {
-          kind: "user",
-          id: a.userId,
-          state: a.state,
           action,
-          timestamp: nowIso(),
         });
+        const handle = await context.writeResource(
+          "state-result",
+          dataName("state-result", `user:${a.userId}`),
+          {
+            kind: "user",
+            id: a.userId,
+            state: a.state,
+            action,
+            timestamp: nowIso(),
+          },
+        );
         return { dataHandles: [handle] };
       },
     },
@@ -2144,8 +2376,10 @@ export const model = {
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const a = RoleListArgs.parse(rawArgs);
-        const g = context.globalArgs;
-        logInfo(context, "Listing roles", { projectId: a.projectId });
+        const g = globalsOf(context);
+        logInfo(context, "Listing roles in project {projectId}", {
+          projectId: a.projectId,
+        });
         const result = await searchAll(
           g,
           mgmt(`/projects/${encodeURIComponent(a.projectId)}/roles/_search`),
@@ -2156,7 +2390,7 @@ export const model = {
           handles.push(
             await context.writeResource(
               "role",
-              `${a.projectId}:${String(ro.key ?? "")}`,
+              dataName("role", `${a.projectId}:${String(ro.key ?? "")}`),
               {
                 projectId: a.projectId,
                 key: String(ro.key ?? ""),
@@ -2170,6 +2404,7 @@ export const model = {
             ),
           );
         }
+        logInfo(context, "Listed {count} roles", { count: handles.length });
         return { dataHandles: handles };
       },
     },
@@ -2182,8 +2417,8 @@ export const model = {
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const a = RoleEnsureArgs.parse(rawArgs);
-        const g = context.globalArgs;
-        const projectId = await ensureProjectId(g, a.project);
+        const g = globalsOf(context);
+        const projectId = await ensureProjectId(g, a.project, context);
         const existing = await findRoleByKey(g, projectId, a.key);
         const ts = nowIso();
         let action: z.infer<typeof Action>;
@@ -2205,6 +2440,14 @@ export const model = {
             (typeof existing.group === "string" ? existing.group : "");
           if (sameName && sameGroup) {
             action = "unchanged";
+            logInfo(
+              context,
+              "Role {key} in project {projectId} already matches",
+              {
+                projectId,
+                key: a.key,
+              },
+            );
           } else {
             await call(g, {
               method: "PUT",
@@ -2216,7 +2459,10 @@ export const model = {
               body: { displayName, group: group ?? "" },
             });
             action = "updated";
-            logInfo(context, "Updated role", { projectId, key: a.key });
+            logInfo(context, "Updated role {key} in project {projectId}", {
+              projectId,
+              key: a.key,
+            });
           }
         } else {
           displayName = a.displayName ?? a.key;
@@ -2229,11 +2475,14 @@ export const model = {
             body,
           });
           action = "created";
-          logInfo(context, "Created role", { projectId, key: a.key });
+          logInfo(context, "Created role {key} in project {projectId}", {
+            projectId,
+            key: a.key,
+          });
         }
         const handle = await context.writeResource(
           "role",
-          `${projectId}:${a.key}`,
+          dataName("role", `${projectId}:${a.key}`),
           {
             projectId,
             key: a.key,
@@ -2256,7 +2505,7 @@ export const model = {
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const a = RoleRemoveArgs.parse(rawArgs);
-        const g = context.globalArgs;
+        const g = globalsOf(context);
         const existing = await findRoleByKey(g, a.projectId, a.key);
         if (!existing) {
           throw new Error(
@@ -2273,13 +2522,13 @@ export const model = {
             }`,
           ),
         });
-        logInfo(context, "Removed role", {
+        logInfo(context, "Removed role {key} from project {projectId}", {
           projectId: a.projectId,
           key: a.key,
         });
         const handle = await context.writeResource(
           "role",
-          `${a.projectId}:${a.key}`,
+          dataName("role", `${a.projectId}:${a.key}`),
           {
             projectId: a.projectId,
             key: a.key,
@@ -2298,7 +2547,7 @@ export const model = {
     },
     grant_list: {
       description:
-        "List user grants — which roles users hold on which projects — optionally " +
+        "List user grants (which roles users hold on which projects), optionally " +
         "filtered by user and/or project (factory: one `grant` each). Read-only.",
       arguments: GrantListArgs,
       execute: async (
@@ -2306,7 +2555,7 @@ export const model = {
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const a = GrantListArgs.parse(rawArgs);
-        const g = context.globalArgs;
+        const g = globalsOf(context);
         const queries: Json[] = [];
         if (a.user) {
           const userId = await resolveUserId(g, a.user);
@@ -2315,7 +2564,7 @@ export const model = {
         if (a.projectId) {
           queries.push({ projectIdQuery: { projectId: a.projectId } });
         }
-        logInfo(context, "Listing grants", {
+        logInfo(context, "Listing grants: {*}", {
           user: a.user,
           projectId: a.projectId,
         });
@@ -2330,18 +2579,20 @@ export const model = {
           handles.push(
             await context.writeResource(
               "grant",
-              String(gr.id ?? ""),
+              dataName("grant", String(gr.id ?? "")),
               shapeGrant(gr, "observed", ts),
             ),
           );
         }
+        logInfo(context, "Listed {count} grants", { count: handles.length });
         return { dataHandles: handles };
       },
     },
     grant_ensure: {
       description:
         "Grant a user a set of roles on a project (find-or-create by user+project; " +
-        "converge the role-key set). Idempotent. Note: the roles only appear in the " +
+        "converge the role-key set). Errors if the project doesn't exist. " +
+        "Idempotent. Note: the roles only appear in the " +
         "user's tokens if the project has roleAssertion enabled (see project_authz_set).",
       arguments: GrantEnsureArgs,
       execute: async (
@@ -2349,16 +2600,24 @@ export const model = {
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const a = GrantEnsureArgs.parse(rawArgs);
-        const g = context.globalArgs;
+        const g = globalsOf(context);
         const userId = await resolveUserId(g, a.user);
-        const projectId = await ensureProjectId(g, a.project);
+        // Never creates a project: a grant on a new, role-less project is
+        // almost always a typo in the name.
+        const projectId = await resolveExistingProjectId(g, a.project);
         const existing = await findGrant(g, userId, projectId);
         const ts = nowIso();
         let grantId: string;
         let action: z.infer<typeof Action>;
         let roleKeys: string[];
+        // A new grant is active. An existing one keeps its own state and
+        // display name: converging roles does not reactivate a grant that
+        // grant_set_state deactivated.
+        let state = "active";
+        let displayName: string | undefined;
         if (existing && typeof existing.id === "string") {
           grantId = existing.id;
+          ({ state, displayName } = shapeGrant(existing, "observed", ts));
           const cur = Array.isArray(existing.roleKeys)
             ? existing.roleKeys as string[]
             : [];
@@ -2372,6 +2631,9 @@ export const model = {
             curSorted.every((r, i) => r === want[i])
           ) {
             action = "unchanged";
+            logInfo(context, "Grant {grantId} already holds the roles", {
+              grantId,
+            });
           } else {
             await call(g, {
               method: "PUT",
@@ -2383,7 +2645,11 @@ export const model = {
               body: { roleKeys },
             });
             action = "updated";
-            logInfo(context, "Updated grant", { userId, projectId, grantId });
+            logInfo(context, "Updated grant {grantId}: {*}", {
+              userId,
+              projectId,
+              grantId,
+            });
           }
         } else {
           roleKeys = a.roleKeys ?? [];
@@ -2392,32 +2658,41 @@ export const model = {
             path: mgmt(`/users/${encodeURIComponent(userId)}/grants`),
             body: { projectId, roleKeys },
           });
-          grantId = String(r.body.userGrantId ?? r.body.id ?? "");
+          grantId = requireId(r.body, "userGrantId", "grant create");
           action = "created";
-          logInfo(context, "Created grant", { userId, projectId, grantId });
+          logInfo(context, "Created grant {grantId}: {*}", {
+            userId,
+            projectId,
+            grantId,
+          });
         }
-        const handle = await context.writeResource("grant", grantId, {
-          grantId,
-          userId,
-          projectId,
-          roleKeys,
-          state: "active",
-          action,
-          timestamp: ts,
-        });
+        const handle = await context.writeResource(
+          "grant",
+          dataName("grant", grantId),
+          {
+            grantId,
+            userId,
+            projectId,
+            roleKeys,
+            state,
+            displayName,
+            action,
+            timestamp: ts,
+          },
+        );
         return { dataHandles: [handle] };
       },
     },
     grant_set_state: {
       description:
-        "Deactivate or reactivate a user grant (reversible; verify-first). No hard delete.",
+        "Deactivate or reactivate a user grant (reversible; verify-first; idempotent). No hard delete.",
       arguments: GrantSetStateArgs,
       execute: async (
         rawArgs,
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const a = GrantSetStateArgs.parse(rawArgs);
-        const g = context.globalArgs;
+        const g = globalsOf(context);
         const userId = await resolveUserId(g, a.user);
         // Verify-first: confirm the grant id actually belongs to this user.
         const owned = await searchAll(g, mgmt("/users/grants/_search"), [
@@ -2431,35 +2706,43 @@ export const model = {
             } does not belong to user ${userId}`,
           );
         }
-        const verb = a.state === "inactive" ? "_deactivate" : "_reactivate";
-        await call(g, {
-          method: "POST",
-          path: mgmt(
-            `/users/${encodeURIComponent(userId)}/grants/${
-              encodeURIComponent(a.grantId)
-            }/${verb}`,
-          ),
-          body: {},
-        });
-        const action: z.infer<typeof Action> = a.state === "inactive"
-          ? "deactivated"
-          : "reactivated";
-        logInfo(context, "Set grant state", {
+        // As for apps and users: a grant already in the target state is
+        // reported as unchanged, not as a fresh deactivate/reactivate.
+        let action: z.infer<typeof Action> = "unchanged";
+        if (friendlyState(gr.state) !== a.state) {
+          const verb = a.state === "inactive" ? "_deactivate" : "_reactivate";
+          await call(g, {
+            method: "POST",
+            path: mgmt(
+              `/users/${encodeURIComponent(userId)}/grants/${
+                encodeURIComponent(a.grantId)
+              }/${verb}`,
+            ),
+            body: {},
+          });
+          action = a.state === "inactive" ? "deactivated" : "reactivated";
+        }
+        logInfo(context, "Grant {grantId} is {state}: {action}", {
           userId,
           grantId: a.grantId,
           state: a.state,
+          action,
         });
-        const handle = await context.writeResource("grant", a.grantId, {
-          ...shapeGrant(gr, action, nowIso()),
-          state: a.state,
-        });
+        const handle = await context.writeResource(
+          "grant",
+          dataName("grant", a.grantId),
+          {
+            ...shapeGrant(gr, action, nowIso()),
+            state: a.state,
+          },
+        );
         return { dataHandles: [handle] };
       },
     },
     project_authz_set: {
       description:
-        "Set the authorization flags on an EXISTING project (roleAssertion / " +
-        "roleCheck / hasProjectCheck) — errors if the named project doesn't exist " +
+        "Set the authorization flags on an existing project (roleAssertion / " +
+        "roleCheck / hasProjectCheck); errors if the named project doesn't exist " +
         "(never auto-creates). Fetch-merge: omitted flags are left as-is, and name / " +
         "private-labeling are preserved. Reversible (toggle back). roleAssertion is " +
         "what makes granted roles appear in users' tokens.",
@@ -2469,7 +2752,7 @@ export const model = {
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const a = ProjectAuthzSetArgs.parse(rawArgs);
-        const g = context.globalArgs;
+        const g = globalsOf(context);
         const projectId = await resolveExistingProjectId(g, a.project);
         const cur = (await call(g, {
           method: "GET",
@@ -2491,6 +2774,9 @@ export const model = {
           want.hasProjectCheck === curHasCheck
         ) {
           action = "unchanged";
+          logInfo(context, "Project {projectId} flags already match", {
+            projectId,
+          });
         } else {
           await call(g, {
             method: "PUT",
@@ -2507,18 +2793,25 @@ export const model = {
             },
           });
           action = "updated";
-          logInfo(context, "Set project authz", { projectId, ...want });
+          logInfo(context, "Set project {projectId} flags: {*}", {
+            projectId,
+            ...want,
+          });
         }
-        const handle = await context.writeResource("project", projectId, {
-          id: projectId,
-          name: String(cur.name ?? ""),
-          state: friendlyState(cur.state),
-          roleAssertion: want.roleAssertion,
-          roleCheck: want.roleCheck,
-          hasProjectCheck: want.hasProjectCheck,
-          action,
-          timestamp: ts,
-        });
+        const handle = await context.writeResource(
+          "project",
+          dataName("project", projectId),
+          {
+            id: projectId,
+            name: String(cur.name ?? ""),
+            state: friendlyState(cur.state),
+            roleAssertion: want.roleAssertion,
+            roleCheck: want.roleCheck,
+            hasProjectCheck: want.hasProjectCheck,
+            action,
+            timestamp: ts,
+          },
+        );
         return { dataHandles: [handle] };
       },
     },
@@ -2527,34 +2820,58 @@ export const model = {
 
 // ─────────────────────────── post-model helpers ───────────────────────────
 
-/** Resolve a project reference (name or id) to an id, creating it if a name is absent. */
+/**
+ * Look a project reference up by name, falling back to an id. A project's name
+ * can be all digits (e.g. `2026`), so a name match wins; an all-digit value
+ * that matches no name is taken as an id. Zitadel ids are 18-digit numbers, so
+ * a name that is also another project's id is not a practical concern.
+ * Returns null for a non-numeric value that matches no name.
+ */
+async function lookupProjectId(
+  g: GlobalArgsT,
+  project: string,
+): Promise<string | null> {
+  const existing = await findProjectByName(g, project);
+  if (existing && typeof existing.id === "string") return existing.id;
+  return looksLikeId(project) ? project : null;
+}
+
+/**
+ * Resolve a project reference (name or id) to an id, creating the project when
+ * no project has that name. The creation is logged because it is a side effect
+ * of a method that is about something else (an app or a role).
+ */
 async function ensureProjectId(
   g: GlobalArgsT,
   project: string,
+  context: Pick<Ctx, "logger">,
 ): Promise<string> {
-  if (looksLikeId(project)) return project;
-  const existing = await findProjectByName(g, project);
-  if (existing && typeof existing.id === "string") return existing.id;
+  const id = await lookupProjectId(g, project);
+  if (id !== null) return id;
   const r = await call(g, {
     method: "POST",
     path: mgmt("/projects"),
     body: { name: project },
   });
-  return String(r.body.id ?? "");
+  const created = requireId(r.body, "id", "project create");
+  logInfo(context, "Created project {name} ({id}): no project had that name", {
+    name: project,
+    id: created,
+  });
+  return created;
 }
 
 /**
- * Resolve a project reference (name or id) to an id WITHOUT creating it. Throws
+ * Resolve a project reference (name or id) to an id without creating it. Throws
  * if a supplied name doesn't resolve. Used by methods that configure an existing
- * project (e.g. `project_authz_set`), where auto-creating on a typo would be a
- * surprising side effect.
+ * project (`project_authz_set`, `grant_ensure`), where auto-creating on a typo
+ * would be a surprising side effect.
  */
 async function resolveExistingProjectId(
   g: GlobalArgsT,
   project: string,
 ): Promise<string> {
-  if (looksLikeId(project)) return project;
-  const existing = await findProjectByName(g, project);
-  if (existing && typeof existing.id === "string") return existing.id;
+  const id = await lookupProjectId(g, project);
+  if (id !== null) return id;
   throw new Error(`No project named ${JSON.stringify(project)}`);
 }

@@ -3,8 +3,9 @@
  * the JWT assertion claims, find-or-create idempotency, the friendly→Zitadel enum
  * mapping sent on the wire, the verify-first PAT-revoke guard, secret-once output
  * shape, the role/grant authorization methods (incl. project_authz_set's no-auto-
- * create), and the single-exception hard-delete guarantee (only role_remove). No
- * live server: the API caller is faked via the __setCaller seam.
+ * create), and the hard-delete guarantee (only role_remove and pat_revoke delete).
+ * The API caller is faked via the __setCaller seam; the few tests of the real
+ * HTTP path stub `fetch`. No live server.
  */
 import {
   __setCaller,
@@ -64,14 +65,26 @@ function makeFakeApi(
   return { caller, calls };
 }
 
-function makeContext() {
+/** One logged line: the level, the message template and its properties. */
+type Logged = { level: string; message: string; props: unknown };
+
+function makeContext(globalArgs: Record<string, unknown> = GLOBALS) {
   const written: Array<
     { specName: string; name: string; data: Record<string, unknown> }
   > = [];
-  const noop = () => {};
+  // Records every log line, so tests can check what was (and was not) logged.
+  const logs: Logged[] = [];
+  const record = (level: string) => (message: string, props?: unknown) => {
+    logs.push({ level, message, props });
+  };
   const context = {
-    globalArgs: GLOBALS,
-    logger: { info: noop, debug: noop, warning: noop, error: noop },
+    globalArgs,
+    logger: {
+      info: record("info"),
+      debug: record("debug"),
+      warn: record("warn"),
+      error: record("error"),
+    },
     writeResource: (
       specName: string,
       name: string,
@@ -82,7 +95,7 @@ function makeContext() {
       return Promise.resolve(h);
     },
   };
-  return { context, written };
+  return { context, written, logs };
 }
 
 type MethodDef = {
@@ -211,19 +224,6 @@ Deno.test("project_list: pages through all results (100 + short page)", async ()
   }
 });
 
-Deno.test("model: role_remove is the ONLY hard-delete; reversible-only otherwise", () => {
-  const names = Object.keys(model.methods);
-  const deletish = names.filter((n) => /delete|destroy|remove/i.test(n));
-  assertEquals(
-    deletish,
-    ["role_remove"],
-    "role_remove is the single, deliberate hard-delete (roles have no deactivate state)",
-  );
-  assert(names.includes("app_set_state"));
-  assert(names.includes("user_set_state"));
-  assert(names.includes("grant_set_state"));
-});
-
 Deno.test("project_ensure: creates when absent, returns created", async () => {
   const { caller, calls } = makeFakeApi((c) => {
     if (c.path.endsWith("/projects/_search")) return { result: [] };
@@ -245,7 +245,7 @@ Deno.test("project_ensure: creates when absent, returns created", async () => {
   }
 });
 
-Deno.test("project_ensure: idempotent — returns unchanged when present", async () => {
+Deno.test("project_ensure: idempotent, returns unchanged when present", async () => {
   const { caller, calls } = makeFakeApi((c) => {
     if (c.path.endsWith("/projects/_search")) {
       return { result: [{ id: "p9", name: "homelab" }] };
@@ -488,7 +488,7 @@ Deno.test("oidc_app_ensure: a new app gets the defaults for fields left out", as
 });
 
 // Same bug class as forgejo issue #4. Zitadel's update replaces every field,
-// so a re-run must carry over what it was not given — including fields this
+// so a re-run must carry over what it was not given, including fields this
 // method does not model, such as role assertions.
 Deno.test("oidc_app_ensure: an existing app keeps every field that was not passed", async () => {
   const current = {
@@ -618,7 +618,9 @@ Deno.test("app_secret_rotate: verify-first GET then regenerate, secret once", as
   const seen: string[] = [];
   const { caller } = makeFakeApi((c) => {
     seen.push(`${c.method} ${c.path}`);
-    if (c.method === "GET") return { app: { id: "a1" } };
+    if (c.method === "GET") {
+      return { app: { id: "a1", oidcConfig: { clientId: "cid" } } };
+    }
     if (c.path.endsWith("/_generate_client_secret")) {
       return { clientId: "cid", clientSecret: "new-secret" };
     }
@@ -643,7 +645,7 @@ Deno.test("app_secret_rotate: verify-first GET then regenerate, secret once", as
 
 Deno.test("app_get: normalizes proto3-omitted OIDC defaults (web/bearer/false)", async () => {
   // Zitadel omits zero-value fields: a default web app comes back with appType,
-  // accessTokenType and devMode ABSENT. The read shape must show effective values.
+  // accessTokenType and devMode absent. The read shape must show effective values.
   const { caller } = makeFakeApi((c) => {
     if (c.method === "GET") {
       return {
@@ -746,6 +748,53 @@ Deno.test("app_get: leaves OIDC-only fields undefined for an API app", async () 
   }
 });
 
+// BASIC is enum value 0 for both OIDC and API apps, so Zitadel omits it.
+Deno.test("app_get: reads an omitted authMethodType as basic", async () => {
+  for (
+    const config of [
+      { oidcConfig: { clientId: "cid" } },
+      { apiConfig: { clientId: "cid" } },
+    ]
+  ) {
+    const { caller } = makeFakeApi((c) =>
+      c.method === "GET"
+        ? { app: { id: "a1", state: "APP_STATE_ACTIVE", ...config } }
+        : undefined
+    );
+    __setCaller(caller);
+    try {
+      const { context, written } = makeContext();
+      await method("app_get").execute(
+        { projectId: "p1", appId: "a1" },
+        context,
+      );
+      assertEquals(
+        written[0].data.authMethod,
+        "basic",
+        String(written[0].data.kind),
+      );
+    } finally {
+      __setCaller(null);
+    }
+  }
+});
+
+Deno.test("app_get: leaves authMethod undefined for a SAML app", async () => {
+  const { caller } = makeFakeApi((c) =>
+    c.method === "GET"
+      ? { app: { id: "a1", state: "APP_STATE_ACTIVE", samlConfig: {} } }
+      : undefined
+  );
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("app_get").execute({ projectId: "p1", appId: "a1" }, context);
+    assertEquals(written[0].data.authMethod, undefined);
+  } finally {
+    __setCaller(null);
+  }
+});
+
 Deno.test("pat_revoke: refuses when tokenId not owned by user", async () => {
   const { caller, calls } = makeFakeApi((c) => {
     if (c.path.endsWith("/pats/_search")) return { result: [{ id: "OTHER" }] };
@@ -828,7 +877,9 @@ Deno.test("machine_key_create: decodes base64 keyDetails to JSON", async () => {
 });
 
 Deno.test("user_set_state: inactive hits _deactivate and reports deactivated", async () => {
-  const { caller, calls } = makeFakeApi(() => ({}));
+  const { caller, calls } = makeFakeApi((c) =>
+    c.method === "GET" ? { user: { id: "u1", state: "USER_STATE_ACTIVE" } } : {}
+  );
   __setCaller(caller);
   try {
     const { context, written } = makeContext();
@@ -840,6 +891,72 @@ Deno.test("user_set_state: inactive hits _deactivate and reports deactivated", a
     assertEquals(written[0].data.action, "deactivated");
   } finally {
     __setCaller(null);
+  }
+});
+
+// Zitadel answers PreconditionFailed when the target already has the requested
+// state, so a re-run must not send the POST.
+Deno.test("user_set_state: unchanged (no POST) when the user is already inactive", async () => {
+  const { caller, calls } = makeFakeApi((c) =>
+    c.method === "GET"
+      ? { user: { id: "u1", state: "USER_STATE_INACTIVE" } }
+      : {}
+  );
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("user_set_state").execute(
+      { userId: "u1", state: "inactive" },
+      context,
+    );
+    assertEquals(calls.map((c) => c.method), ["GET"]);
+    assertEquals(written[0].data.action, "unchanged");
+    assertEquals(written[0].data.state, "inactive");
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("app_set_state: deactivates an active app", async () => {
+  const { caller, calls } = makeFakeApi((c) =>
+    c.method === "GET" ? { app: { id: "a1", state: "APP_STATE_ACTIVE" } } : {}
+  );
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("app_set_state").execute(
+      { projectId: "p1", appId: "a1", state: "inactive" },
+      context,
+    );
+    assert(calls.some((c) => c.path.endsWith("/apps/a1/_deactivate")));
+    assertEquals(written[0].data.action, "deactivated");
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("app_set_state: unchanged (no POST) when the app already has the state", async () => {
+  for (
+    const [live, wanted] of [
+      ["APP_STATE_INACTIVE", "inactive"],
+      ["APP_STATE_ACTIVE", "active"],
+    ]
+  ) {
+    const { caller, calls } = makeFakeApi((c) =>
+      c.method === "GET" ? { app: { id: "a1", state: live } } : {}
+    );
+    __setCaller(caller);
+    try {
+      const { context, written } = makeContext();
+      await method("app_set_state").execute(
+        { projectId: "p1", appId: "a1", state: wanted },
+        context,
+      );
+      assertEquals(calls.map((c) => c.method), ["GET"], wanted);
+      assertEquals(written[0].data.action, "unchanged", wanted);
+    } finally {
+      __setCaller(null);
+    }
   }
 });
 
@@ -893,7 +1010,7 @@ Deno.test("role_ensure: creates a role with roleKey when absent", async () => {
   }
 });
 
-Deno.test("role_ensure: idempotent — unchanged when key/displayName/group match", async () => {
+Deno.test("role_ensure: idempotent, unchanged when key/displayName/group match", async () => {
   const { caller, calls } = makeFakeApi((c) => {
     if (c.path.endsWith("/projects/_search")) {
       return { result: [{ id: "p1", name: "homelab" }] };
@@ -921,7 +1038,7 @@ Deno.test("role_ensure: idempotent — unchanged when key/displayName/group matc
   }
 });
 
-Deno.test("role_remove: verify-first — refuses (no DELETE) when role is absent", async () => {
+Deno.test("role_remove: verify-first, refuses (no DELETE) when role is absent", async () => {
   const { caller, calls } = makeFakeApi((c) => {
     if (c.path.endsWith("/roles/_search")) return { result: [] };
   });
@@ -1149,6 +1266,38 @@ Deno.test("grant_set_state: deactivates an owned grant and reports deactivated",
   }
 });
 
+Deno.test("grant_set_state: a grant already in the target state is unchanged", async () => {
+  const { caller, calls } = makeFakeApi((c) => {
+    if (c.path.endsWith("/users/grants/_search")) {
+      return {
+        result: [{
+          id: "g1",
+          userId: "500",
+          projectId: "p1",
+          roleKeys: ["a"],
+          state: "USER_GRANT_STATE_INACTIVE",
+        }],
+      };
+    }
+  });
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("grant_set_state").execute(
+      { user: "500", grantId: "g1", state: "inactive" },
+      context,
+    );
+    assert(
+      !calls.some((c) => c.path.includes("_deactivate")),
+      "must not deactivate an inactive grant again",
+    );
+    assertEquals(written[0].data.action, "unchanged");
+    assertEquals(written[0].data.state, "inactive");
+  } finally {
+    __setCaller(null);
+  }
+});
+
 Deno.test("project_authz_set: refuses to auto-create on an unknown project name", async () => {
   const { caller, calls } = makeFakeApi((c) => {
     if (c.path.endsWith("/projects/_search")) return { result: [] };
@@ -1338,7 +1487,9 @@ Deno.test("reachable check applies the schema defaults to globalArgs", async () 
 
 // ─────────────────────────── strict booleans ───────────────────────────
 
-Deno.test("boolean arguments reject anything but true/false", () => {
+// Plain z.boolean() keeps the JSON Schema; the CLI coerces --input x=true
+// before the schema sees it, so the schema itself sees only real booleans.
+Deno.test("boolean arguments accept only real booleans", () => {
   const schema = (model.methods as unknown as Record<string, {
     arguments: {
       safeParse: (v: unknown) => {
@@ -1351,10 +1502,10 @@ Deno.test("boolean arguments reject anything but true/false", () => {
     const r = schema.safeParse({ devMode: v });
     return (r.error?.issues ?? []).some((i) => i.path[0] === "devMode");
   };
-  for (const bad of ["0", "1", "False", "True", "yes", null]) {
+  for (const bad of ["true", "false", "0", "1", "False", "yes", null]) {
     assert(fieldFails(bad), `devMode=${JSON.stringify(bad)} must be rejected`);
   }
-  for (const good of [true, false, "true", "false"]) {
+  for (const good of [true, false]) {
     assert(
       !fieldFails(good),
       `devMode=${JSON.stringify(good)} must be accepted`,
@@ -1418,7 +1569,7 @@ Deno.test("grant_list: a user can be named by login name", async () => {
 });
 
 Deno.test("grant_list: a machine username still resolves when no login name matches", async () => {
-  const { caller } = makeFakeApi((c) => {
+  const { caller, calls } = makeFakeApi((c) => {
     if (c.path.endsWith("/users/_search")) {
       const byLoginName = JSON.stringify(c.body).includes("loginNameQuery");
       return byLoginName ? { result: [] } : {
@@ -1431,6 +1582,727 @@ Deno.test("grant_list: a machine username still resolves when no login name matc
   try {
     const { context } = makeContext();
     await method("grant_list").execute({ user: "smoke-bot" }, context);
+    const grants = calls.find((c) => c.path.endsWith("/users/grants/_search"));
+    assert(
+      JSON.stringify(grants?.body).includes("900"),
+      "filters on the machine user's id",
+    );
+  } finally {
+    __setCaller(null);
+  }
+});
+
+// ─────────────────────────── data names ───────────────────────────
+
+// swamp keys data by model + name, not spec: a user record must never replace
+// the client secret generated for the same user id.
+Deno.test("data names: a user and its client secret get distinct names", async () => {
+  const { caller } = makeFakeApi((c) => {
+    if (c.path.endsWith("/users/900/secret")) {
+      return { clientId: "ci", clientSecret: "s3cret" };
+    }
+    if (c.path.endsWith("/users/_search")) {
+      return {
+        result: [{ id: "900", userName: "ci", machine: { name: "CI" } }],
+        details: { totalResult: "1" },
+      };
+    }
+  });
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("machine_secret_generate").execute({ user: "900" }, context);
+    await method("user_list").execute({ type: "machine" }, context);
+    assertEquals(written.map((w) => w.name), [
+      "machine-credential:secret:900",
+      "user:900",
+    ]);
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("data names: role keys are escaped so distinct keys never collide", async () => {
+  const keys = ["a/b", "a%2Fb", "a..b", "a.b", "a\\b"];
+  const { caller } = makeFakeApi((c) => {
+    if (c.path.endsWith("/roles/_search")) {
+      return {
+        result: keys.map((key) => ({ key })),
+        details: { totalResult: String(keys.length) },
+      };
+    }
+  });
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("role_list").execute({ projectId: "300" }, context);
+    const names = written.map((w) => w.name);
+    assertEquals(names, [
+      "role:300:a%2Fb",
+      "role:300:a%252Fb",
+      "role:300:a.%2Eb",
+      "role:300:a.b",
+      "role:300:a%5Cb",
+    ]);
+    for (const n of names) {
+      assert(!/[\/\\\0]|\.\./.test(n), `${n} is a valid swamp data name`);
+    }
+  } finally {
+    __setCaller(null);
+  }
+});
+
+// ─────────────────────────── hard deletes ───────────────────────────
+
+// Arguments that let every method run to completion against `everythingApi`.
+// The table must name every method, so a new method cannot skip this check.
+const RUN_ALL_ARGS: Record<string, Record<string, unknown>> = {
+  org_get: {},
+  project_list: {},
+  app_list: { projectId: "1" },
+  app_get: { projectId: "1", appId: "1" },
+  oidc_app_redirect_set: { projectId: "1", appId: "1", add: ["https://x"] },
+  user_list: {},
+  manager_audit: {},
+  project_ensure: { name: "n" },
+  oidc_app_ensure: { project: "1", name: "n", devMode: true },
+  api_app_ensure: { project: "1", name: "n" },
+  app_secret_rotate: { projectId: "1", appId: "1" },
+  machine_user_ensure: { username: "n", name: "n" },
+  pat_create: { user: "1" },
+  pat_revoke: { user: "1", tokenId: "1" },
+  machine_key_create: { user: "1" },
+  machine_secret_generate: { user: "1" },
+  app_set_state: { projectId: "1", appId: "1", state: "inactive" },
+  user_set_state: { userId: "1", state: "inactive" },
+  role_list: { projectId: "1" },
+  role_ensure: { project: "1", key: "k" },
+  role_remove: { projectId: "1", key: "k" },
+  grant_list: {},
+  grant_ensure: { user: "1", project: "1", roleKeys: ["k", "j"] },
+  grant_set_state: { user: "1", grantId: "1", state: "inactive" },
+  project_authz_set: { project: "1", roleAssertion: true },
+};
+
+/** A fake API where every lookup finds one object matching the args above. */
+function everythingApi() {
+  const item = {
+    id: "1",
+    name: "n",
+    key: "k",
+    userId: "1",
+    projectId: "1",
+    userName: "n",
+    roleKeys: ["k"],
+    state: "STATE_ACTIVE",
+    machine: { name: "n" },
+    oidcConfig: { clientId: "c" },
+    apiConfig: { clientId: "c" },
+  };
+  return makeFakeApi(() => ({
+    result: [item],
+    details: { totalResult: "1" },
+    app: item,
+    user: item,
+    project: item,
+    org: item,
+    id: "1",
+    appId: "1",
+    userId: "1",
+    tokenId: "1",
+    keyId: "1",
+    userGrantId: "1",
+  }));
+}
+
+Deno.test("model: only role_remove and pat_revoke send a DELETE", async () => {
+  assertEquals(
+    Object.keys(RUN_ALL_ARGS).sort(),
+    Object.keys(model.methods).sort(),
+    "the table covers every method",
+  );
+  const deleting: string[] = [];
+  for (const [name, args] of Object.entries(RUN_ALL_ARGS)) {
+    const { caller, calls } = everythingApi();
+    __setCaller(caller);
+    try {
+      await method(name).execute(args, makeContext().context);
+    } finally {
+      __setCaller(null);
+    }
+    if (calls.some((c) => c.method === "DELETE")) deleting.push(name);
+  }
+  assertEquals(deleting.sort(), ["pat_revoke", "role_remove"]);
+});
+
+// ─────────────────────────── stage-3 fixes ───────────────────────────
+
+Deno.test("project_list: an omitted authorization flag reads false", async () => {
+  const { caller } = makeFakeApi((c) => {
+    if (c.path.endsWith("/projects/_search")) {
+      return {
+        result: [{ id: "1", name: "p", projectRoleAssertion: true }],
+        details: { totalResult: "1" },
+      };
+    }
+  });
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("project_list").execute({}, context);
+    assertEquals(written[0].data.roleAssertion, true);
+    assertEquals(written[0].data.roleCheck, false);
+    assertEquals(written[0].data.hasProjectCheck, false);
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("api_app_ensure: refuses a name that is an OIDC app", async () => {
+  const { caller, calls } = makeFakeApi((c) => {
+    if (c.path.endsWith("/apps/_search")) {
+      return { result: [{ id: "a1", name: "web", oidcConfig: {} }] };
+    }
+  });
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await rejects(
+      () =>
+        method("api_app_ensure").execute(
+          { project: "1", name: "web" },
+          context,
+        ),
+      /not an API app/,
+    );
+    assertEquals(written.length, 0);
+    assertEquals(calls.filter((c) => c.path.endsWith("/apps/api")).length, 0);
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("oidc_app_ensure: refuses a name that is an API app (no PUT)", async () => {
+  const { caller, calls } = makeFakeApi((c) => {
+    if (c.path.endsWith("/apps/_search")) {
+      return { result: [{ id: "a1", name: "api", apiConfig: {} }] };
+    }
+  });
+  __setCaller(caller);
+  try {
+    const { context } = makeContext();
+    await rejects(
+      () =>
+        method("oidc_app_ensure").execute(
+          { project: "1", name: "api", devMode: true },
+          context,
+        ),
+      /not an OIDC app/,
+    );
+    assert(!calls.some((c) => c.method === "PUT"), "nothing written");
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("api_app_ensure: creates with the jwt default and returns the id", async () => {
+  let body: unknown;
+  const { caller } = makeFakeApi((c) => {
+    if (c.path.endsWith("/apps/_search")) return { result: [] };
+    if (c.path.endsWith("/apps/api")) {
+      body = c.body;
+      return { appId: "a7", clientId: "cid" };
+    }
+  });
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("api_app_ensure").execute(
+      { project: "1", name: "m2m" },
+      context,
+    );
+    assertEquals(body, {
+      name: "m2m",
+      authMethodType: "API_AUTH_METHOD_TYPE_PRIVATE_KEY_JWT",
+    });
+    assertEquals(written[0].name, "app-credential:a7");
+    assertEquals(written[0].data.action, "created");
+    assertEquals(written[0].data.kind, "api");
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("app_secret_rotate: takes the kind from the app (API app, no kind passed)", async () => {
+  const { caller, calls } = makeFakeApi((c) => {
+    if (c.method === "GET") return { app: { id: "a1", apiConfig: {} } };
+    return { clientId: "cid", clientSecret: "s" };
+  });
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("app_secret_rotate").execute(
+      { projectId: "1", appId: "a1" },
+      context,
+    );
+    assert(
+      calls.some((c) => c.path.endsWith("/api_config/_generate_client_secret")),
+    );
+    assertEquals(written[0].data.kind, "api");
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("app_secret_rotate: a kind that does not match the app is refused", async () => {
+  const { caller, calls } = makeFakeApi((c) => {
+    if (c.method === "GET") return { app: { id: "a1", apiConfig: {} } };
+  });
+  __setCaller(caller);
+  try {
+    const { context } = makeContext();
+    await rejects(
+      () =>
+        method("app_secret_rotate").execute(
+          { projectId: "1", appId: "a1", kind: "oidc" },
+          context,
+        ),
+      /is an api app, not oidc/,
+    );
+    assertEquals(calls.filter((c) => c.method === "POST").length, 0);
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("pat_revoke: finds a token beyond the first page", async () => {
+  const page1 = Array.from({ length: 100 }, (_, i) => ({ id: `t${i}` }));
+  const { caller, calls } = makeFakeApi((c) => {
+    if (c.path.endsWith("/pats/_search")) {
+      const off = (c.body as { query: { offset: number } }).query.offset;
+      return {
+        result: off === 0 ? page1 : [{ id: "t100" }],
+        details: { totalResult: "101" },
+      };
+    }
+  });
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("pat_revoke").execute(
+      { user: "900", tokenId: "t100" },
+      context,
+    );
+    assert(calls.some((c) => c.method === "DELETE"), "revoked");
+    assertEquals(written[0].data.action, "revoked");
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("grant_ensure: an existing deactivated grant keeps its state", async () => {
+  const { caller } = makeFakeApi((c) => {
+    if (c.path.endsWith("/users/grants/_search")) {
+      return {
+        result: [{
+          id: "g1",
+          userId: "700",
+          projectId: "300",
+          roleKeys: ["a"],
+          state: "USER_GRANT_STATE_INACTIVE",
+          displayName: "Alice",
+        }],
+      };
+    }
+  });
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("grant_ensure").execute(
+      { user: "700", project: "300", roleKeys: ["a", "b"] },
+      context,
+    );
+    assertEquals(written[0].data.action, "updated");
+    assertEquals(written[0].data.state, "inactive");
+    assertEquals(written[0].data.displayName, "Alice");
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("role_ensure: logs a project it creates for an unknown name", async () => {
+  const { caller } = makeFakeApi((c) => {
+    if (c.path.endsWith("/projects/_search")) return { result: [] };
+    if (c.method === "POST" && c.path.endsWith("/projects")) {
+      return { id: "300" };
+    }
+  });
+  __setCaller(caller);
+  try {
+    const { context, logs } = makeContext();
+    await method("role_ensure").execute(
+      { project: "homelba", key: "admin" },
+      context,
+    );
+    assert(
+      logs.some((l) =>
+        l.message.startsWith("Created project") &&
+        JSON.stringify(l.props).includes("homelba")
+      ),
+      "the implicit project creation is logged",
+    );
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("create methods fail when Zitadel returns no id", async () => {
+  const { caller } = makeFakeApi((c) => {
+    if (c.path.endsWith("/_search")) return { result: [] };
+    return {};
+  });
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await rejects(
+      () => method("project_ensure").execute({ name: "p" }, context),
+      /project create returned no id/,
+    );
+    await rejects(
+      () => method("pat_create").execute({ user: "900" }, context),
+      /PAT create returned no tokenId/,
+    );
+    await rejects(
+      () =>
+        method("grant_ensure").execute(
+          { user: "700", project: "300" },
+          context,
+        ),
+      /grant create returned no userGrantId/,
+    );
+    assertEquals(written.length, 0);
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("user_set_state: refuses to deactivate the model's own service user", async () => {
+  // GLOBALS' keyJson belongs to user u123.
+  const { caller, calls } = makeFakeApi(() => ({
+    user: { state: "USER_STATE_ACTIVE" },
+  }));
+  __setCaller(caller);
+  try {
+    const { context } = makeContext();
+    await rejects(
+      () =>
+        method("user_set_state").execute(
+          { userId: "u123", state: "inactive" },
+          context,
+        ),
+      /own service user/,
+    );
+    assertEquals(calls.length, 0);
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("a plain-http apiUrl logs a warning; https does not", async () => {
+  const { caller } = makeFakeApi(() => ({ org: { id: "1", name: "o" } }));
+  __setCaller(caller);
+  try {
+    const http = makeContext({ ...GLOBALS, apiUrl: "http://zitadel.lan" });
+    await method("org_get").execute({}, http.context);
+    assert(http.logs.some((l) => l.level === "warn"), "warned for http");
+    const https = makeContext();
+    await method("org_get").execute({}, https.context);
+    assert(!https.logs.some((l) => l.level === "warn"), "quiet for https");
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("httpTimeoutMs must be positive", () => {
+  const schema = model.globalArguments;
+  const base = { apiUrl: GLOBALS.apiUrl, keyJson: GLOBALS.keyJson };
+  assert(!schema.safeParse({ ...base, httpTimeoutMs: 0 }).success, "0");
+  assert(!schema.safeParse({ ...base, httpTimeoutMs: -5 }).success, "-5");
+  assert(schema.safeParse({ ...base, httpTimeoutMs: 1 }).success, "1");
+});
+
+// ─────────────────────────── untested methods ───────────────────────────
+
+Deno.test("org_get: records the org", async () => {
+  const { caller } = makeFakeApi(() => ({
+    org: {
+      id: "1",
+      name: "Home",
+      state: "ORG_STATE_ACTIVE",
+      primaryDomain: "home.example.com",
+    },
+  }));
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("org_get").execute({}, context);
+    assertEquals(written[0].name, "org:1");
+    assertEquals(written[0].data.state, "active");
+    assertEquals(written[0].data.primaryDomain, "home.example.com");
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("user_list: filters by type, shapes both kinds, logs a count", async () => {
+  const { caller, calls } = makeFakeApi(() => ({
+    result: [
+      { id: "1", userName: "bot", machine: { name: "Bot" } },
+      { id: "2", userName: "al", human: { profile: { displayName: "Al" } } },
+    ],
+    details: { totalResult: "2" },
+  }));
+  __setCaller(caller);
+  try {
+    const { context, written, logs } = makeContext();
+    await method("user_list").execute({ type: "machine" }, context);
+    assert(JSON.stringify(calls[0].body).includes("TYPE_MACHINE"));
+    assertEquals(written.map((w) => [w.data.type, w.data.displayName]), [
+      ["machine", "Bot"],
+      ["human", "Al"],
+    ]);
+    assert(
+      logs.some((l) => (l.props as { count?: number }).count === 2),
+      "completion count logged",
+    );
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("manager_audit: records each manager's roles", async () => {
+  const { caller } = makeFakeApi(() => ({
+    result: [{ userId: "1", displayName: "Root", roles: ["ORG_OWNER"] }],
+    details: { totalResult: "1" },
+  }));
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("manager_audit").execute({}, context);
+    assertEquals(written[0].name, "manager:1");
+    assertEquals(written[0].data.roles, ["ORG_OWNER"]);
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("machine_secret_generate: returns the secret once under its own name", async () => {
+  const { caller, calls } = makeFakeApi(() => ({
+    clientId: "ci",
+    clientSecret: "s3cret",
+  }));
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("machine_secret_generate").execute({ user: "900" }, context);
+    assertEquals(calls[0].method, "PUT");
+    assertEquals(written[0].name, "machine-credential:secret:900");
+    assertEquals(written[0].data.clientSecret, "s3cret");
+    assertEquals(written[0].data.action, "rotated");
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("no secret a method mints ever reaches the logger", async () => {
+  const secret = "SECRET-VALUE-do-not-log";
+  const { caller } = makeFakeApi((c) => {
+    if (c.path.endsWith("/_search")) return { result: [] };
+    if (c.method === "GET") return { app: { id: "1", oidcConfig: {} } };
+    return {
+      appId: "1",
+      tokenId: "1",
+      keyId: "1",
+      clientId: "c",
+      clientSecret: secret,
+      token: secret,
+      keyDetails: btoa(secret),
+    };
+  });
+  __setCaller(caller);
+  try {
+    const { context, logs } = makeContext();
+    const runs: [string, Record<string, unknown>][] = [
+      ["oidc_app_ensure", { project: "1", name: "n" }],
+      ["api_app_ensure", { project: "1", name: "n", authMethod: "basic" }],
+      ["app_secret_rotate", { projectId: "1", appId: "1" }],
+      ["pat_create", { user: "900" }],
+      ["machine_key_create", { user: "900" }],
+      ["machine_secret_generate", { user: "900" }],
+    ];
+    for (const [name, args] of runs) await method(name).execute(args, context);
+    assert(logs.length > 0, "the methods did log");
+    for (const l of logs) {
+      assert(
+        !JSON.stringify(l).includes(secret),
+        `logged a secret: ${l.message}`,
+      );
+    }
+  } finally {
+    __setCaller(null);
+  }
+});
+
+// ─────────────────────────── real HTTP path ───────────────────────────
+
+/** A real RSA key, so getToken can sign; a fresh keyId skips the token cache. */
+async function realKeyJson(): Promise<string> {
+  const kp = await crypto.subtle.generateKey(
+    {
+      name: "RSASSA-PKCS1-v1_5",
+      modulusLength: 2048,
+      publicExponent: new Uint8Array([1, 0, 1]),
+      hash: "SHA-256",
+    },
+    true,
+    ["sign", "verify"],
+  ) as CryptoKeyPair;
+  const pem = derToPem(
+    new Uint8Array(await crypto.subtle.exportKey("pkcs8", kp.privateKey)),
+    "PRIVATE KEY",
+  );
+  return JSON.stringify({ keyId: crypto.randomUUID(), key: pem, userId: "u1" });
+}
+
+/** Run org_get through the real caller with `fetch` replaced by `fake`. */
+async function orgGetWithFetch(
+  fake: typeof fetch,
+  extra: Record<string, unknown> = {},
+): Promise<unknown> {
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = fake;
+  try {
+    const { context } = makeContext({
+      ...GLOBALS,
+      keyJson: await realKeyJson(),
+      ...extra,
+    });
+    return await method("org_get").execute({}, context);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+}
+
+const tokenOk = () =>
+  new Response(JSON.stringify({ access_token: "t", expires_in: 60 }));
+
+Deno.test("realCaller: a non-JSON token response gives a clear error", async () => {
+  await rejects(
+    () =>
+      orgGetWithFetch(() =>
+        Promise.resolve(new Response("<html>login</html>", { status: 200 }))
+      ),
+    /token exchange returned non-JSON/,
+  );
+});
+
+Deno.test("realCaller: an API error carries method, path, status and message", async () => {
+  await rejects(
+    () =>
+      orgGetWithFetch((url) =>
+        Promise.resolve(
+          String(url).endsWith("/oauth/v2/token") ? tokenOk() : new Response(
+            JSON.stringify({ message: "org not found" }),
+            { status: 404 },
+          ),
+        )
+      ),
+    /^Zitadel API GET \/management\/v1\/orgs\/me -> HTTP 404: org not found$/,
+  );
+});
+
+Deno.test("realCaller: the timeout also covers a stalled response body", async () => {
+  // Headers arrive at once; the body never does, unless the request is aborted.
+  const stalled: typeof fetch = (url, init) => {
+    if (String(url).endsWith("/oauth/v2/token")) {
+      return Promise.resolve(tokenOk());
+    }
+    const body = new ReadableStream({
+      start(ctrl) {
+        init?.signal?.addEventListener("abort", () => {
+          ctrl.error(new DOMException("aborted", "AbortError"));
+        });
+      },
+    });
+    return Promise.resolve(new Response(body));
+  };
+  let guard: ReturnType<typeof setTimeout> | undefined;
+  const hang = new Promise<string>((resolve) => {
+    guard = setTimeout(() => resolve("hung"), 2000);
+  });
+  try {
+    const outcome = await Promise.race([
+      orgGetWithFetch(stalled, { httpTimeoutMs: 50 }).then(
+        () => "resolved",
+        () => "aborted",
+      ),
+      hang,
+    ]);
+    assertEquals(outcome, "aborted");
+  } finally {
+    clearTimeout(guard);
+  }
+});
+
+// ─────────────────────────── project references ───────────────────────────
+
+Deno.test("grant_ensure: an unknown project name fails and creates nothing", async () => {
+  const { caller, calls } = makeFakeApi((c) => {
+    if (c.path.endsWith("/_search")) return { result: [] };
+  });
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await rejects(
+      () =>
+        method("grant_ensure").execute(
+          { user: "700", project: "homelba", roleKeys: [] },
+          context,
+        ),
+      /No project named "homelba"/,
+    );
+    assertEquals(
+      calls.filter((c) => c.method === "POST" && !c.path.endsWith("/_search"))
+        .length,
+      0,
+    );
+    assertEquals(written.length, 0);
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("an all-digit project value is looked up by name before it is taken as an id", async () => {
+  const { caller, calls } = makeFakeApi((c) => {
+    if (c.path.endsWith("/projects/_search")) {
+      const asked = JSON.stringify(c.body);
+      return {
+        result: asked.includes('"2026"') ? [{ id: "999", name: "2026" }] : [],
+      };
+    }
+    if (c.path.endsWith("/roles/_search")) return { result: [] };
+  });
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await method("role_ensure").execute({ project: "2026", key: "a" }, context);
+    assertEquals(written[0].data.projectId, "999", "found by name");
+    await method("role_ensure").execute({ project: "300", key: "a" }, context);
+    assertEquals(written[1].data.projectId, "300", "no name match: an id");
+    assert(
+      !calls.some((c) => c.method === "POST" && c.path.endsWith("/projects")),
+      "an all-digit value never creates a project",
+    );
   } finally {
     __setCaller(null);
   }
