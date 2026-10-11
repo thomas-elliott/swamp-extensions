@@ -2240,3 +2240,34 @@ Deno.test("project_deploy in gitops mode fails on an error line in the redeploy 
     __setArcaneTransport(null);
   }
 });
+
+for (
+  const [label, redeploy] of [
+    [
+      "a broken connection",
+      () => Promise.reject(new Error("socket hang up")),
+    ],
+    [
+      "a stream cut short after its started line",
+      () => Promise.resolve('{"type":"activity","activityId":"a1"}\n'),
+    ],
+  ] as [string, () => Promise<unknown>][]
+) {
+  Deno.test(`project_deploy does not roll back after ${label}`, async () => {
+    const calls: Call[] = [];
+    __setComposeValidator(() => Promise.resolve({ version: "v2.test" }));
+    __setArcaneTransport(deployTransport(redeploy, "healthy", calls));
+    try {
+      const message = await deployError(true);
+      assert(/no rollback attempted/.test(message), `got: ${message}`);
+      assertEquals(
+        calls.filter((c) => c.method === "PUT").length,
+        1,
+        "only the update PUT, no rollback PUT",
+      );
+    } finally {
+      __setArcaneTransport(null);
+      __setComposeValidator(null);
+    }
+  });
+}
