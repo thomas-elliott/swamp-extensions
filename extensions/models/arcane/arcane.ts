@@ -315,9 +315,14 @@ const PruneResultResource = z.object({
 const API = "/api";
 const REQUEST_TIMEOUT_MS = 30_000;
 // Up, down, redeploy, pull and destroy answer only when Docker has finished,
-// so they get longer than the 30 s an ordinary request gets. project_deploy
-// bounds its redeploys by healthTimeoutSec instead.
-const OPERATION_TIMEOUT_MS = 10 * 60_000;
+// so they get longer than the 30 s an ordinary request gets: past Arcane's own
+// limits (10 min per image pull, then 10 min for compose to come up), so a slow
+// operation is not reported failed while Arcane is still finishing it.
+// project_deploy bounds its redeploys by healthTimeoutSec instead.
+const OPERATION_TIMEOUT_MS = 30 * 60_000;
+
+/** A redeploy that outlived its budget; Arcane may still be running it. */
+class RedeployTimeout extends Error {}
 
 type GlobalArgsT = z.infer<typeof GlobalArgs>;
 /** A parsed JSON object. */
@@ -369,22 +374,23 @@ function safeJson(body: string): unknown {
 }
 
 /**
- * The error message from a streamed (NDJSON) Arcane response, or undefined when
- * no line carries one. Arcane's project up, pull and redeploy handlers write
- * `{"error": "..."}` as a line of the 200 body when the operation fails, so the
- * body has to be read to know whether it worked.
+ * Why a streamed (NDJSON) Arcane operation failed, or undefined if it finished.
+ * Arcane's project up, pull and redeploy answer 200 at once, then end the body
+ * with `{"done":true}` on success or `{"error":"..."}` on failure, so the body
+ * has to be read to know whether it worked. A body with neither was cut short.
  */
-export function streamError(body: unknown): string | undefined {
+export function streamFailure(body: unknown): string | undefined {
   const lines = typeof body === "string" ? body.split("\n") : [body];
+  let done = false;
   for (const line of lines) {
     const obj = typeof line === "string" ? safeJson(line.trim()) : line;
-    if (
-      obj && typeof obj === "object" && typeof (obj as Json).error === "string"
-    ) {
+    if (!obj || typeof obj !== "object") continue;
+    if (typeof (obj as Json).error === "string") {
       return (obj as Json).error as string;
     }
+    if ((obj as Json).done === true) done = true;
   }
-  return undefined;
+  return done ? undefined : "the response ended without Arcane's done line";
 }
 
 /** Signature of the Arcane HTTP transport, swappable via {@link __setArcaneTransport}. */
@@ -803,6 +809,7 @@ async function pollProjectHealthy(
     const serviceCount = Number(pick(p, "serviceCount") ?? 0);
     const runningCount = Number(pick(p, "runningCount") ?? 0);
     let notHealthy: string[] = [];
+    let runtimeError: string | undefined;
     try {
       const rt = unwrap(
         await arcane(g, "GET", `${ENV(g)}/projects/${id}/runtime`),
@@ -813,18 +820,22 @@ async function pollProjectHealthy(
       notHealthy = services
         .map((s) => asString(pick(s, "health")) ?? "")
         .filter((h) => h === "unhealthy" || h === "starting");
-    } catch { /* runtime view is best-effort */ }
+    } catch (e) {
+      // Without the runtime view the healthchecks are unknown, so keep waiting.
+      runtimeError = e instanceof Error ? e.message : String(e);
+    }
     last = {
-      healthy: projectHealthy(
-        status,
-        serviceCount,
-        runningCount,
-        notHealthy.length > 0,
-      ),
+      healthy: runtimeError === undefined &&
+        projectHealthy(
+          status,
+          serviceCount,
+          runningCount,
+          notHealthy.length > 0,
+        ),
       status,
       detail: `status=${status} running=${runningCount}/${serviceCount}${
         notHealthy.length > 0 ? ` (health: ${notHealthy.join(", ")})` : ""
-      }`,
+      }${runtimeError ? ` (runtime view failed: ${runtimeError})` : ""}`,
     };
     if (last.healthy || Date.now() >= deadline) return last;
     await sleep(intervalSec * 1000);
@@ -846,7 +857,7 @@ async function redeployAndPoll(
 ): Promise<HealthResult> {
   const deadline = Date.now() + timeoutSec * 1000;
   try {
-    const failure = streamError(
+    const failure = streamFailure(
       await arcane(
         g,
         "POST",
@@ -858,7 +869,7 @@ async function redeployAndPoll(
     if (failure !== undefined) throw new Error(`redeploy failed: ${failure}`);
   } catch (e) {
     if (e instanceof Error && /request timed out/.test(e.message)) {
-      throw new Error(
+      throw new RedeployTimeout(
         `redeploy did not finish within healthTimeoutSec (${timeoutSec}s); Arcane may still be running it`,
       );
     }
@@ -1333,15 +1344,16 @@ const ProjectDeployArgs = z.object({
   rollback: z.boolean().default(true).describe(
     "Roll back to prior state on failure (direct mode). false = stop and report, leaving the failed state for inspection.",
   ),
-  healthTimeoutSec: z.number().int().positive().default(120).describe(
-    "How long the redeploy and the wait for the project to become healthy may take together",
-  ),
+  healthTimeoutSec: z.number().int().positive().max(86_400).default(300)
+    .describe(
+      "How long the redeploy and the wait for the project to become healthy may take together",
+    ),
   pollIntervalSec: z.number().int().positive().default(5),
 });
 
 const SwarmServiceForceUpdateArgs = z.object({
   name: z.string().describe("Swarm service name (e.g. unifi_unifi)"),
-  convergeTimeoutSec: z.number().int().default(180),
+  convergeTimeoutSec: z.number().int().positive().default(180),
   pollIntervalSec: z.number().int().positive().default(5),
 });
 
@@ -1362,13 +1374,13 @@ const SwarmStackDeployArgs = z.object({
   prune: z.boolean().default(false).describe(
     "Remove services no longer present in the compose file",
   ),
-  convergeTimeoutSec: z.number().int().default(180),
+  convergeTimeoutSec: z.number().int().positive().default(180),
   pollIntervalSec: z.number().int().positive().default(5),
 });
 
 const SwarmStackRemoveArgs = z.object({
   name: z.string(),
-  removeTimeoutSec: z.number().int().default(30).describe(
+  removeTimeoutSec: z.number().int().positive().default(30).describe(
     "Max seconds to keep re-issuing DELETE until the stack record 404s",
   ),
   pollIntervalSec: z.number().int().positive().default(2),
@@ -1479,7 +1491,7 @@ export const model = {
     {
       toVersion: "2026.10.11.1",
       description:
-        "Map the retired values Arcane never accepted: repository.authType token → http, syncs[].targetType swarm → swarm_stack.",
+        "Map the retired enum values: repository.authType token → http; syncs[].targetType swarm → project, since Arcane ran anything but swarm_stack as a compose project.",
       upgradeAttributes: (
         old: Record<string, unknown>,
       ): Record<string, unknown> => {
@@ -1490,7 +1502,7 @@ export const model = {
         }
         if (Array.isArray(out.syncs)) {
           out.syncs = out.syncs.map((s: Record<string, unknown>) =>
-            s?.targetType === "swarm" ? { ...s, targetType: "swarm_stack" } : s
+            s?.targetType === "swarm" ? { ...s, targetType: "project" } : s
           );
         }
         return out;
@@ -2307,6 +2319,7 @@ export const model = {
         //    failed redeploy throws (an HTTP error, or an error line in its streamed
         //    200 body) and takes the same rollback path as an unhealthy poll result.
         let failReason: string | undefined;
+        let timedOut = false;
         let healthy = false;
         try {
           if (isFirstDeploy) {
@@ -2338,6 +2351,7 @@ export const model = {
           if (!healthy) failReason = `unhealthy: ${health.detail}`;
         } catch (e) {
           failReason = e instanceof Error ? e.message : String(e);
+          timedOut = e instanceof RedeployTimeout;
           await record("apply", false, 0, failReason);
         }
 
@@ -2354,7 +2368,19 @@ export const model = {
           return { dataHandles: handles };
         }
 
-        // 4. Failure path — roll back by default.
+        // 4. Failure path — roll back by default, but not on top of a redeploy
+        //    Arcane is still running: the two would race.
+        if (timedOut) {
+          await record(
+            "rollback",
+            false,
+            0,
+            "redeploy timed out and may still be running — no rollback attempted",
+          );
+          throw new Error(
+            `deploy of '${name}' failed (${failReason}); no rollback attempted while it may still be running — check the project in Arcane`,
+          );
+        }
         if (args.rollback === false) {
           await record(
             "rollback",
@@ -3037,6 +3063,9 @@ export const model = {
   },
 } satisfies ModelDefinition<typeof GlobalArgs>;
 
+/** Project endpoints that answer with an NDJSON stream ending in a done or error line. */
+const STREAMED_OPERATIONS = new Set(["/up", "/pull", "/redeploy"]);
+
 /**
  * Build a fan-out project-lifecycle method. Resolves each name to a project id,
  * issues the action, and records an operation-result per target. The argument
@@ -3078,12 +3107,18 @@ function makeLifecycle(
         if (httpMethod === "DELETE") {
           await deleteIfPresent(g, path, OPERATION_TIMEOUT_MS);
         } else {
-          // up, pull and redeploy stream NDJSON: the 200 arrives before the work
-          // runs and a failure is an error line in the body, so the status alone
-          // shows nothing.
-          const failure = streamError(
-            await arcane(g, httpMethod, path, undefined, OPERATION_TIMEOUT_MS),
+          const body = await arcane(
+            g,
+            httpMethod,
+            path,
+            undefined,
+            OPERATION_TIMEOUT_MS,
           );
+          // up, pull and redeploy stream NDJSON, so the 200 alone shows nothing;
+          // down and restart answer plain JSON and fail with an HTTP error.
+          const failure = STREAMED_OPERATIONS.has(suffix)
+            ? streamFailure(body)
+            : undefined;
           if (failure !== undefined) {
             throw new Error(
               `Arcane ${operation} of '${name}' failed: ${failure}`,

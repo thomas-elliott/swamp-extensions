@@ -16,7 +16,7 @@ import {
   renderNames,
   repointServiceRefs,
   serviceConvergence,
-  streamError,
+  streamFailure,
   swarmStackResource,
   swarmTaskResource,
   unwrap,
@@ -182,6 +182,9 @@ type WriteCall = {
   data: Record<string, unknown>;
 };
 
+/** A streamed Arcane operation (up, pull, redeploy) that finished. */
+const STREAM_DONE = '{"type":"activity","activityId":"a1"}\n{"done":true}\n';
+
 const TEST_GLOBALS = {
   baseUrl: "https://arcane.test",
   apiKey: "test-key",
@@ -258,7 +261,7 @@ Deno.test("project_deploy direct mode: validate → update → redeploy → heal
         return Promise.resolve({ success: true, data: {} });
       }
       if (m === "POST" && p === "/environments/0/projects/p1/redeploy") {
-        return Promise.resolve({ success: true, data: { message: "ok" } });
+        return Promise.resolve(STREAM_DONE);
       }
       if (m === "GET" && p === "/environments/0/projects/p1") {
         return Promise.resolve({
@@ -374,7 +377,7 @@ Deno.test("project_deploy direct mode: unhealthy deploy rolls back to prior cont
         return Promise.resolve({ success: true, data: {} });
       }
       if (m === "POST" && p === "/environments/0/projects/p1/redeploy") {
-        return Promise.resolve({ success: true, data: {} });
+        return Promise.resolve(STREAM_DONE);
       }
       if (m === "GET" && p === "/environments/0/projects/p1") {
         // unhealthy until the rollback (2nd) PUT lands, then healthy
@@ -469,13 +472,11 @@ Deno.test("project_deploy direct mode: a redeploy Arcane rejects (HTTP 400) stil
       }
       if (m === "POST" && p === "/environments/0/projects/p1/redeploy") {
         // the broken redeploy is rejected; the rollback redeploy (after the 2nd PUT) succeeds
-        return putCount >= 2
-          ? Promise.resolve({ success: true, data: {} })
-          : Promise.reject(
-            new Error(
-              "Arcane POST /redeploy -> HTTP 400: container exited (1)",
-            ),
-          );
+        return putCount >= 2 ? Promise.resolve(STREAM_DONE) : Promise.reject(
+          new Error(
+            "Arcane POST /redeploy -> HTTP 400: container exited (1)",
+          ),
+        );
       }
       if (m === "GET" && p === "/environments/0/projects/p1") {
         return Promise.resolve({
@@ -1026,7 +1027,7 @@ Deno.test("swarm_stack_remove throws if the record never clears within the deadl
     let threw = false;
     try {
       await method("swarm_stack_remove").execute(
-        { name: "stuck", pollIntervalSec: 1, removeTimeoutSec: 0 },
+        { name: "stuck", pollIntervalSec: 1, removeTimeoutSec: 1 },
         context,
       );
     } catch (e) {
@@ -1529,28 +1530,36 @@ Deno.test("reachable check: a rejected key fails rather than passing", async () 
 
 // ─────────────────────────── streaming lifecycle ───────────────────────────
 
-Deno.test("streamError finds the error line in an NDJSON body and nothing else", () => {
+Deno.test("streamFailure: an error line fails, a done line passes, neither means cut short", () => {
   assertEquals(
-    streamError(
-      '{"type":"activity","id":"a1"}\n{"type":"deploy","phase":"begin"}\n{"error":"service web: image not found"}\n',
+    streamFailure(
+      '{"type":"activity","activityId":"a1"}\n{"log":"pulling"}\n{"error":"service web: image not found"}\n',
     ),
     "service web: image not found",
   );
   assertEquals(
-    streamError(
-      '{"type":"deploy","phase":"begin"}\n{"type":"deploy","phase":"complete"}\n',
-    ),
+    streamFailure('{"type":"activity","activityId":"a1"}\n{"done":true}\n'),
     undefined,
   );
+  const cutShort = /ended without Arcane's done line/;
+  assert(
+    cutShort.test(
+      streamFailure('{"type":"activity","activityId":"a1"}\n') ?? "",
+    ),
+  );
   // a single-line body arrives already parsed
-  assertEquals(streamError({ error: "boom" }), "boom");
-  assertEquals(streamError({ success: true }), undefined);
-  assertEquals(streamError(null), undefined);
-  assertEquals(streamError("not json at all"), undefined);
+  assertEquals(streamFailure({ error: "boom" }), "boom");
+  assertEquals(streamFailure({ done: true }), undefined);
+  assert(cutShort.test(streamFailure(null) ?? ""));
+  assert(cutShort.test(streamFailure("not json at all") ?? ""));
 });
 
 for (
-  const [name, suffix] of [["project_up", "/up"], ["project_pull", "/pull"]]
+  const [name, suffix] of [
+    ["project_up", "/up"],
+    ["project_pull", "/pull"],
+    ["project_redeploy", "/redeploy"],
+  ]
 ) {
   Deno.test(`${name}: an error line in the 200 body fails the method`, async () => {
     __setArcaneTransport(
@@ -1601,7 +1610,7 @@ for (
         }
         if (m === "POST" && p === `/environments/0/projects/p1${suffix}`) {
           return Promise.resolve(
-            '{"type":"activity","id":"a1"}\n{"status":"complete"}\n',
+            '{"type":"activity","id":"a1"}\n{"log":"Container web Started"}\n{"done":true}\n',
           );
         }
         return Promise.reject(new Error(`unexpected ${m} ${p}`));
@@ -1916,7 +1925,7 @@ Deno.test("redeploy and lifecycle calls get the long timeout; reads keep the sho
     if (p.endsWith("/projects?limit=-1")) {
       return Promise.resolve([{ id: "p1", name: "web" }]);
     }
-    return Promise.resolve("");
+    return Promise.resolve(STREAM_DONE);
   });
   try {
     const { context } = makeContext(TEST_GLOBALS);
@@ -1924,7 +1933,7 @@ Deno.test("redeploy and lifecycle calls get the long timeout; reads keep the sho
     assertEquals(timeouts["GET /environments/0/projects?limit=-1"], 30_000);
     assertEquals(
       timeouts["POST /environments/0/projects/p1/redeploy"],
-      10 * 60_000,
+      30 * 60_000,
     );
   } finally {
     __setArcaneTransport(null);
@@ -1987,7 +1996,8 @@ Deno.test("project_restart uses Arcane's restart for each project", async () => 
 /** A project_deploy update of `web` (id p1), with the redeploy and runtime answers supplied. */
 function deployTransport(
   redeploy: (timeoutMs?: number) => Promise<unknown>,
-  health: string,
+  health: string | Error,
+  calls: Call[] = [],
 ) {
   return (
     _g: unknown,
@@ -1996,6 +2006,7 @@ function deployTransport(
     _b?: unknown,
     timeoutMs?: number,
   ): Promise<unknown> => {
+    calls.push({ method: m, path: p });
     if (m === "GET" && p === "/environments/0/projects?limit=-1") {
       return Promise.resolve([{ id: "p1", name: "web" }]);
     }
@@ -2018,6 +2029,7 @@ function deployTransport(
       });
     }
     if (m === "GET" && p === "/environments/0/projects/p1/runtime") {
+      if (health instanceof Error) return Promise.reject(health);
       return Promise.resolve({
         success: true,
         data: { runtimeServices: [{ health }] },
@@ -2027,14 +2039,14 @@ function deployTransport(
   };
 }
 
-async function deployError(): Promise<string> {
+async function deployError(rollback = false): Promise<string> {
   const { context } = makeContext(TEST_GLOBALS);
   try {
     await method("project_deploy").execute(
       {
         name: "web",
         composeContent: "NEW",
-        rollback: false,
+        rollback,
         healthTimeoutSec: 1,
         pollIntervalSec: 1,
       },
@@ -2049,7 +2061,7 @@ async function deployError(): Promise<string> {
 Deno.test("project_deploy does not pass a service whose healthcheck is still starting", async () => {
   __setComposeValidator(() => Promise.resolve({ version: "v2.test" }));
   __setArcaneTransport(
-    deployTransport(() => Promise.resolve({ success: true }), "starting"),
+    deployTransport(() => Promise.resolve(STREAM_DONE), "starting"),
   );
   try {
     const message = await deployError();
@@ -2121,7 +2133,7 @@ Deno.test("the 2026.10.11.1 upgrade maps the retired authType and targetType val
   assertEquals((out.repository as Json).authType, "http");
   assertEquals(
     (out.syncs as Json[]).map((s) => s.targetType),
-    ["swarm_stack", "project", undefined],
+    ["project", "project", undefined],
   );
   assertEquals(out.baseUrl, "https://arcane.example.com");
   assertEquals(upgrade.upgradeAttributes({ baseUrl: "x" }), { baseUrl: "x" });
@@ -2139,4 +2151,92 @@ Deno.test("project_deploy refuses a zero healthTimeoutSec, which would switch th
     schema.safeParse({ name: "web", healthTimeoutSec: 30 }).success,
     true,
   );
+});
+
+Deno.test("project_deploy does not roll back on top of a redeploy that timed out", async () => {
+  const calls: Call[] = [];
+  __setComposeValidator(() => Promise.resolve({ version: "v2.test" }));
+  __setArcaneTransport(
+    deployTransport(
+      (timeoutMs) =>
+        Promise.reject(new Error(`request timed out after ${timeoutMs} ms`)),
+      "healthy",
+      calls,
+    ),
+  );
+  try {
+    const message = await deployError(true);
+    assert(/no rollback attempted/.test(message), `got: ${message}`);
+    assertEquals(
+      calls.filter((c) => c.method === "PUT").length,
+      1,
+      "only the update PUT, no rollback PUT",
+    );
+  } finally {
+    __setArcaneTransport(null);
+    __setComposeValidator(null);
+  }
+});
+
+Deno.test("project_deploy keeps waiting when the runtime view fails", async () => {
+  __setComposeValidator(() => Promise.resolve({ version: "v2.test" }));
+  __setArcaneTransport(
+    deployTransport(
+      () => Promise.resolve(STREAM_DONE),
+      new Error("Arcane GET /runtime -> HTTP 500"),
+    ),
+  );
+  try {
+    const message = await deployError();
+    assert(/runtime view failed/.test(message), `got: ${message}`);
+  } finally {
+    __setArcaneTransport(null);
+    __setComposeValidator(null);
+  }
+});
+
+Deno.test("project_deploy in gitops mode fails on an error line in the redeploy body", async () => {
+  __setArcaneTransport(
+    (_g: unknown, m: string, p: string): Promise<unknown> => {
+      if (m === "GET" && p === "/environments/0/projects?limit=-1") {
+        return Promise.resolve([{ id: "p1", name: "web" }]);
+      }
+      if (m === "GET" && p === "/environments/0/projects/p1/compose") {
+        return Promise.resolve({
+          success: true,
+          data: { composeContent: "FROM GIT", gitOpsManagedBy: "s1" },
+        });
+      }
+      if (m === "GET" && p === "/environments/0/gitops-syncs?limit=-1") {
+        return Promise.resolve([{ id: "s1", name: "web", projectName: "web" }]);
+      }
+      if (m === "POST" && p === "/environments/0/gitops-syncs/s1/sync") {
+        return Promise.resolve({ success: true });
+      }
+      if (m === "POST" && p === "/environments/0/projects/p1/redeploy") {
+        return Promise.resolve(
+          '{"type":"activity","activityId":"a1"}\n{"error":"service web: container exited (1)"}\n',
+        );
+      }
+      return Promise.reject(new Error(`unexpected ${m} ${p}`));
+    },
+  );
+  try {
+    const { context } = makeContext(TEST_GLOBALS);
+    let message = "";
+    try {
+      await method("project_deploy").execute(
+        { name: "web", healthTimeoutSec: 1, pollIntervalSec: 1 },
+        context,
+      );
+    } catch (e) {
+      message = e instanceof Error ? e.message : String(e);
+    }
+    assert(
+      /redeploy failed: service web: container exited/.test(message),
+      `got: ${message}`,
+    );
+  } finally {
+    __setArcaneTransport(null);
+  }
 });
