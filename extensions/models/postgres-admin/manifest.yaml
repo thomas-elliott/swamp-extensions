@@ -1,6 +1,6 @@
 manifestVersion: 1
 name: "@thomas/postgres-admin"
-version: 2026.06.01.1
+version: 2026.10.11.1
 description: >-
   Non-destructive PostgreSQL administration over a direct TCP connection
   (node-postgres). Reads databases, roles, permissions, tables, connections, and
