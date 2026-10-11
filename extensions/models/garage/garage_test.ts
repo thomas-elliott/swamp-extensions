@@ -5,6 +5,7 @@
  * shaping for allow/deny/alias/update, and keeping secrets out of logs. No live
  * cluster; the Admin API transport is faked via the __setGarageApi seam.
  */
+import { z } from "npm:zod@4";
 import { __setGarageApi, type ApiFn, type Json, model } from "./garage.ts";
 
 function assertEquals(actual: unknown, expected: unknown, msg?: string): void {
@@ -100,6 +101,11 @@ const method = (name: string): MethodDef =>
 const call = (calls: Call[], op: string): Call | undefined =>
   calls.find((c) => c.op === op);
 
+/** Throw what the real transport throws for a Garage 404 (NoSuchBucket, NoSuchAccessKey). */
+function notFound(op: string): never {
+  throw new Error(`Garage ${op} failed (HTTP 404): no such item`);
+}
+
 // ─────────────────────────── cluster_health ───────────────────────────
 
 Deno.test("cluster_health: GETs GetClusterHealth and shapes the snapshot", async () => {
@@ -124,6 +130,7 @@ Deno.test("cluster_health: GETs GetClusterHealth and shapes the snapshot", async
     assertEquals(call(fake.calls, "GetClusterHealth")?.method, "GET");
     assertEquals(written[0].data.status, "healthy");
     assertEquals(written[0].data.partitions, 256);
+    assertEquals(written[0].name, "cluster-health");
     assertEquals(written[0].data.s3Region, "garage");
   } finally {
     __setGarageApi(null);
@@ -148,6 +155,7 @@ Deno.test("bucket_create: idempotent — existing globalAlias returns unchanged,
     );
     assertEquals(written[0].data.action, "unchanged");
     assertEquals(written[0].data.id, "abc123");
+    assertEquals(written[0].name, "bucket-result:abc123");
   } finally {
     __setGarageApi(null);
   }
@@ -170,6 +178,11 @@ Deno.test("bucket_create: new globalAlias issues CreateBucket with the alias bod
     });
     assertEquals(written[0].data.action, "created");
     assertEquals(written[0].data.id, "newid");
+    assertEquals(
+      written[0].name,
+      "bucket-result:newid",
+      "named by id, not alias",
+    );
   } finally {
     __setGarageApi(null);
   }
@@ -190,6 +203,51 @@ Deno.test("bucket_create: an error other than 404 is not taken as a free alias",
       /HTTP 403/,
     );
     assert(!call(fake.calls, "CreateBucket"), "must not create");
+  } finally {
+    __setGarageApi(null);
+  }
+});
+
+// Garage gives a local alias's key nothing unless the create asks for it.
+Deno.test("bucket_create: local alias passes the requested grants to Garage", async () => {
+  const fake = makeFakeApi((op) =>
+    op === "CreateBucket" ? { id: "nb", globalAliases: [] } : undefined
+  );
+  __setGarageApi(fake.fn);
+  try {
+    const { context } = makeContext();
+    await method("bucket_create").execute({
+      localAlias: "mine",
+      localAliasAccessKeyId: "GK1",
+      localAliasRead: true,
+      localAliasWrite: true,
+    }, context);
+    assertEquals(call(fake.calls, "CreateBucket")?.body, {
+      localAlias: {
+        accessKeyId: "GK1",
+        alias: "mine",
+        allow: { read: true, write: true, owner: false },
+      },
+    });
+  } finally {
+    __setGarageApi(null);
+  }
+});
+
+Deno.test("bucket_create: local-alias grants without a local alias are rejected", async () => {
+  const fake = makeFakeApi(() => undefined);
+  __setGarageApi(fake.fn);
+  try {
+    const { context } = makeContext();
+    await rejects(
+      () =>
+        method("bucket_create").execute(
+          { globalAlias: "g", localAliasRead: true },
+          context,
+        ),
+      /need localAlias/,
+    );
+    assertEquals(fake.calls.length, 0);
   } finally {
     __setGarageApi(null);
   }
@@ -332,16 +390,20 @@ Deno.test("bucket_update: nothing to update throws", async () => {
 
 // ─────────────────────────── bucket_delete (gated) ───────────────────────────
 
-Deno.test("bucket_delete: not found throws, no DeleteBucket", async () => {
-  const fake = makeFakeApi((op) => (op === "GetBucketInfo" ? {} : undefined));
+// Garage answers an unknown bucket id with 404. An already-gone bucket is
+// the goal of a delete, so a re-run records unchanged instead of failing.
+Deno.test("bucket_delete: already gone records unchanged, no DeleteBucket", async () => {
+  const fake = makeFakeApi((op) =>
+    op === "GetBucketInfo" ? notFound(op) : undefined
+  );
   __setGarageApi(fake.fn);
   try {
-    const { context } = makeContext();
-    await rejects(
-      () => method("bucket_delete").execute({ id: "ghost" }, context),
-      /not found/,
-    );
+    const { context, written } = makeContext();
+    await method("bucket_delete").execute({ id: "ghost" }, context);
     assert(!call(fake.calls, "DeleteBucket"));
+    assertEquals(written[0].name, "bucket-result:ghost");
+    assertEquals(written[0].data.id, "ghost");
+    assertEquals(written[0].data.action, "unchanged");
   } finally {
     __setGarageApi(null);
   }
@@ -418,6 +480,97 @@ Deno.test("bucket_alias_add: global vs local body shapes", async () => {
   }
 });
 
+/** A GetBucketInfo answer: global alias "g", and key GK1 with local alias "l". */
+function aliasedBucket(op: string): unknown {
+  return op === "GetBucketInfo"
+    ? {
+      id: "b1",
+      globalAliases: ["g"],
+      keys: [{
+        accessKeyId: "GK1",
+        permissions: { read: true },
+        bucketLocalAliases: ["l"],
+      }],
+    }
+    : undefined;
+}
+
+Deno.test("bucket_alias_add: an alias already on the bucket is unchanged, no write", async () => {
+  for (
+    const args of [
+      { bucketId: "b1", globalAlias: "g" },
+      { bucketId: "b1", localAlias: "l", accessKeyId: "GK1" },
+    ]
+  ) {
+    const fake = makeFakeApi(aliasedBucket);
+    __setGarageApi(fake.fn);
+    try {
+      const { context, written } = makeContext();
+      await method("bucket_alias_add").execute(args, context);
+      assertEquals(fake.ops(), ["GetBucketInfo"]);
+      assertEquals(written[0].data.action, "unchanged");
+    } finally {
+      __setGarageApi(null);
+    }
+  }
+});
+
+Deno.test("bucket_alias_remove: removes a present alias", async () => {
+  const fake = makeFakeApi(aliasedBucket);
+  __setGarageApi(fake.fn);
+  try {
+    const { context, written } = makeContext();
+    await method("bucket_alias_remove").execute(
+      { bucketId: "b1", globalAlias: "g" },
+      context,
+    );
+    assertEquals(call(fake.calls, "RemoveBucketAlias")?.body, {
+      bucketId: "b1",
+      globalAlias: "g",
+    });
+    assertEquals(written[0].data.action, "updated");
+  } finally {
+    __setGarageApi(null);
+  }
+});
+
+Deno.test("bucket_alias_remove: an alias already gone is unchanged, no write", async () => {
+  for (
+    const args of [
+      { bucketId: "b1", globalAlias: "gone" },
+      { bucketId: "b1", localAlias: "gone", accessKeyId: "GK1" },
+    ]
+  ) {
+    const fake = makeFakeApi(aliasedBucket);
+    __setGarageApi(fake.fn);
+    try {
+      const { context, written } = makeContext();
+      await method("bucket_alias_remove").execute(args, context);
+      assertEquals(fake.ops(), ["GetBucketInfo"]);
+      assertEquals(written[0].data.action, "unchanged");
+    } finally {
+      __setGarageApi(null);
+    }
+  }
+});
+
+Deno.test("bucket_alias_remove: a local alias of a key Garage doesn't list goes to Garage", async () => {
+  // GK2 has no permission on b1, so GetBucketInfo can't show its aliases.
+  const fake = makeFakeApi(aliasedBucket);
+  __setGarageApi(fake.fn);
+  try {
+    const { context, written } = makeContext();
+    await method("bucket_alias_remove").execute(
+      { bucketId: "b1", localAlias: "x", accessKeyId: "GK2" },
+      context,
+    );
+    assertEquals(fake.ops(), ["GetBucketInfo", "RemoveBucketAlias"]);
+    assertEquals(written[0].data.action, "updated");
+  } finally {
+    __setGarageApi(null);
+  }
+});
+
 Deno.test("bucket_alias_add: local alias without accessKeyId is rejected", async () => {
   const { context } = makeContext();
   await rejects(
@@ -452,10 +605,65 @@ Deno.test("key_create: surfaces the one-time secret and never logs it", async ()
     });
     assertEquals(written[0].data.secretAccessKey, "s3cr3t");
     assertEquals(written[0].data.action, "created");
+    assertEquals(written[0].name, "key-result:GK123");
     assert(
       !logs.some((l) => JSON.stringify(l).includes("s3cr3t")),
       "secret must never be logged",
     );
+  } finally {
+    __setGarageApi(null);
+  }
+});
+
+/**
+ * True when a field carries `{ sensitive: true }`, read the way swamp reads it:
+ * from the global zod registry, on the field or on any optional/nullable layer.
+ */
+function isSensitiveField(field: z.ZodType): boolean {
+  let current: unknown = field;
+  while (current) {
+    if (z.globalRegistry.get(current as z.ZodType)?.sensitive) return true;
+    current = (current as { _def: { innerType?: unknown } })._def.innerType;
+  }
+  return false;
+}
+
+// sensitiveOutput vaulted every field, so the key id, name and action came back
+// as vault references that CEL and the README recipe could not read.
+Deno.test("key-result: only secretAccessKey is vaulted", () => {
+  const spec = (model.resources as Record<
+    string,
+    { sensitiveOutput?: boolean; schema: z.ZodObject }
+  >)["key-result"];
+  assert(!spec.sensitiveOutput, "the whole output must not be vaulted");
+  const sensitive = Object.entries(spec.schema.shape)
+    .filter(([, field]) => isSensitiveField(field as z.ZodType))
+    .map(([name]) => name);
+  assertEquals(sensitive, ["secretAccessKey"]);
+});
+
+// A new key has no expiry, so neverExpires=false alone used to create a key
+// that never expires.
+Deno.test("key_create: neverExpires=false without expiration is rejected", async () => {
+  const fake = makeFakeApi(() => ({ accessKeyId: "GK1" }));
+  __setGarageApi(fake.fn);
+  try {
+    const { context } = makeContext();
+    await rejects(
+      () =>
+        method("key_create").execute(
+          { name: "tmp", neverExpires: false },
+          context,
+        ),
+      /neverExpires=false needs expiration/,
+    );
+    assertEquals(fake.calls.length, 0);
+    await method("key_create").execute({
+      name: "tmp",
+      neverExpires: false,
+      expiration: "2027-01-01T00:00:00Z",
+    }, context);
+    assert(call(fake.calls, "CreateKey"), "false with expiration is fine");
   } finally {
     __setGarageApi(null);
   }
@@ -597,13 +805,15 @@ Deno.test("key_rotate: a failed grant copy deletes the new key and fails", async
 });
 
 Deno.test("key_rotate: missing old key throws before creating anything", async () => {
-  const fake = makeFakeApi((op) => (op === "GetKeyInfo" ? {} : undefined));
+  const fake = makeFakeApi((op) =>
+    op === "GetKeyInfo" ? notFound(op) : undefined
+  );
   __setGarageApi(fake.fn);
   try {
     const { context } = makeContext();
     await rejects(
       () => method("key_rotate").execute({ id: "nope" }, context),
-      /not found/,
+      /^Key "nope" not found$/,
     );
     assert(
       !call(fake.calls, "CreateKey"),
@@ -614,18 +824,58 @@ Deno.test("key_rotate: missing old key throws before creating anything", async (
   }
 });
 
-// ─────────────────────────── key_delete (gated) ───────────────────────────
-
-Deno.test("key_delete: not found throws, no DeleteKey", async () => {
-  const fake = makeFakeApi((op) => (op === "GetKeyInfo" ? {} : undefined));
+Deno.test("key_rotate: an expired key is refused before creating anything", async () => {
+  const fake = makeFakeApi((op) =>
+    op === "GetKeyInfo"
+      ? {
+        accessKeyId: "GK1",
+        expiration: "2020-01-01T00:00:00Z",
+        expired: true,
+      }
+      : undefined
+  );
   __setGarageApi(fake.fn);
   try {
     const { context } = makeContext();
     await rejects(
-      () => method("key_delete").execute({ id: "ghost" }, context),
-      /not found/,
+      () => method("key_rotate").execute({ id: "GK1" }, context),
+      /expired at 2020-01-01T00:00:00Z.*key_update/,
     );
+    assert(!call(fake.calls, "CreateKey"));
+  } finally {
+    __setGarageApi(null);
+  }
+});
+
+// ─────────────────────────── key_delete (gated) ───────────────────────────
+
+Deno.test("key_delete: an already-gone id as typed is escaped in the data name", async () => {
+  const fake = makeFakeApi((op) =>
+    op === "GetKeyInfo" ? notFound(op) : undefined
+  );
+  __setGarageApi(fake.fn);
+  try {
+    const { context, written } = makeContext();
+    await method("key_delete").execute({ id: "../a/b%" }, context);
+    assertEquals(written[0].name, "key-result:.%2E%2Fa%2Fb%25");
+    assertEquals(written[0].data.accessKeyId, "../a/b%");
+  } finally {
+    __setGarageApi(null);
+  }
+});
+
+Deno.test("key_delete: already gone records unchanged, no DeleteKey", async () => {
+  const fake = makeFakeApi((op) =>
+    op === "GetKeyInfo" ? notFound(op) : undefined
+  );
+  __setGarageApi(fake.fn);
+  try {
+    const { context, written } = makeContext();
+    await method("key_delete").execute({ id: "ghost" }, context);
     assert(!call(fake.calls, "DeleteKey"));
+    assertEquals(written[0].name, "key-result:ghost");
+    assertEquals(written[0].data.accessKeyId, "ghost");
+    assertEquals(written[0].data.action, "unchanged");
   } finally {
     __setGarageApi(null);
   }
@@ -648,6 +898,7 @@ Deno.test("key_allow: sends permissions body and records granted", async () => {
       permissions: { read: true, write: true, owner: false },
     });
     assertEquals(written[0].data.action, "granted");
+    assertEquals(written[0].name, "permission-result:b1:GK1");
   } finally {
     __setGarageApi(null);
   }
@@ -832,7 +1083,8 @@ Deno.test("cluster_status: shapes node id, version, and per-node role", async ()
   const fake = makeFakeApi((op) => {
     if (op === "GetNodeInfo") return SELF_N1;
     if (op === "GetClusterStatus") {
-      // GetClusterStatusResponse has layoutVersion and nodes only; no self id.
+      // GetClusterStatusResponse has layoutVersion and nodes only: no self id
+      // and no top-level garageVersion.
       return {
         layoutVersion: 1,
         nodes: [
@@ -855,6 +1107,8 @@ Deno.test("cluster_status: shapes node id, version, and per-node role", async ()
     assertEquals(call(fake.calls, "GetNodeInfo")?.query, { node: "self" });
     const d = written[0].data as Record<string, unknown>;
     assertEquals(d.node, "n1");
+    assertEquals(d.garageVersion, "v2.3.0");
+    assertEquals(written[0].name, "cluster-status");
     assertEquals(d.layoutVersion, 1);
     const nodes = d.nodes as Array<Record<string, unknown>>;
     assertEquals(nodes[0].zone, "dc1");
@@ -884,6 +1138,7 @@ Deno.test("layout_get: shapes roles + staged changes + zoneRedundancy", async ()
     const d = written[0].data as Record<string, unknown>;
     assertEquals(d.version, 2);
     assertEquals(d.zoneRedundancy, "atLeast:1");
+    assertEquals(written[0].name, "cluster-layout");
     assertEquals((d.roles as unknown[]).length, 1);
     assertEquals(
       (d.stagedChanges as Array<Record<string, unknown>>)[0].remove,
@@ -977,6 +1232,108 @@ Deno.test("layout_assign: zone-only change keeps the node's current capacity", a
   }
 });
 
+// Garage keeps one staged change per node and a new one overwrites it, so the
+// omitted fields must come from the staged role, not the applied one.
+Deno.test("layout_assign: a follow-up call keeps the zone already staged", async () => {
+  const fake = makeFakeApi((op) =>
+    op === "GetClusterLayout"
+      ? {
+        ...LAYOUT_N1,
+        stagedRoleChanges: [{
+          id: "n1",
+          zone: "rack-b",
+          capacity: 1000000000,
+          tags: ["ssd"],
+        }],
+      }
+      : undefined
+  );
+  __setGarageApi(fake.fn);
+  try {
+    const { context } = makeContext();
+    await method("layout_assign").execute(
+      { nodeId: "n1", capacity: 2000000000 },
+      context,
+    );
+    const body = call(fake.calls, "UpdateClusterLayout")?.body as Record<
+      string,
+      unknown
+    >;
+    assertEquals(body.roles, [{
+      id: "n1",
+      zone: "rack-b",
+      capacity: 2000000000,
+      tags: ["ssd"],
+    }]);
+  } finally {
+    __setGarageApi(null);
+  }
+});
+
+Deno.test("layout_assign: a node staged but not applied needs no zone on a tags-only call", async () => {
+  const fake = makeFakeApi((op) =>
+    op === "GetClusterLayout"
+      ? {
+        ...EMPTY_LAYOUT,
+        stagedRoleChanges: [{
+          id: "n9",
+          zone: "dc2",
+          capacity: null,
+          tags: [],
+        }],
+      }
+      : undefined
+  );
+  __setGarageApi(fake.fn);
+  try {
+    const { context } = makeContext();
+    await method("layout_assign").execute(
+      { nodeId: "n9", tags: ["edge"] },
+      context,
+    );
+    const body = call(fake.calls, "UpdateClusterLayout")?.body as Record<
+      string,
+      unknown
+    >;
+    assertEquals(body.roles, [{
+      id: "n9",
+      zone: "dc2",
+      capacity: null,
+      tags: ["edge"],
+    }]);
+  } finally {
+    __setGarageApi(null);
+  }
+});
+
+Deno.test("layout_assign: a staged removal falls back to the applied role", async () => {
+  const fake = makeFakeApi((op) =>
+    op === "GetClusterLayout"
+      ? { ...LAYOUT_N1, stagedRoleChanges: [{ id: "n1", remove: true }] }
+      : undefined
+  );
+  __setGarageApi(fake.fn);
+  try {
+    const { context } = makeContext();
+    await method("layout_assign").execute(
+      { nodeId: "n1", capacity: 2000000000 },
+      context,
+    );
+    const body = call(fake.calls, "UpdateClusterLayout")?.body as Record<
+      string,
+      unknown
+    >;
+    assertEquals(body.roles, [{
+      id: "n1",
+      zone: "rack-a",
+      capacity: 2000000000,
+      tags: ["ssd"],
+    }]);
+  } finally {
+    __setGarageApi(null);
+  }
+});
+
 Deno.test("layout_assign: new node without a zone is rejected before staging", async () => {
   const fake = makeFakeApi((
     op,
@@ -1040,6 +1397,7 @@ Deno.test("layout_apply: resolves version to current+1 and applies", async () =>
     assertEquals(call(fake.calls, "ApplyClusterLayout")?.body, { version: 4 });
     assertEquals(written[0].data.applied, true);
     assertEquals(written[0].data.version, 4);
+    assertEquals(written[0].name, "layout-result:apply-4");
   } finally {
     __setGarageApi(null);
   }
@@ -1072,6 +1430,7 @@ Deno.test("layout_revert: calls RevertClusterLayout, action reverted", async () 
     await method("layout_revert").execute({}, context);
     assert(call(fake.calls, "RevertClusterLayout"), "must call revert");
     assertEquals(written[0].data.action, "reverted");
+    assertEquals(written[0].name, "layout-result:revert");
   } finally {
     __setGarageApi(null);
   }
@@ -1206,4 +1565,601 @@ Deno.test("reachable check: applies the schema defaults to globalArgs", async ()
   } finally {
     __setGarageApi(null);
   }
+});
+
+// ─────────────────────────── data names ───────────────────────────
+
+Deno.test("data names: specs sharing a Garage id get distinct names", async () => {
+  // swamp keys data by model + name, so `key` and `key-result` for the same
+  // access key must not share a name (the result would replace the listing).
+  const fake = makeFakeApi((op) => {
+    if (op === "GetKeyInfo") {
+      return { accessKeyId: "GK1", name: "app", buckets: [] };
+    }
+    if (op === "GetBucketInfo") return { id: "b1", globalAliases: [] };
+    return undefined;
+  });
+  __setGarageApi(fake.fn);
+  try {
+    const { context, written } = makeContext();
+    await method("key_get").execute({ id: "GK1" }, context);
+    await method("key_update").execute({ id: "GK1", name: "app2" }, context);
+    await method("bucket_get").execute({ id: "b1" }, context);
+    await method("bucket_update").execute(
+      { id: "b1", maxObjects: 5 },
+      context,
+    );
+    assertEquals(written.map((w) => w.name), [
+      "key:GK1",
+      "key-result:GK1",
+      "bucket:b1",
+      "bucket-result:b1",
+    ]);
+  } finally {
+    __setGarageApi(null);
+  }
+});
+
+// ─────────────────────────── transport errors ───────────────────────────
+
+/** A context whose globalArgs point at a local test server. */
+function contextFor(endpoint: string, timeoutMs: number) {
+  const { context } = makeContext();
+  return { ...context, globalArgs: { ...GLOBALS, endpoint, timeoutMs } };
+}
+
+// The timer used to stop at the headers, so a body that never arrived hung
+// the method; and a fetch error did not name the call.
+Deno.test("transport: a stalled response body times out and names the call", async () => {
+  let body: ReadableStreamDefaultController | undefined;
+  const server = Deno.serve(
+    { hostname: "127.0.0.1", port: 0, onListen() {} },
+    // Headers go out at once; the body never comes.
+    () => new Response(new ReadableStream({ start: (c) => void (body = c) })),
+  );
+  let guard: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const context = contextFor(`http://127.0.0.1:${server.addr.port}`, 100);
+    // Without the timeout the method would wait for ever; fail instead.
+    const hung = new Promise((_, reject) => {
+      guard = setTimeout(() => reject(new Error("hung")), 3000);
+    });
+    await rejects(
+      () => Promise.race([method("cluster_health").execute({}, context), hung]),
+      /^Garage GetClusterHealth failed: timed out after 100 ms$/,
+    );
+  } finally {
+    clearTimeout(guard);
+    // End the body so the server can shut down even if the client still waits.
+    try {
+      body?.close();
+    } catch { /* already cancelled by the client's abort */ }
+    await server.shutdown();
+  }
+});
+
+Deno.test("transport: a refused connection names the call", async () => {
+  // Bind a port, then free it, so nothing is listening there.
+  const listener = Deno.listen({ hostname: "127.0.0.1", port: 0 });
+  const port = listener.addr.port;
+  listener.close();
+  const context = contextFor(`http://127.0.0.1:${port}`, 2000);
+  await rejects(
+    () => method("cluster_health").execute({}, context),
+    /^Garage GetClusterHealth failed: /,
+  );
+});
+
+// ─────────────────────────── argument validation ───────────────────────────
+
+Deno.test("arguments: more than one selector or alias is rejected before any call", async () => {
+  const fake = makeFakeApi(() => ({}));
+  __setGarageApi(fake.fn);
+  try {
+    const { context } = makeContext();
+    await rejects(
+      () => method("bucket_get").execute({ id: "b1", search: "b" }, context),
+      /exactly one of id, globalAlias, or search/,
+    );
+    await rejects(
+      () => method("key_get").execute({ id: "GK1", search: "GK" }, context),
+      /exactly one of id or search/,
+    );
+    await rejects(
+      () =>
+        method("bucket_alias_add").execute({
+          bucketId: "b1",
+          globalAlias: "g",
+          localAlias: "l",
+          accessKeyId: "GK1",
+        }, context),
+      /exactly one of globalAlias or localAlias/,
+    );
+    assertEquals(fake.calls.length, 0);
+  } finally {
+    __setGarageApi(null);
+  }
+});
+
+// Garage stores quotas and capacity as unsigned integers.
+Deno.test("arguments: negative sizes are rejected", async () => {
+  const fake = makeFakeApi((op) =>
+    op === "GetClusterLayout" ? EMPTY_LAYOUT : BUCKET_B1
+  );
+  __setGarageApi(fake.fn);
+  try {
+    const { context } = makeContext();
+    await rejects(
+      () => method("bucket_update").execute({ id: "b1", maxSize: -1 }, context),
+      /maxSize/,
+    );
+    await rejects(
+      () =>
+        method("layout_assign").execute(
+          { nodeId: "n1", zone: "dc1", capacity: -1 },
+          context,
+        ),
+      /capacity/,
+    );
+    assert(!call(fake.calls, "UpdateBucket"));
+    assert(!call(fake.calls, "UpdateClusterLayout"));
+  } finally {
+    __setGarageApi(null);
+  }
+});
+
+Deno.test("arguments: zoneRedundancy 0 is not a positive integer", async () => {
+  const fake = makeFakeApi((
+    op,
+  ) => (op === "GetClusterLayout" ? EMPTY_LAYOUT : undefined));
+  __setGarageApi(fake.fn);
+  try {
+    const { context } = makeContext();
+    await rejects(
+      () =>
+        method("layout_assign").execute(
+          { nodeId: "n1", zone: "dc1", zoneRedundancy: "0" },
+          context,
+        ),
+      /invalid zoneRedundancy/,
+    );
+    assert(!call(fake.calls, "UpdateClusterLayout"));
+  } finally {
+    __setGarageApi(null);
+  }
+});
+
+// A zero timeout aborts every request at once.
+Deno.test("reachable check: a timeoutMs of 0 fails the schema", async () => {
+  const fake = makeFakeApi(() => ({ status: "healthy" }));
+  __setGarageApi(fake.fn);
+  try {
+    const checks = (model as unknown as {
+      checks: Record<
+        string,
+        { execute: (c: unknown) => Promise<{ pass: boolean }> }
+      >;
+    }).checks;
+    const res = await checks.reachable.execute({
+      globalArgs: { ...GLOBALS, timeoutMs: 0 },
+    });
+    assertEquals(res.pass, false);
+    assertEquals(fake.calls.length, 0);
+  } finally {
+    __setGarageApi(null);
+  }
+});
+
+// ─────────────────────────── bucket_update website ───────────────────────────
+
+Deno.test("bucket_update: documents with websiteEnabled=false are rejected, not dropped", async () => {
+  const fake = makeFakeApi((
+    op,
+  ) => (op === "GetBucketInfo" ? BUCKET_B1 : undefined));
+  __setGarageApi(fake.fn);
+  try {
+    const { context } = makeContext();
+    await rejects(
+      () =>
+        method("bucket_update").execute(
+          { id: "b1", websiteEnabled: false, indexDocument: "x.html" },
+          context,
+        ),
+      /documents can only be set with websiteEnabled=true/,
+    );
+    assert(!call(fake.calls, "UpdateBucket"));
+  } finally {
+    __setGarageApi(null);
+  }
+});
+
+Deno.test("bucket_update: a document for a bucket with the website off is rejected", async () => {
+  const fake = makeFakeApi((op) =>
+    op === "GetBucketInfo"
+      ? { id: "b2", quotas: {}, websiteAccess: false }
+      : undefined
+  );
+  __setGarageApi(fake.fn);
+  try {
+    const { context } = makeContext();
+    await rejects(
+      () =>
+        method("bucket_update").execute(
+          { id: "b2", indexDocument: "x.html" },
+          context,
+        ),
+      /website serving is off/,
+    );
+    assert(!call(fake.calls, "UpdateBucket"));
+  } finally {
+    __setGarageApi(null);
+  }
+});
+
+Deno.test("bucket_update: enabling a website with no index document is rejected", async () => {
+  const fake = makeFakeApi((op) =>
+    op === "GetBucketInfo"
+      ? { id: "b2", quotas: {}, websiteAccess: false }
+      : undefined
+  );
+  __setGarageApi(fake.fn);
+  try {
+    const { context } = makeContext();
+    await rejects(
+      () =>
+        method("bucket_update").execute(
+          { id: "b2", websiteEnabled: true },
+          context,
+        ),
+      /pass indexDocument to enable the website/,
+    );
+    assert(!call(fake.calls, "UpdateBucket"));
+  } finally {
+    __setGarageApi(null);
+  }
+});
+
+// ─────────────────────────── listings ───────────────────────────
+
+// A bucket deleted between ListBuckets and GetBucketInfo answers 404.
+Deno.test("bucket_list and permissions_audit: skip a bucket deleted mid-listing", async () => {
+  const fake = makeFakeApi((op, _body, query) => {
+    if (op === "ListBuckets") return [{ id: "b1" }, { id: "gone" }];
+    if (op === "ListKeys") return [];
+    if (op === "GetBucketInfo") {
+      return query.id === "gone"
+        ? notFound(op)
+        : { id: "b1", globalAliases: [], keys: [] };
+    }
+    return undefined;
+  });
+  __setGarageApi(fake.fn);
+  try {
+    const { context, written } = makeContext();
+    await method("bucket_list").execute({}, context);
+    assertEquals(written.map((w) => w.name), ["bucket:b1"]);
+    await method("permissions_audit").execute({}, context);
+    assertEquals(written[1].data.bucketCount, 1);
+  } finally {
+    __setGarageApi(null);
+  }
+});
+
+// ─────────────────────────── key_update / key_import ───────────────────────────
+
+// Garage reads a missing neverExpires as false, so sending false changes
+// nothing; it used to be recorded as an update.
+Deno.test("key_update: neverExpires=false is not a change", async () => {
+  const fake = makeFakeApi(() => ({ accessKeyId: "GK1", name: "app" }));
+  __setGarageApi(fake.fn);
+  try {
+    const { context } = makeContext();
+    await rejects(
+      () =>
+        method("key_update").execute(
+          { id: "GK1", neverExpires: false },
+          context,
+        ),
+      /nothing to update/,
+    );
+    assertEquals(fake.calls.length, 0);
+    await method("key_update").execute(
+      { id: "GK1", name: "app", neverExpires: false },
+      context,
+    );
+    assertEquals(call(fake.calls, "UpdateKey")?.body, { name: "app" });
+  } finally {
+    __setGarageApi(null);
+  }
+});
+
+/** A fake where ImportKey answers 409 and GetKeyInfo returns `existing`. */
+function importConflict(existing: () => unknown) {
+  return makeFakeApi((op) => {
+    if (op === "ImportKey") {
+      throw new Error(
+        "Garage ImportKey failed (HTTP 409): Key GK1 already exists in data store.",
+      );
+    }
+    if (op === "GetKeyInfo") return existing();
+    return undefined;
+  });
+}
+
+Deno.test("key_import: re-importing the same pair records unchanged", async () => {
+  const fake = importConflict(() => ({
+    accessKeyId: "GK1",
+    name: "app",
+    secretAccessKey: "s3cr3t",
+  }));
+  __setGarageApi(fake.fn);
+  try {
+    const { context, written, logs } = makeContext();
+    await method("key_import").execute(
+      { accessKeyId: "GK1", secretAccessKey: "s3cr3t" },
+      context,
+    );
+    assertEquals(call(fake.calls, "GetKeyInfo")?.query, {
+      id: "GK1",
+      search: undefined,
+      showSecretKey: "true",
+    });
+    assertEquals(written[0].data.action, "unchanged");
+    assertEquals(written[0].data.name, "app");
+    assert(!("secretAccessKey" in written[0].data), "no secret recorded");
+    assert(!JSON.stringify(logs).includes("s3cr3t"), "secret never logged");
+  } finally {
+    __setGarageApi(null);
+  }
+});
+
+Deno.test("key_import: an existing key with another secret fails without showing it", async () => {
+  const fake = importConflict(() => ({
+    accessKeyId: "GK1",
+    secretAccessKey: "other-secret",
+  }));
+  __setGarageApi(fake.fn);
+  try {
+    const { context, written } = makeContext();
+    let message = "";
+    await method("key_import").execute(
+      { accessKeyId: "GK1", secretAccessKey: "s3cr3t" },
+      context,
+    ).catch((e: Error) => message = e.message);
+    assert(/already exists with a different secret/.test(message), message);
+    assert(!/s3cr3t|other-secret/.test(message), "no secret in the error");
+    assertEquals(written.length, 0);
+  } finally {
+    __setGarageApi(null);
+  }
+});
+
+// Garage never reuses the id of a deleted key; its own message says so.
+Deno.test("key_import: a deleted key's id keeps Garage's conflict error", async () => {
+  const fake = importConflict(() => notFound("GetKeyInfo"));
+  __setGarageApi(fake.fn);
+  try {
+    const { context } = makeContext();
+    await rejects(
+      () =>
+        method("key_import").execute(
+          { accessKeyId: "GK1", secretAccessKey: "s3cr3t" },
+          context,
+        ),
+      /HTTP 409/,
+    );
+  } finally {
+    __setGarageApi(null);
+  }
+});
+
+// ─────────────────────────── key secrets not recorded ───────────────────────────
+
+/** A context whose writeResource fails, as it does with no vault for the secret. */
+function failingWriteContext() {
+  const { context } = makeContext();
+  return {
+    ...context,
+    writeResource: () => Promise.reject(new Error("no default vault")),
+  };
+}
+
+Deno.test("key_create: a failed record names the key that now exists", async () => {
+  const fake = makeFakeApi((op) =>
+    op === "CreateKey"
+      ? { accessKeyId: "GK9", secretAccessKey: "s3cr3t" }
+      : undefined
+  );
+  __setGarageApi(fake.fn);
+  try {
+    await rejects(
+      () => method("key_create").execute({ name: "ci" }, failingWriteContext()),
+      /Key GK9 was created in Garage but recording it failed \(no default vault\)/,
+    );
+  } finally {
+    __setGarageApi(null);
+  }
+});
+
+Deno.test("key_rotate: a failed record names the new key", async () => {
+  const fake = makeFakeApi((op) => {
+    if (op === "GetKeyInfo") {
+      return { accessKeyId: "OLD", permissions: {}, buckets: [] };
+    }
+    if (op === "CreateKey") return { accessKeyId: "NEW", secretAccessKey: "s" };
+    return undefined;
+  });
+  __setGarageApi(fake.fn);
+  try {
+    await rejects(
+      () => method("key_rotate").execute({ id: "OLD" }, failingWriteContext()),
+      /Key NEW was created in Garage but recording it failed/,
+    );
+  } finally {
+    __setGarageApi(null);
+  }
+});
+
+// ─────────────────────────── key_rotate local aliases ───────────────────────────
+
+// Local aliases belong to a key; without a copy, a client addressing the
+// bucket by one gets NoSuchBucket under the new key.
+Deno.test("key_rotate: copies the old key's local aliases onto the new key", async () => {
+  const fake = makeFakeApi((op) => {
+    if (op === "GetKeyInfo") {
+      return {
+        accessKeyId: "OLD",
+        permissions: {},
+        buckets: [{
+          id: "b1",
+          localAliases: ["mine", "also-mine"],
+          permissions: { read: true },
+        }],
+      };
+    }
+    if (op === "CreateKey") return { accessKeyId: "NEW", secretAccessKey: "s" };
+    return undefined;
+  });
+  __setGarageApi(fake.fn);
+  try {
+    const { context } = makeContext();
+    await method("key_rotate").execute({ id: "OLD" }, context);
+    assertEquals(
+      fake.calls.filter((c) => c.op === "AddBucketAlias").map((c) => c.body),
+      [
+        { bucketId: "b1", localAlias: "mine", accessKeyId: "NEW" },
+        { bucketId: "b1", localAlias: "also-mine", accessKeyId: "NEW" },
+      ],
+    );
+  } finally {
+    __setGarageApi(null);
+  }
+});
+
+Deno.test("key_rotate: a failed alias copy deletes the new key", async () => {
+  const fake = makeFakeApi((op) => {
+    if (op === "GetKeyInfo") {
+      return {
+        accessKeyId: "OLD",
+        permissions: {},
+        buckets: [{ id: "b1", localAliases: ["mine"], permissions: {} }],
+      };
+    }
+    if (op === "CreateKey") return { accessKeyId: "NEW", secretAccessKey: "s" };
+    if (op === "AddBucketAlias") {
+      throw new Error("Garage AddBucketAlias failed (HTTP 400): bad alias");
+    }
+    return undefined;
+  });
+  __setGarageApi(fake.fn);
+  try {
+    const { context } = makeContext();
+    await rejects(
+      () => method("key_rotate").execute({ id: "OLD" }, context),
+      /new key was deleted again/,
+    );
+    assertEquals(call(fake.calls, "DeleteKey")?.query, { id: "NEW" });
+  } finally {
+    __setGarageApi(null);
+  }
+});
+
+// ─────────────────────────── layout ───────────────────────────
+
+Deno.test("layout_apply: a staged parameters change alone is applied", async () => {
+  const fake = makeFakeApi((op) =>
+    op === "GetClusterLayout"
+      ? {
+        version: 3,
+        stagedRoleChanges: [],
+        stagedParameters: { zoneRedundancy: "maximum" },
+      }
+      : { message: [] }
+  );
+  __setGarageApi(fake.fn);
+  try {
+    const { context } = makeContext();
+    await method("layout_apply").execute({}, context);
+    assertEquals(call(fake.calls, "ApplyClusterLayout")?.body, { version: 4 });
+  } finally {
+    __setGarageApi(null);
+  }
+});
+
+Deno.test("cluster_init: a failed apply says the role is still staged", async () => {
+  const fake = makeFakeApi((op) => {
+    if (op === "GetClusterLayout") return EMPTY_LAYOUT;
+    if (op === "ApplyClusterLayout") {
+      throw new Error(
+        "Garage ApplyClusterLayout failed (HTTP 400): bad layout",
+      );
+    }
+    return undefined;
+  });
+  __setGarageApi(fake.fn);
+  try {
+    const { context } = makeContext();
+    await rejects(
+      () =>
+        method("cluster_init").execute({ nodeId: "n1", capacity: 1 }, context),
+      /HTTP 400\): bad layout; the role for n1 is still staged: run layout_revert/,
+    );
+  } finally {
+    __setGarageApi(null);
+  }
+});
+
+// ─────────────────────────── logging ───────────────────────────
+
+Deno.test("logging: the single-item reads log on entry and on completion", async () => {
+  const fake = makeFakeApi((op) => {
+    if (op === "GetBucketInfo") return { id: "b1" };
+    if (op === "GetKeyInfo") return { accessKeyId: "GK1" };
+    if (op === "GetClusterLayout") return EMPTY_LAYOUT;
+    return undefined;
+  });
+  __setGarageApi(fake.fn);
+  try {
+    const { context, logs } = makeContext();
+    await method("bucket_get").execute({ id: "b1" }, context);
+    await method("key_get").execute({ id: "GK1" }, context);
+    await method("layout_get").execute({}, context);
+    assertEquals(logs.map((l) => l.msg), [
+      "Fetching bucket",
+      "Fetched bucket",
+      "Fetching key",
+      "Fetched key",
+      "Fetching cluster layout",
+      "Fetched cluster layout",
+    ]);
+  } finally {
+    __setGarageApi(null);
+  }
+});
+
+Deno.test("logging: a listing logs how many items it wrote", async () => {
+  const fake = makeFakeApi((op) =>
+    op === "ListKeys" ? [{ id: "GK1" }, { id: "GK2" }] : undefined
+  );
+  __setGarageApi(fake.fn);
+  try {
+    const { context, logs } = makeContext();
+    await method("key_list").execute({}, context);
+    assertEquals(logs.at(-1), { msg: "Listed keys", props: { count: 2 } });
+  } finally {
+    __setGarageApi(null);
+  }
+});
+
+Deno.test("upgrade 2026.10.11.1: drops a non-positive timeoutMs, keeps the rest", () => {
+  const up = model.upgrades[0].upgradeAttributes;
+  assertEquals(
+    up({ endpoint: "http://g", adminToken: "t", timeoutMs: 0 }),
+    { endpoint: "http://g", adminToken: "t" },
+  );
+  assertEquals(
+    up({ endpoint: "http://g", timeoutMs: 5000 }),
+    { endpoint: "http://g", timeoutMs: 5000 },
+  );
+  assertEquals(up({ endpoint: "http://g" }), { endpoint: "http://g" });
 });
