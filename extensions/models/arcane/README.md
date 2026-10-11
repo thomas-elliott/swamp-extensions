@@ -64,7 +64,8 @@ swamp model method run arcane-prod swarm_stack_remove --input '{"name":"unifi"}'
   `project_up` / `project_down` / `project_redeploy` / `project_restart` /
   `project_pull` / `project_destroy`. `project_redeploy` is pull + compose up,
   which leaves an unchanged container running; `project_restart` restarts the
-  containers in place. Direct (API) authoring: `project_validate`,
+  containers in place (it does not start a project that is down, or pick up
+  compose changes). Direct (API) authoring: `project_validate`,
   `project_create`, `project_update`. Orchestration: `project_deploy`
   (validated, mode-aware, rolls back by default).
 - **`secret_*` / `config_*`** — swarm secret/config CRUD plus `secret_rotate` /
@@ -78,9 +79,9 @@ swamp model method run arcane-prod swarm_stack_remove --input '{"name":"unifi"}'
   `swarm_stack_deploy` (validate → deploy → poll convergence),
   `swarm_stack_remove` (DELETE then poll `GET → 404`, re-issuing DELETE until
   Arcane's stored record is cleared, because the first DELETE can answer 404
-  with the record still there), and `swarm_stack_tasks` (the deploy **debug view** — per-task
-  `currentState` + error, with `onlyProblems` to show just the rejected/failed
-  ones).
+  with the record still there), and `swarm_stack_tasks` (the deploy **debug
+  view** — per-task `currentState` + error, with `onlyProblems` to show just the
+  rejected/failed ones).
 - **`volume_*` / `*_prune`** — cleanup: `volume_list`, `volume_remove`
   (idempotent, refuses in-use), `volume_prune`, `network_prune`, `image_prune`.
   Docker-level, so they work on any environment, not swarm-only.
@@ -99,15 +100,16 @@ swamp model method run arcane-prod swarm_stack_remove --input '{"name":"unifi"}'
 
 `project_deploy` detects the mode from Arcane's `gitOpsManagedBy` field.
 
-In both modes, `healthTimeoutSec` covers the redeploy and the health wait
-together. Healthy means status `running`, every service running, and no
-healthcheck reporting `unhealthy` or still `starting`. Arcane holds the
-redeploy call open until compose finishes, so if the call is what runs out of
-time, Arcane may still be working on it when the rollback starts.
+In both modes, `healthTimeoutSec` (default 300) covers the redeploy and the
+health wait together. Healthy means status `running`, every service running, and
+no healthcheck reporting `unhealthy` or still `starting`. Arcane keeps running a
+redeploy after the call gives up, so when the redeploy itself runs out of time
+`project_deploy` does not roll back on top of it: it fails and leaves the
+project for you to check in Arcane.
 
-Swarm methods need Arcane to see the environment as swarm-enabled. Arcane
-stores that flag and refreshes it only at startup, so after `docker swarm init`
-outside Arcane, restart Arcane before using them.
+Swarm methods need Arcane to see the environment as swarm-enabled. Arcane stores
+that flag and refreshes it only at startup, so after `docker swarm init` outside
+Arcane, restart Arcane before using them.
 
 ## Validation gate (fail-closed)
 
@@ -204,11 +206,14 @@ rotation); the per-type prunes above cover the rest.
   always validate the compose file locally and stop if validation fails or
   cannot run. A `validate: false` still passed is ignored.
 - **`authType` accepts `none`, `http` or `ssh`, and `targetType` `project` or
-  `swarm_stack`**, the values Arcane uses. The old `token` and `swarm` were
-  never accepted by Arcane; the model upgrade rewrites them to `http` and
-  `swarm_stack` in existing definitions.
-- **`healthTimeoutSec` and `pollIntervalSec` must be positive.** `healthTimeoutSec: 0` used to switch the
-  timeout off.
+  `swarm_stack`**, the values Arcane documents. Arcane stored the old `token`
+  and `swarm` without checking them, then ran a `token` repository without
+  authentication and a `swarm` sync as a compose project. The model upgrade
+  rewrites them to `http` and `project` in existing definitions.
+- **Time arguments must be positive**, and `healthTimeoutSec` at most a day.
+  `healthTimeoutSec: 0` used to switch the timeout off.
+- **`healthTimeoutSec` defaults to 300** (was 120), since it now covers the
+  image pull as well as the health wait.
 
 ## Fixes
 
@@ -224,11 +229,16 @@ rotation); the per-type prunes above cover the rest.
 - **`project_deploy`'s `healthTimeoutSec` bounds the redeploy call.** The
   redeploy used to get a fixed limit of its own, so a compose `depends_on` that
   never became healthy held the deploy (and the model lock) past the timeout.
-- **`project_deploy` reads the redeploy's streamed body.** Arcane answers a
-  failed redeploy (an image that can't be pulled, say) with 200 and an error
-  line, so the deploy used to carry on and could report the old containers as
-  a healthy deploy.
+- **Streamed operations must finish.** Arcane answers up, pull and redeploy with
+  200 at once and ends the body with a done line or an error line (an image that
+  can't be pulled and isn't cached, say). `project_deploy` used to ignore the
+  body and could report the old containers as a healthy deploy; it and
+  `project_up`/`project_pull`/`project_redeploy` now fail on an error line or a
+  body cut short.
+- **A timed-out redeploy is not rolled back.** Arcane may still be running it,
+  and a rollback would race it.
 - **Request time limits cover the whole request.** They used to reset whenever
   data arrived, so a streamed operation printing progress could run past them.
+  Long operations get 30 minutes, more than Arcane's own limits.
 - **New `project_restart`**, using Arcane's restart, since `project_redeploy`
   does not restart an unchanged project.
