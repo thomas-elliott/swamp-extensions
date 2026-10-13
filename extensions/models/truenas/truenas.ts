@@ -11,28 +11,21 @@ import type {
 /**
  * `@thomas/truenas`: administration of a TrueNAS SCALE host via its JSON-RPC 2.0
  * API over a WebSocket (`wss://<host>/api/current`), authenticated with an API key.
- * Targets 25.04 ("Fangtooth"), which has no REST API; the WebSocket RPC is the
- * supported API.
+ * Supports 25.04 ("Fangtooth") and 25.10 ("Goldeye"); the WebSocket RPC is the
+ * supported API. Of the calls this model makes, only the SMB share schema differs
+ * between the two: 25.10 moved the host lists under `options` (see {@link smbAccessUpdate}).
  *
- * SCOPE: read what a TrueNAS host exposes, then restrict it. The set of mutating
- * methods is deliberately small:
- *   - app port binding (`app_set_port_bind`): switch a catalog app's port between
- *     `published` (on the host) and `exposed` (container-internal only).
- *   - NFS share access (`nfs_share_set_access`): set the per-share authorized
- *     `networks`/`hosts` allowlist (the only supported per-client access control).
- *   - SMB share access (`smb_share_set_access`): set per-share `hostsallow`/`hostsdeny`.
- *   - SMB/NFS share delete (`smb_share_delete`, `nfs_share_delete`): remove a share
- *     definition (the dataset/data is left untouched); the removed config is recorded
- *     so it can be re-created.
- * It does NOT change pools, datasets, users, snapshots, replication, or service
+ * Scope: read what a TrueNAS host exposes, then restrict it. The mutating methods
+ * are deliberately few and limited to app port binds, app docker networks, and NFS/SMB
+ * share access and deletion; each method's description says what it changes.
+ * It does not change pools, datasets, users, snapshots, replication, or service
  * start/stop. `filesystem_list` reads a directory and `replication_list` reads task
  * definitions; neither writes, and no verb runs or edits a replication task. Service
  * start/stop is an explicit gap because a stopped ssh/nfs service risks a lockout or
- * outage. Every mutating verb verifies its target by id/name first;
- * the set-access verbs are reversible (re-run with the prior values) and the delete
- * verbs record the removed config so the share can be re-created.
+ * outage. Every mutating verb verifies its target by id/name first and records the
+ * prior state on its result.
  *
- * TRANSPORT SAFETY: TrueNAS **permanently revokes an API key the instant it is sent
+ * Transport safety: TrueNAS **permanently revokes an API key the instant it is sent
  * over a non-TLS transport** (plain `ws://`/`http://`). This model therefore refuses
  * any non-`wss` endpoint: {@link websocketUrl} throws before a socket is opened, and
  * never downgrades `https→ws`. The certificate is always validated: Deno skips
@@ -52,14 +45,15 @@ const GlobalArgs = z.object({
   endpoint: z.string().min(1).describe(
     "TrueNAS host or wss:// base URL (required), e.g. nas.example.com or " +
       "wss://nas.example.com/api/current. A bare host becomes " +
-      "wss://<host>/api/current. NON-TLS (ws://, http://) is REJECTED — TrueNAS " +
+      "wss://<host>/api/current (the server's newest API version). " +
+      "Non-TLS endpoints (ws://, http://) are rejected: TrueNAS " +
       "revokes an API key sent over cleartext.",
   ),
-  apiKey: z.string().meta({ sensitive: true }).describe(
+  apiKey: z.string().min(1).meta({ sensitive: true }).describe(
     "TrueNAS API key (Credentials → Users → API keys). Supply via vault: " +
       "${{ vault.get(<vault>, truenas/credential) }}",
   ),
-  timeoutMs: z.coerce.number().int().default(30000).describe(
+  timeoutMs: z.coerce.number().int().positive().default(30000).describe(
     "Per-call timeout in milliseconds (also the job-wait budget)",
   ),
 });
@@ -93,18 +87,24 @@ const SystemInfo = z.object({
   timestamp: z.string(),
 });
 
-/** One published/exposed port binding on an app (from config.network.<key>). */
+/**
+ * One published/exposed port binding on an app: a catalog app's keyed
+ * config.network.<key>, or an entry of a custom app's config.ports list.
+ */
 const PortBinding = z.object({
-  portKey: z.string().describe('Config key, e.g. "ldap_port" / "admin_port"'),
+  portKey: z.string().describe(
+    'Config key, e.g. "ldap_port" / "admin_port"; "ports[<i>]" for an entry ' +
+      "of a custom app's config.ports list (select those by portNumber)",
+  ),
   portNumber: z.number(),
   protocol: z.string().describe("tcp | udp (best-effort; tcp if unknown)"),
   bindMode: z.string().describe("published | exposed"),
   hostIps: z.array(z.string()).describe(
-    'Host IPs the port publishes on; "0.0.0.0" = all interfaces',
+    'Host IPs the port publishes on; empty, "0.0.0.0" or "::" = all interfaces',
   ),
   published: z.boolean().describe("bindMode === published"),
   exposedToAll: z.boolean().describe(
-    'published AND hostIps includes "0.0.0.0"',
+    'published, and hostIps is empty or includes "0.0.0.0" or "::"',
   ),
 });
 
@@ -115,7 +115,9 @@ const AppInfo = z.object({
   version: z.string().optional(),
   humanVersion: z.string().optional(),
   hostNetwork: z.boolean().describe(
-    "Whether the app runs on the host network (ports are not individually bound)",
+    "Whether the app runs on the host network (ports are not individually bound). " +
+      "Read from config.network.host_network (catalog apps) or config.host_network " +
+      "(custom apps)",
   ),
   portBindings: z.array(PortBinding),
   action: Action,
@@ -129,13 +131,14 @@ const NfsShare = z.object({
   enabled: z.boolean(),
   ro: z.boolean(),
   networks: z.array(z.string()).describe(
-    "Authorized networks (CIDR). EMPTY = ALL networks allowed.",
+    "Authorized networks (CIDR). Empty (with hosts empty too) = all networks allowed.",
   ),
   hosts: z.array(z.string()).describe(
-    "Authorized hosts/IPs. EMPTY = ALL hosts allowed.",
+    "Authorized hosts/IPs. Empty (with networks empty too) = all hosts allowed.",
   ),
   unrestricted: z.boolean().describe(
-    "True when both networks and hosts are empty (reachable by any client)",
+    "True when any client can mount it: networks and hosts both empty, or an " +
+      'entry that admits everyone (networks "0.0.0.0/0" or "::/0", hosts "*")',
   ),
   action: Action,
   timestamp: z.string(),
@@ -147,15 +150,19 @@ const SmbShare = z.object({
   path: z.string(),
   comment: z.string().optional(),
   enabled: z.boolean(),
-  ro: z.boolean(),
+  ro: z.boolean().describe("Read-only (`readonly` on 25.10)"),
   hostsallow: z.array(z.string()).describe(
-    "Allowed hosts. EMPTY = all allowed.",
+    "Allowed hosts. Empty = all allowed. On 25.10 a purpose with no host lists " +
+      "(EXTERNAL_SHARE, VEEAM_REPOSITORY_SHARE, and all but LEGACY_SHARE on 25.10.0) " +
+      "reads as empty.",
   ),
   hostsdeny: z.array(z.string()).describe("Denied hosts."),
   purpose: z.string().describe(
-    "TrueNAS 25.04 share purpose preset. DEFAULT_SHARE/VEEAM_REPOSITORY_SHARE LOCK " +
-      "hostsallow/hostsdeny to empty — a host allowlist can't be applied without first " +
-      "moving the share to NO_PRESET (smb_share_set_access does this automatically).",
+    "Share purpose preset. Some presets hold no host lists: DEFAULT_SHARE and " +
+      "VEEAM_REPOSITORY_SHARE on 25.04, all but LEGACY_SHARE on 25.10.0. To apply host " +
+      "rules, smb_share_set_access moves a DEFAULT_SHARE to NO_PRESET (25.04) or " +
+      "LEGACY_SHARE (25.10) and does not move it back; it refuses any other preset " +
+      "without host lists.",
   ),
   unrestricted: z.boolean().describe(
     "True when hostsallow is empty (no host allowlist in force). hostsdeny does " +
@@ -180,7 +187,7 @@ const DirEntry = z.object({
   type: z.string().describe("DIRECTORY | FILE | SYMLINK | OTHER"),
   size: z.number().nullable().optional(),
   isMountpoint: z.boolean().describe(
-    "The entry is a mountpoint — for /mnt/<pool> children, a child DATASET " +
+    "The entry is a mountpoint — for /mnt/<pool> children, a child dataset " +
       "rather than a plain directory",
   ),
 });
@@ -204,7 +211,7 @@ const HostPathMount = z.object({
   configPath: z.string().describe(
     "Where it sits in the app config, e.g. storage.additional_storage[1]",
   ),
-  mountPath: z.string().describe("Path INSIDE the container"),
+  mountPath: z.string().describe("Path inside the container"),
   hostPath: z.string().describe("Path on the NAS"),
   readOnly: z.boolean(),
 });
@@ -234,11 +241,11 @@ const ReplicationTask = z.object({
     "cron-ish minute hour dom month dow, or absent when not scheduled",
   ),
   readonlyPolicy: z.string().optional().describe(
-    "TrueNAS readonly policy for the DESTINATION (SET/REQUIRE/IGNORE). SET " +
+    "TrueNAS readonly policy for the destination (SET/REQUIRE/IGNORE). SET " +
       "rewrites the destination's readonly property, which remounts it.",
   ),
   sendsProperties: z.boolean().describe(
-    "Replicates dataset PROPERTIES (incl. mountpoint/readonly) — a property " +
+    "Replicates dataset properties (incl. mountpoint/readonly) — a property " +
       "change on receive can unmount/remount the destination dataset",
   ),
   state: z.string().optional().describe("Last run state (FINISHED/ERROR/…)"),
@@ -275,7 +282,7 @@ const NetworkInfo = z.object({
 
 /** One published port across the estate, for the exposure roll-up. */
 const ExposedPort = z.object({
-  source: z.string().describe("app:<name> | service:<name>"),
+  source: z.string().describe("app:<name>"),
   portNumber: z.number(),
   protocol: z.string(),
   hostIps: z.array(z.string()),
@@ -287,12 +294,19 @@ const ExposureAudit = z.object({
   version: z.string(),
   /** Every app port with bindMode=published. */
   publishedPorts: z.array(ExposedPort),
-  /** Enabled NFS shares with no networks AND no hosts restriction. */
+  hostNetworkApps: z.array(z.string()).describe(
+    "Apps on the host network. They bind no individual ports, so publishedPorts " +
+      "cannot list them, but every port they open is on the host.",
+  ),
+  /** Enabled NFS shares any client can mount (see `nfs-share` `unrestricted`). */
   unrestrictedNfsShares: z.array(z.string()),
   /** Enabled SMB shares with an empty hostsallow. */
   unrestrictedSmbShares: z.array(z.string()),
   flags: z.object({
-    /** Published ports bound to 0.0.0.0 (reachable on every interface). */
+    /**
+     * Published ports reachable on every interface: host IPs empty (the apps
+     * library then binds 0.0.0.0 and ::), or including 0.0.0.0 or ::.
+     */
     portsOnAllInterfaces: z.array(z.number()),
     /** Plaintext LDAP (389) published anywhere. */
     plaintextLdapPublished: z.boolean(),
@@ -341,7 +355,9 @@ const DEFAULT_NETWORK_CONFIG = {
 
 /** Result of an NFS share access change. */
 const NfsShareResult = z.object({
-  id: z.number(),
+  id: z.number().nullable().describe(
+    "Share id; null when the share was already absent and was selected by path",
+  ),
   path: z.string(),
   previousNetworks: z.array(z.string()),
   previousHosts: z.array(z.string()),
@@ -353,8 +369,13 @@ const NfsShareResult = z.object({
 
 /** Result of an SMB share access change. */
 const SmbShareResult = z.object({
-  id: z.number(),
+  id: z.number().nullable().describe(
+    "Share id; null when the share was already absent and was selected by name",
+  ),
   name: z.string(),
+  path: z.string().describe(
+    "The shared path; empty when the share was already absent",
+  ),
   previousHostsallow: z.array(z.string()),
   previousHostsdeny: z.array(z.string()),
   hostsallow: z.array(z.string()),
@@ -363,24 +384,98 @@ const SmbShareResult = z.object({
     "The share's purpose preset before the change",
   ),
   purpose: z.string().describe(
-    "The share's purpose preset after the change (flipped to NO_PRESET when a " +
-      "host allowlist had to be applied to a preset that locks hostsallow)",
+    "The share's purpose preset after the change (a DEFAULT_SHARE given host " +
+      "rules moves to NO_PRESET on 25.04 or LEGACY_SHARE on 25.10)",
   ),
   action: Action,
   timestamp: z.string(),
 });
 
+/** A share row's host lists: top-level on 25.04, under `options` on 25.10. */
+function smbHostLists(
+  share: Record<string, unknown>,
+): { allow: string[]; deny: string[] } {
+  const src = share.options === undefined ? share : asObj(share.options);
+  return { allow: strArr(src.hostsallow), deny: strArr(src.hostsdeny) };
+}
+
+/** The error for a share whose purpose can't hold host rules and must not be moved. */
+function cannotHoldHostRules(name: unknown, purpose: string): Error {
+  return new Error(
+    `SMB share ${
+      JSON.stringify(name)
+    } has purpose ${purpose}, which holds no ` +
+      "host lists on this TrueNAS version. Moving it to one that does would drop " +
+      "the features that purpose provides, so nothing was changed. Change the " +
+      "purpose in the TrueNAS UI first if that is what you want.",
+  );
+}
+
 /**
- * SMB purpose presets that LOCK `hostsallow`/`hostsdeny` to empty: TrueNAS re-applies
- * the preset's empty host lists on every `sharing.smb.update`, silently discarding any
- * allowlist. To enforce host rules on such a share it must move to `NO_PRESET` (which
- * applies no preset overrides) in the same update. Discovered on SCALE 25.04 via
- * `sharing.smb.presets`.
+ * The `sharing.smb.update` payload that sets a share's host lists, and the purpose the
+ * share ends up on. Throws, before anything is sent, when host rules can't be applied.
+ *
+ * A DEFAULT_SHARE that gets host rules moves to the preset-free purpose (NO_PRESET on
+ * 25.04, LEGACY_SHARE on 25.10), which renders the same share. Any other purpose that
+ * holds no host lists is refused, as moving it would drop what it is for (Veeam's
+ * `block size`, Time Machine, WORM, per-user datasets).
+ *
+ * 25.04: the update patches top-level lists. DEFAULT_SHARE and VEEAM_REPOSITORY_SHARE
+ * re-apply empty lists on every update, discarding any allowlist without an error.
+ *
+ * 25.10: the lists sit in `options`, only for purposes that have them (LEGACY_SHARE on
+ * 25.10.0, most from 25.10.1). The update needs `purpose` with `options` and replaces
+ * the whole `options`, defaulting unsent fields, so the existing options are merged.
  */
-const HOST_LOCKING_PURPOSES = new Set([
-  "DEFAULT_SHARE",
-  "VEEAM_REPOSITORY_SHARE",
-]);
+function smbAccessUpdate(
+  share: Record<string, unknown>,
+  allow: string[],
+  deny: string[],
+): { purpose: string; payload: Record<string, unknown> } {
+  const purpose = String(share.purpose ?? "");
+  const wantHostRules = allow.length > 0 || deny.length > 0;
+
+  if (share.options === undefined) {
+    // 25.04. Clearing rules needs no purpose change.
+    if (wantHostRules && purpose === "DEFAULT_SHARE") {
+      return {
+        purpose: "NO_PRESET",
+        payload: { hostsallow: allow, hostsdeny: deny, purpose: "NO_PRESET" },
+      };
+    }
+    if (wantHostRules && purpose === "VEEAM_REPOSITORY_SHARE") {
+      throw cannotHoldHostRules(share.name, purpose);
+    }
+    return { purpose, payload: { hostsallow: allow, hostsdeny: deny } };
+  }
+
+  const options = asObj(share.options);
+  if ("hostsallow" in options) {
+    return {
+      purpose,
+      payload: {
+        purpose,
+        options: { ...options, hostsallow: allow, hostsdeny: deny },
+      },
+    };
+  }
+  // This purpose holds no host lists, so there are none to clear.
+  if (!wantHostRules) return { purpose, payload: {} };
+  if (purpose === "DEFAULT_SHARE") {
+    return {
+      purpose: "LEGACY_SHARE",
+      payload: {
+        purpose: "LEGACY_SHARE",
+        options: {
+          aapl_name_mangling: options.aapl_name_mangling ?? false,
+          hostsallow: allow,
+          hostsdeny: deny,
+        },
+      },
+    };
+  }
+  throw cannotHoldHostRules(share.name, purpose);
+}
 
 // ─────────────────────────── transport seam ───────────────────────────
 
@@ -402,7 +497,7 @@ export interface RpcSession {
 
 /**
  * Opens an authenticated {@link RpcSession} from the resolved global args. Typed
- * loosely as {@link Json} so this EXPORTED seam stays "fast-check" clean (a
+ * loosely as {@link Json} so this exported seam stays "fast-check" clean (a
  * zod-inferred arg type would put a slow type on the public API).
  */
 export type SessionFactory = (g: Json) => Promise<RpcSession>;
@@ -413,6 +508,12 @@ let _sessionOverride: SessionFactory | null = null;
 export function __setTruenasSession(fn: SessionFactory | null): void {
   _sessionOverride = fn;
 }
+
+/**
+ * The API path a bare host or `https://host` resolves to: the server's own newest API
+ * version, so the model reads the schema the server actually stores.
+ */
+const DEFAULT_API_PATH = "/api/current";
 
 /**
  * Build the `wss://<host>/api/current` URL from an operator endpoint. Accepts a bare
@@ -433,7 +534,7 @@ export function websocketUrl(endpoint: string): string {
         "API key sent over cleartext — use wss:// (or https://), never ws:// or http://",
     );
   }
-  if (u.pathname === "/" || u.pathname === "") u.pathname = "/api/current";
+  if (u.pathname === "/" || u.pathname === "") u.pathname = DEFAULT_API_PATH;
   return u.toString();
 }
 
@@ -457,6 +558,19 @@ function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
   });
 }
 
+/**
+ * The error for a socket that never opened. The WebSocket API reports no cause, and a
+ * certificate the host name does not match (TrueNAS ships a self-signed one) is the
+ * likeliest when the host is up, so say so.
+ */
+function connectionFailed(): Error {
+  return new Error(
+    "TrueNAS WebSocket connection failed. If the host is up, check that its TLS " +
+      "certificate is valid for this host name (see the README's TLS note), and " +
+      "that the NAS serves the endpoint's API path (a bare host uses /api/current).",
+  );
+}
+
 /** Minimal JSON-RPC 2.0 client over a single WebSocket. Resolves calls by id. */
 class JsonRpcSocket {
   #ws: WebSocket;
@@ -466,6 +580,7 @@ class JsonRpcSocket {
     { resolve: (v: unknown) => void; reject: (e: Error) => void }
   >();
   #closed: Error | null = null;
+  #rejectReady: (e: Error) => void = () => {};
   readonly #secret: string;
   readonly ready: Promise<void>;
 
@@ -473,9 +588,9 @@ class JsonRpcSocket {
     this.#secret = secret;
     this.#ws = new WebSocket(url);
     this.ready = new Promise((resolve, reject) => {
+      this.#rejectReady = reject;
       this.#ws.onopen = () => resolve();
-      this.#ws.onerror = () =>
-        reject(new Error("TrueNAS WebSocket connection failed"));
+      this.#ws.onerror = () => reject(connectionFailed());
     });
     this.#ws.onmessage = (ev) => this.#onMessage(ev);
     this.#ws.onclose = () => this.#fail(new Error("TrueNAS WebSocket closed"));
@@ -504,19 +619,46 @@ class JsonRpcSocket {
   #fail(err: Error): void {
     if (this.#closed) return;
     this.#closed = err;
+    // A socket can close before it opens without an error event; without this the
+    // connection would wait out the full timeout. A no-op once `ready` has resolved.
+    this.#rejectReady(connectionFailed());
     for (const waiter of this.#pending.values()) waiter.reject(err);
     this.#pending.clear();
   }
 
-  call(method: string, params: unknown[]): Promise<unknown> {
+  /**
+   * Issue one call, rejected after `timeoutMs`. A timed-out call is also dropped from
+   * the pending map, so a late reply is ignored and the map does not grow over a
+   * long session.
+   */
+  call(
+    method: string,
+    params: unknown[],
+    timeoutMs: number,
+    label = `call ${method}`,
+  ): Promise<unknown> {
     if (this.#closed) return Promise.reject(this.#closed);
     const id = this.#nextId++;
     const frame = JSON.stringify({ jsonrpc: "2.0", id, method, params });
     return new Promise((resolve, reject) => {
-      this.#pending.set(id, { resolve, reject });
+      const timer = setTimeout(() => {
+        this.#pending.delete(id);
+        reject(new Error(`TrueNAS ${label} timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
+      this.#pending.set(id, {
+        resolve: (v) => {
+          clearTimeout(timer);
+          resolve(v);
+        },
+        reject: (e) => {
+          clearTimeout(timer);
+          reject(e);
+        },
+      });
       try {
         this.#ws.send(frame);
       } catch (err) {
+        clearTimeout(timer);
         this.#pending.delete(id);
         reject(err instanceof Error ? err : new Error(String(err)));
       }
@@ -540,8 +682,9 @@ const realSessionFactory: SessionFactory = async (g) => {
   const sock = new JsonRpcSocket(url, secret);
   try {
     await withTimeout(sock.ready, timeoutMs, "connection");
-    const authed = await withTimeout(
-      sock.call("auth.login_with_api_key", [secret]),
+    const authed = await sock.call(
+      "auth.login_with_api_key",
+      [secret],
       timeoutMs,
       "login",
     );
@@ -555,11 +698,7 @@ const realSessionFactory: SessionFactory = async (g) => {
   return {
     async call(method, params) {
       try {
-        return await withTimeout(
-          sock.call(method, params),
-          timeoutMs,
-          `call ${method}`,
-        );
+        return await sock.call(method, params, timeoutMs);
       } catch (err) {
         throw new Error(
           redact(err instanceof Error ? err.message : String(err), secret),
@@ -622,9 +761,37 @@ function strArr(v: unknown): string[] {
 const JOB_DONE = new Set(["SUCCESS", "FAILED", "ABORTED"]);
 
 /**
+ * Appended when a change call's outcome is unknown: TrueNAS carries on after a
+ * timeout or a dropped socket, so a caller must not assume nothing changed.
+ */
+const MAY_YET_APPLY =
+  "The change may yet apply: re-read the target before retrying or reverting.";
+
+/**
+ * Make one call that changes state. A JSON-RPC error is passed on as it is: usually
+ * TrueNAS refusing the change, though a failure after its database write (a service
+ * reload, say) also answers this way. Any other failure (a timeout, a closed socket)
+ * leaves the outcome unknown, so the error says the change may yet apply.
+ */
+async function callChange(
+  session: RpcSession,
+  method: string,
+  params: unknown[],
+): Promise<unknown> {
+  try {
+    return await session.call(method, params);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (message.includes("JSON-RPC error")) throw err;
+    throw new Error(`${method}: ${message}. ${MAY_YET_APPLY}`);
+  }
+}
+
+/**
  * Submit a job-returning RPC (such as `app.update`) and wait for it to finish by
  * polling `core.get_jobs`. Returns the job's `result`; throws (with the job error) on
- * a FAILED/ABORTED terminal state or if the wait times out.
+ * a FAILED/ABORTED terminal state or if the wait times out. A timed-out job keeps
+ * running on TrueNAS.
  */
 async function callJob(
   session: RpcSession,
@@ -632,7 +799,7 @@ async function callJob(
   params: unknown[],
   timeoutMs: number,
 ): Promise<unknown> {
-  const jobIdRaw = await session.call(method, params);
+  const jobIdRaw = await callChange(session, method, params);
   const jobId = asNum(jobIdRaw);
   if (jobId === undefined) {
     throw new Error(
@@ -642,9 +809,18 @@ async function callJob(
   const deadline = Date.now() + timeoutMs;
   // Poll until terminal. Interval is short; the per-call timeout still bounds each poll.
   while (true) {
-    const jobs = asArr(
-      await session.call("core.get_jobs", [[["id", "=", jobId]]]),
-    );
+    let jobsRaw: unknown;
+    try {
+      jobsRaw = await session.call("core.get_jobs", [[["id", "=", jobId]]]);
+    } catch (err) {
+      // The job was submitted, so any poll failure leaves its outcome unknown.
+      throw new Error(
+        `${method} job ${jobId}: polling failed (${
+          err instanceof Error ? err.message : String(err)
+        }). ${MAY_YET_APPLY}`,
+      );
+    }
+    const jobs = asArr(jobsRaw);
     if (jobs.length === 0) {
       throw new Error(`${method} job ${jobId} not found in core.get_jobs`);
     }
@@ -652,14 +828,23 @@ async function callJob(
     const state = String(job.state ?? "");
     if (JOB_DONE.has(state)) {
       if (state !== "SUCCESS") {
-        const err = asObj(job.exc_info).type ?? job.error ?? state;
-        throw new Error(`${method} job ${jobId} ${state}: ${String(err)}`);
+        // `error` carries the reason (for a validation failure, each field and
+        // why); `exc_info.type` is only the class, e.g. VALIDATION.
+        const excInfo = asObj(job.exc_info);
+        const reason = asStr(job.error) ?? asStr(excInfo.repr) ?? state;
+        const type = asStr(excInfo.type);
+        throw new Error(
+          `${method} job ${jobId} ${state}: ${
+            type ? `${type}: ${reason}` : reason
+          }`,
+        );
       }
       return job.result;
     }
     if (Date.now() > deadline) {
       throw new Error(
-        `${method} job ${jobId} did not finish within ${timeoutMs}ms (state=${state})`,
+        `${method} job ${jobId} did not finish within ${timeoutMs}ms ` +
+          `(state=${state}). The job is still running on TrueNAS. ${MAY_YET_APPLY}`,
       );
     }
     await new Promise((r) => setTimeout(r, 750));
@@ -668,52 +853,88 @@ async function callJob(
 
 // ─────────────────────────── shaping ───────────────────────────
 
-/** Known protocol hints per app port key (config.network rarely carries protocol). */
+/**
+ * Whether a published port listens on every interface. The apps library binds
+ * an empty host_ips list to ["0.0.0.0", "::"] (truenas/apps
+ * library/<v>/container.py add_port), and "::" alone covers every IPv6
+ * interface, so all three count.
+ */
+function bindsAllInterfaces(hostIps: string[]): boolean {
+  return hostIps.length === 0 || hostIps.includes("0.0.0.0") ||
+    hostIps.includes("::");
+}
+
+function shapePortBinding(
+  portKey: string,
+  p: Record<string, unknown>,
+): z.infer<typeof PortBinding> {
+  const hostIps = strArr(p.host_ips);
+  const bindMode = String(p.bind_mode);
+  const published = bindMode === "published";
+  return {
+    portKey,
+    portNumber: asNum(p.port_number) ?? 0,
+    protocol: String(p.protocol ?? "tcp"),
+    bindMode,
+    hostIps,
+    published,
+    exposedToAll: published && bindsAllInterfaces(hostIps),
+  };
+}
+
+/**
+ * Port bindings in both config forms: catalog apps key each port object under
+ * config.network, custom (ix-app) apps keep an unkeyed config.ports list.
+ */
 function shapePortBindings(
-  network: Record<string, unknown>,
+  config: Record<string, unknown>,
 ): z.infer<typeof PortBinding>[] {
   const out: z.infer<typeof PortBinding>[] = [];
-  for (const [key, val] of Object.entries(network)) {
+  for (const [key, val] of Object.entries(asObj(config.network))) {
     const p = asObj(val);
     // A port object has port_number + bind_mode; skip scalars like host_network/networks.
     if (p.port_number === undefined || p.bind_mode === undefined) continue;
-    const hostIps = strArr(p.host_ips);
-    const bindMode = String(p.bind_mode);
-    const published = bindMode === "published";
-    out.push({
-      portKey: key,
-      portNumber: asNum(p.port_number) ?? 0,
-      protocol: String(p.protocol ?? "tcp"),
-      bindMode,
-      hostIps,
-      published,
-      exposedToAll: published && hostIps.includes("0.0.0.0"),
-    });
+    out.push(shapePortBinding(key, p));
   }
+  asArr(config.ports).forEach((val, i) => {
+    const p = asObj(val);
+    if (p.port_number === undefined || p.bind_mode === undefined) return;
+    out.push(shapePortBinding(`ports[${i}]`, p));
+  });
   return out.sort((a, b) => a.portNumber - b.portNumber);
 }
 
 function shapeApp(raw: unknown, ts: string): z.infer<typeof AppInfo> {
   const a = asObj(raw);
   const config = asObj(a.config);
-  const network = asObj(config.network);
   return {
     name: String(a.name ?? ""),
     state: String(a.state ?? "UNKNOWN"),
     customApp: asBool(a.custom_app),
     version: asStr(a.version),
     humanVersion: asStr(a.human_version),
-    hostNetwork: asBool(network.host_network),
-    portBindings: shapePortBindings(network),
+    hostNetwork: asBool(asObj(config.network).host_network) ||
+      asBool(config.host_network),
+    portBindings: shapePortBindings(config),
     action: "observed",
     timestamp: ts,
   };
 }
 
+/**
+ * Entries that admit every client. TrueNAS treats empty lists as `0.0.0.0/0` plus
+ * `::/0`, and a `*` host as "everybody" (middleware plugins/nfs.py), so a share
+ * listing one of these is as open as one with no restriction at all.
+ */
+const NFS_OPEN_NETWORKS = new Set(["0.0.0.0/0", "::/0"]);
+
 function shapeNfs(raw: unknown, ts: string): z.infer<typeof NfsShare> {
   const s = asObj(raw);
   const networks = strArr(s.networks);
   const hosts = strArr(s.hosts);
+  // An export admits a client that matches any entry, so one open entry opens it.
+  const unrestricted = (networks.length === 0 && hosts.length === 0) ||
+    networks.some((n) => NFS_OPEN_NETWORKS.has(n)) || hosts.includes("*");
   return {
     id: asNum(s.id) ?? 0,
     path: String(s.path ?? ""),
@@ -722,7 +943,7 @@ function shapeNfs(raw: unknown, ts: string): z.infer<typeof NfsShare> {
     ro: asBool(s.ro),
     networks,
     hosts,
-    unrestricted: networks.length === 0 && hosts.length === 0,
+    unrestricted,
     action: "observed",
     timestamp: ts,
   };
@@ -730,18 +951,18 @@ function shapeNfs(raw: unknown, ts: string): z.infer<typeof NfsShare> {
 
 function shapeSmb(raw: unknown, ts: string): z.infer<typeof SmbShare> {
   const s = asObj(raw);
-  const hostsallow = strArr(s.hostsallow);
+  const hosts = smbHostLists(s);
   return {
     id: asNum(s.id) ?? 0,
     name: String(s.name ?? ""),
     path: String(s.path ?? ""),
     comment: asStr(s.comment),
     enabled: asBool(s.enabled),
-    ro: asBool(s.ro),
-    hostsallow,
-    hostsdeny: strArr(s.hostsdeny),
+    ro: asBool(s.readonly ?? s.ro),
+    hostsallow: hosts.allow,
+    hostsdeny: hosts.deny,
     purpose: String(s.purpose ?? ""),
-    unrestricted: hostsallow.length === 0,
+    unrestricted: hosts.allow.length === 0,
     action: "observed",
     timestamp: ts,
   };
@@ -848,10 +1069,27 @@ function shapeReplication(
   };
 }
 
-/** A path as a data-instance name: `/mnt/Backup/apps` → `mnt-Backup-apps`. */
-function pathKey(path: string): string {
-  const key = path.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
-  return key || "root";
+/**
+ * The data name for a record: `<spec>` for one record per model, `<spec>:<key>`
+ * for a keyed one. swamp keys stored data by model + name, not by spec, so the
+ * spec has to be in the name or two specs overwrite each other.
+ *
+ * swamp rejects `/`, `\`, `..` and NUL in a name. A path can hold all of them,
+ * and any other character too (`:`, `-` and `%` included), so no plain
+ * substitution is safe. Instead they are percent-escaped, and `%` itself is
+ * escaped first: every `%` in the result then starts an escape, so the name
+ * decodes back to exactly one key and two keys never share a name.
+ * `/mnt/Backup` becomes `dir-listing:%2Fmnt%2FBackup`.
+ */
+function dataName(spec: string, key?: string | number): string {
+  if (key === undefined) return spec;
+  const safe = String(key)
+    .replaceAll("%", "%25")
+    .replaceAll("/", "%2F")
+    .replaceAll("\\", "%5C")
+    .replaceAll("\0", "%00")
+    .replaceAll("..", ".%2E");
+  return `${spec}:${safe}`;
 }
 
 // ─────────────────────────── method argument schemas ───────────────────────────
@@ -861,7 +1099,9 @@ const Empty = z.object({});
 const AppSetPortBindArgs = z.object({
   app: z.string().describe("App name (from app_list)"),
   portKey: z.string().optional().describe(
-    'Port config key, e.g. "ldap_port", "admin_port" (preferred; from app_list portBindings)',
+    'Port config key, e.g. "ldap_port", "admin_port" (preferred; from app_list ' +
+      'portBindings). A custom app\'s list-form port ("ports[<i>]" in app_list) ' +
+      "has no key: select it by portNumber.",
   ),
   portNumber: z.coerce.number().int().optional().describe(
     "Alternatively select the port by its current number",
@@ -883,7 +1123,7 @@ const AppSetPortBindArgs = z.object({
 );
 
 const FilesystemListArgs = z.object({
-  // `--input path='["/a","/b"]'` arrives as a STRING (the CLI only decodes JSON for
+  // `--input path='["/a","/b"]'` arrives as a string (the CLI only decodes JSON for
   // a declared array type, and this field also accepts a bare path). Decode a
   // leading-`[` string here, or the whole JSON string is listed as one path name.
   path: z.preprocess((v) => {
@@ -894,12 +1134,14 @@ const FilesystemListArgs = z.object({
     }
     return v;
   }, z.union([z.string(), z.array(z.string())])).describe(
-    "Absolute path to list, e.g. /mnt/Backup, or a JSON LIST of paths to list in " +
+    "Absolute path to list, e.g. /mnt/Backup, or a JSON list of paths to list in " +
       'one run, e.g. \'["/mnt/Backup","/mnt/Backup/apps"]\' (host paths, not ' +
       "container paths)",
   ),
-  maxEntries: z.coerce.number().int().default(500).describe(
-    "Cap on entries recorded (a media dataset can hold thousands)",
+  // 0 is allowed: it records whether the path exists without its entries.
+  maxEntries: z.coerce.number().int().nonnegative().default(500).describe(
+    "Cap on entries recorded (a media dataset can hold thousands); 0 records " +
+      "only whether the path exists",
   ),
 });
 
@@ -912,7 +1154,7 @@ const AppStorageArgs = z.object({
 const AppSetNetworksArgs = z.object({
   app: z.string().describe("App name (from app_list)"),
   networks: z.array(z.string()).describe(
-    "The COMPLETE desired set of docker network names to attach the app to (e.g. " +
+    "The complete desired set of docker network names to attach the app to (e.g. " +
       '["ix-scrutiny_default","ix-lldap_default"]). Existing entries are preserved ' +
       "(their config kept); entries not listed are detached. Reversible: re-run with " +
       "the prior set. Use to attach a reverse-proxy app to other apps' bridges.",
@@ -927,7 +1169,7 @@ const NfsShareSetAccessArgs = z.object({
     "Alternatively select the share by export path",
   ),
   networks: z.array(z.string()).optional().describe(
-    'Authorized networks in CIDR, e.g. ["192.0.2.161/32"]. Empty array CLEARS ' +
+    'Authorized networks in CIDR, e.g. ["192.0.2.161/32"]. Empty array clears ' +
       "the restriction (all networks). Omit to leave networks unchanged.",
   ),
   hosts: z.array(z.string()).optional().describe(
@@ -1011,6 +1253,22 @@ async function resolveApp(
   return asObj(app);
 }
 
+/**
+ * Refuse an app installed from compose YAML (`custom_app: true`). Its `app.update`
+ * takes a whole compose file and ignores `values` (middleware plugins/apps/crud.py
+ * `update_internal`), so the value edits the app methods make cannot apply and the
+ * job would fail with a confusing "custom_compose_config required". The UI's
+ * "Custom App" is not one of these: it is the `ix-app` catalog app and takes values.
+ */
+function refuseComposeApp(app: Record<string, unknown>, method: string): void {
+  if (app.custom_app !== true) return;
+  throw new Error(
+    `app ${JSON.stringify(app.name)} was installed from compose YAML ` +
+      `(custom_app), which ${method} cannot edit: such an app takes a whole ` +
+      "compose file on update. Nothing was changed.",
+  );
+}
+
 /** Find an NFS share by id or path; throws if absent/ambiguous. */
 async function resolveNfs(
   session: RpcSession,
@@ -1057,7 +1315,7 @@ async function resolveSmb(
 
 /**
  * Like {@link resolveNfs} but returns `null` when no share matches (idempotent
- * delete path). Still throws on an AMBIGUOUS selector, because it cannot tell which
+ * delete path). Still throws on an ambiguous selector, because it cannot tell which
  * of several matches to delete.
  */
 async function resolveNfsOrNull(
@@ -1081,7 +1339,7 @@ async function resolveNfsOrNull(
 
 /**
  * Like {@link resolveSmb} but returns `null` when no share matches (idempotent
- * delete path). Still throws on an AMBIGUOUS selector.
+ * delete path). Still throws on an ambiguous selector.
  */
 async function resolveSmbOrNull(
   session: RpcSession,
@@ -1106,14 +1364,32 @@ async function resolveSmbOrNull(
 
 /**
  * The `@thomas/truenas` model definition: read/audit methods over apps, NFS/SMB
- * shares, services, and network exposure, plus a few reversible mutating methods
- * (app port bind mode, NFS/SMB share access). See the module header for scope and the
- * transport-safety guarantee.
+ * shares, services, and network exposure, plus a few mutating methods. See the module
+ * header for scope and the transport-safety guarantee.
  */
 export const model = {
   type: "@thomas/truenas",
-  version: "2026.06.24.1",
+  version: "2026.10.11.1",
   globalArguments: GlobalArgs,
+  upgrades: [
+    {
+      toVersion: "2026.10.11.1",
+      description:
+        "insecureSkipTlsVerify is removed; the certificate is always validated. timeoutMs must now be positive; a zero or negative value is dropped so the 30000 ms default applies. Stored data is renamed to <spec>:<key> (or <spec>); records under the old names are left as they are and are not migrated. Several methods change behaviour; see the README's Breaking changes.",
+      upgradeAttributes: (
+        old: Record<string, unknown>,
+      ): Record<string, unknown> => {
+        // It never worked: Deno cannot skip certificate checks per connection.
+        const { insecureSkipTlsVerify: _, ...rest } = old;
+        // Zero or negative used to mean 30000 silently, so dropping it keeps that.
+        if (Number(rest.timeoutMs) <= 0) {
+          const { timeoutMs: _t, ...withoutTimeout } = rest;
+          return withoutTimeout;
+        }
+        return rest;
+      },
+    },
+  ],
   checks: {
     "reachable": {
       description:
@@ -1151,22 +1427,25 @@ export const model = {
       lifetime: "1h",
       garbageCollection: 5,
     },
+    // Observations of apps and shares expire after an hour, like `service`: nothing
+    // deletes the record of an app or share that is gone, so a longer-lived one would
+    // go on reporting it as live.
     "app": {
       description: "An installed app with its published/exposed port bindings",
       schema: AppInfo,
-      lifetime: "infinite",
+      lifetime: "1h",
       garbageCollection: 10,
     },
     "nfs-share": {
       description: "An NFS export with its networks/hosts allowlist",
       schema: NfsShare,
-      lifetime: "infinite",
+      lifetime: "1h",
       garbageCollection: 10,
     },
     "smb-share": {
       description: "An SMB share with its hostsallow/hostsdeny",
       schema: SmbShare,
-      lifetime: "infinite",
+      lifetime: "1h",
       garbageCollection: 10,
     },
     "service": {
@@ -1201,7 +1480,7 @@ export const model = {
       garbageCollection: 5,
     },
     "exposure-audit": {
-      description: "Service-exposure roll-up across apps/shares/services",
+      description: "Exposure roll-up across apps and NFS/SMB shares",
       schema: ExposureAudit,
       lifetime: "infinite",
       garbageCollection: 10,
@@ -1247,19 +1526,24 @@ export const model = {
           logInfo(context, "Fetching system.info");
           const raw = asObj(await session.call("system.info", []));
           const ts = new Date().toISOString();
-          const handle = await context.writeResource("system-info", "main", {
-            hostname: String(raw.hostname ?? "unknown"),
-            version: String(raw.version ?? "unknown"),
-            uptimeSeconds: nullableNum(raw.uptime_seconds),
-            loadAvg: Array.isArray(raw.loadavg)
-              ? raw.loadavg.map((n) => asNum(n) ?? 0)
-              : undefined,
-            physmem: nullableNum(raw.physmem),
-            model: asStr(raw.model),
-            cores: nullableNum(raw.cores),
-            action: "observed",
-            timestamp: ts,
-          });
+          const handle = await context.writeResource(
+            "system-info",
+            dataName("system-info"),
+            {
+              hostname: String(raw.hostname ?? "unknown"),
+              version: String(raw.version ?? "unknown"),
+              uptimeSeconds: nullableNum(raw.uptime_seconds),
+              loadAvg: Array.isArray(raw.loadavg)
+                ? raw.loadavg.map((n) => asNum(n) ?? 0)
+                : undefined,
+              physmem: nullableNum(raw.physmem),
+              model: asStr(raw.model),
+              cores: nullableNum(raw.cores),
+              action: "observed",
+              timestamp: ts,
+            },
+          );
+          logInfo(context, "Recorded system info");
           return { dataHandles: [handle] };
         } finally {
           session.close();
@@ -1291,9 +1575,14 @@ export const model = {
             const shaped = shapeApp(raw, ts);
             if (!shaped.name) continue;
             handles.push(
-              await context.writeResource("app", shaped.name, shaped),
+              await context.writeResource(
+                "app",
+                dataName("app", shaped.name),
+                shaped,
+              ),
             );
           }
+          logInfo(context, "Recorded apps", { count: handles.length });
           return { dataHandles: handles };
         } finally {
           session.close();
@@ -1321,13 +1610,12 @@ export const model = {
             handles.push(
               await context.writeResource(
                 "nfs-share",
-                // Prefixed: TrueNAS numbers NFS shares, SMB shares and replication
-                // tasks separately, and swamp names data per model, not per spec.
-                `nfs-${shaped.id}`,
+                dataName("nfs-share", shaped.id),
                 shaped,
               ),
             );
           }
+          logInfo(context, "Recorded NFS shares", { count: handles.length });
           return { dataHandles: handles };
         } finally {
           session.close();
@@ -1355,11 +1643,12 @@ export const model = {
             handles.push(
               await context.writeResource(
                 "smb-share",
-                `smb-${shaped.id}`,
+                dataName("smb-share", shaped.id),
                 shaped,
               ),
             );
           }
+          logInfo(context, "Recorded SMB shares", { count: handles.length });
           return { dataHandles: handles };
         } finally {
           session.close();
@@ -1386,9 +1675,14 @@ export const model = {
             const shaped = shapeService(raw, ts);
             if (!shaped.service) continue;
             handles.push(
-              await context.writeResource("service", shaped.service, shaped),
+              await context.writeResource(
+                "service",
+                dataName("service", shaped.service),
+                shaped,
+              ),
             );
           }
+          logInfo(context, "Recorded services", { count: handles.length });
           return { dataHandles: handles };
         } finally {
           session.close();
@@ -1451,12 +1745,20 @@ export const model = {
               interface: interfaceOf.get(address),
             };
           });
-          const handle = await context.writeResource("network-info", "main", {
-            bindableIps,
-            interfaces,
-            guiAddresses: strArr(general.ui_address),
-            action: "observed",
-            timestamp: ts,
+          const handle = await context.writeResource(
+            "network-info",
+            dataName("network-info"),
+            {
+              bindableIps,
+              interfaces,
+              guiAddresses: strArr(general.ui_address),
+              action: "observed",
+              timestamp: ts,
+            },
+          );
+          logInfo(context, "Recorded network info", {
+            bindableIps: bindableIps.length,
+            interfaces: interfaces.length,
           });
           return { dataHandles: [handle] };
         } finally {
@@ -1468,7 +1770,7 @@ export const model = {
     filesystem_list: {
       description:
         "List directories on the NAS (`filesystem.listdir`) — entries with type/size " +
-        "and a mountpoint flag (a child dataset). Read-only. Takes one path or a LIST " +
+        "and a mountpoint flag (a child dataset). Read-only. Takes one path or a list " +
         "of paths and writes one `dir-listing` each (fan-out: one session, one model " +
         "lock). A path that is absent records exists=false instead of failing, so this " +
         'answers "does this backup/app source path still exist?" in one call.',
@@ -1479,7 +1781,8 @@ export const model = {
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const g = context.globalArgs;
         const a = FilesystemListArgs.parse(rawArgs);
-        const paths = Array.isArray(a.path) ? a.path : [a.path];
+        // Deduplicated: a path listed twice would write the same data name twice.
+        const paths = [...new Set(Array.isArray(a.path) ? a.path : [a.path])];
         const session = await openSession(g);
         try {
           const handles: DataHandle[] = [];
@@ -1498,36 +1801,47 @@ export const model = {
                 throw e;
               }
               handles.push(
-                await context.writeResource("dir-listing", pathKey(path), {
-                  path,
-                  exists: false,
-                  entryCount: 0,
-                  truncated: false,
-                  entries: [],
-                  error: message,
-                  action: "observed",
-                  timestamp: ts,
-                }),
+                await context.writeResource(
+                  "dir-listing",
+                  dataName("dir-listing", path),
+                  {
+                    path,
+                    exists: false,
+                    entryCount: 0,
+                    truncated: false,
+                    entries: [],
+                    error: message,
+                    action: "observed",
+                    timestamp: ts,
+                  },
+                ),
               );
               continue;
             }
-            // Sort BEFORE truncating, so the entries kept under maxEntries are
+            // Sort before truncating, so the entries kept under maxEntries are
             // deterministic rather than dependent on listdir order.
             const all = rows.map(shapeDirEntry)
               .sort((x, y) => x.name.localeCompare(y.name));
             const entries = all.slice(0, a.maxEntries);
             handles.push(
-              await context.writeResource("dir-listing", pathKey(path), {
-                path,
-                exists: true,
-                entryCount: entries.length,
-                truncated: all.length > entries.length,
-                entries,
-                action: "observed",
-                timestamp: ts,
-              }),
+              await context.writeResource(
+                "dir-listing",
+                dataName("dir-listing", path),
+                {
+                  path,
+                  exists: true,
+                  entryCount: entries.length,
+                  truncated: all.length > entries.length,
+                  entries,
+                  action: "observed",
+                  timestamp: ts,
+                },
+              ),
             );
           }
+          logInfo(context, "Recorded directory listings", {
+            count: handles.length,
+          });
           return { dataHandles: handles };
         } finally {
           session.close();
@@ -1571,17 +1885,20 @@ export const model = {
             collectHostPaths(app.config, "", mounts);
             mounts.sort((x, y) => x.mountPath.localeCompare(y.mountPath));
             handles.push(
-              // Suffixed: a bare app name would collide with the `app` instance
-              // app_list writes into this model's shared data namespace.
-              await context.writeResource("app-storage", `${name}-storage`, {
-                app: name,
-                mountCount: mounts.length,
-                mounts,
-                action: "observed",
-                timestamp: ts,
-              }),
+              await context.writeResource(
+                "app-storage",
+                dataName("app-storage", name),
+                {
+                  app: name,
+                  mountCount: mounts.length,
+                  mounts,
+                  action: "observed",
+                  timestamp: ts,
+                },
+              ),
             );
           }
+          logInfo(context, "Recorded app storage", { count: handles.length });
           return { dataHandles: handles };
         } finally {
           session.close();
@@ -1611,14 +1928,16 @@ export const model = {
           for (const raw of rows) {
             const shaped = shapeReplication(raw, ts);
             handles.push(
-              // Prefixed, like the shares: see nfs_share_list.
               await context.writeResource(
                 "replication-task",
-                `repl-${shaped.id}`,
+                dataName("replication-task", shaped.id),
                 shaped,
               ),
             );
           }
+          logInfo(context, "Recorded replication tasks", {
+            count: handles.length,
+          });
           return { dataHandles: handles };
         } finally {
           session.close();
@@ -1628,9 +1947,10 @@ export const model = {
 
     exposure_audit: {
       description:
-        "Roll up service exposure across apps/NFS/SMB/services into one report " +
-        "(published ports, unrestricted shares, 0.0.0.0 binds, plaintext-LDAP flag). " +
-        "Read-only.",
+        "Roll up exposure across apps and NFS/SMB shares into one report (published " +
+        "app ports, host-network apps, unrestricted shares, all-interface binds, " +
+        "plaintext-LDAP flag). Read-only. System services (SSH, SMB, NFS, the web " +
+        "UI) are not covered: use service_list.",
       arguments: Empty,
       execute: async (
         _rawArgs,
@@ -1662,10 +1982,12 @@ export const model = {
           const ts = new Date().toISOString();
 
           const publishedPorts: z.infer<typeof ExposedPort>[] = [];
+          const hostNetworkApps: string[] = [];
           const portsOnAll = new Set<number>();
           let plaintextLdap = false;
           for (const raw of apps) {
             const shaped = shapeApp(raw, ts);
+            if (shaped.hostNetwork) hostNetworkApps.push(shaped.name);
             for (const pb of shaped.portBindings) {
               if (!pb.published) continue;
               publishedPorts.push({
@@ -1675,7 +1997,7 @@ export const model = {
                 hostIps: pb.hostIps,
                 detail: pb.portKey,
               });
-              if (pb.hostIps.includes("0.0.0.0")) portsOnAll.add(pb.portNumber);
+              if (pb.exposedToAll) portsOnAll.add(pb.portNumber);
               if (pb.portNumber === 389) plaintextLdap = true;
             }
           }
@@ -1689,22 +2011,32 @@ export const model = {
             .map((r) => String(asObj(r).address ?? ""))
             .filter((a) => a && a !== "0.0.0.0");
 
-          const handle = await context.writeResource("exposure-audit", "main", {
-            hostname: String(info.hostname ?? "unknown"),
-            version: String(info.version ?? "unknown"),
-            publishedPorts,
-            unrestrictedNfsShares: unrestrictedNfs,
-            unrestrictedSmbShares: unrestrictedSmb,
-            flags: {
-              portsOnAllInterfaces: [...portsOnAll].sort((a, b) => a - b),
-              plaintextLdapPublished: plaintextLdap,
-              nonWildcardBindableIps: nonWildcard,
+          const handle = await context.writeResource(
+            "exposure-audit",
+            dataName("exposure-audit"),
+            {
+              hostname: String(info.hostname ?? "unknown"),
+              version: String(info.version ?? "unknown"),
+              publishedPorts,
+              hostNetworkApps: hostNetworkApps.sort(),
+              unrestrictedNfsShares: unrestrictedNfs,
+              unrestrictedSmbShares: unrestrictedSmb,
+              flags: {
+                portsOnAllInterfaces: [...portsOnAll].sort((a, b) => a - b),
+                plaintextLdapPublished: plaintextLdap,
+                nonWildcardBindableIps: nonWildcard,
+              },
+              appCount: apps.length,
+              nfsShareCount: nfs.length,
+              smbShareCount: smb.length,
+              action: "observed",
+              timestamp: ts,
             },
-            appCount: apps.length,
-            nfsShareCount: nfs.length,
-            smbShareCount: smb.length,
-            action: "observed",
-            timestamp: ts,
+          );
+          logInfo(context, "Recorded exposure audit", {
+            publishedPorts: publishedPorts.length,
+            unrestrictedNfsShares: unrestrictedNfs.length,
+            unrestrictedSmbShares: unrestrictedSmb.length,
           });
           return { dataHandles: [handle] };
         } finally {
@@ -1719,7 +2051,9 @@ export const model = {
         "Change one app port's bind mode (published↔exposed) and/or host IPs. " +
         "Verifies the app + port first, sends the full reconstructed port object so " +
         "port_number/certificate_id survive, then waits for the app.update job. " +
-        "Reversible: re-run with the prior bindMode/hostIps.",
+        "A portNumber that matches more than one port is refused, as is an app " +
+        "installed from compose YAML. Reversible: re-run with the prior " +
+        "bindMode/hostIps.",
       arguments: AppSetPortBindArgs,
       execute: async (
         rawArgs,
@@ -1730,9 +2064,10 @@ export const model = {
         const session = await openSession(g);
         try {
           const app = await resolveApp(session, a.app);
+          refuseComposeApp(app, "app_set_port_bind");
           const cfg = asObj(app.config);
 
-          // Some apps store ports as a LIST (config.ports: [{port_number,bind_mode,
+          // Some apps store ports as a list (config.ports: [{port_number,bind_mode,
           // host_ips,…}]) instead of the keyed config.network map (e.g. kopia, custom
           // apps). That form is handled in its own branch; list entries have no key,
           // so they're selected by portNumber.
@@ -1743,6 +2078,26 @@ export const model = {
               (v) => asNum(asObj(v).port_number) === a.portNumber,
             );
           if (portsList.length > 0 && !inNetworkMap) {
+            // A portKey names no list entry (they have none), so one given here
+            // matched nothing. Refuse rather than drop it and act on the number.
+            if (a.portKey) {
+              throw new Error(
+                `portKey ${JSON.stringify(a.portKey)} is not a key of ` +
+                  `config.network on ${a.app}. Its config.ports list entries ` +
+                  "have no key: select one by portNumber alone.",
+              );
+            }
+            const matches = portsList.filter((p) =>
+              asNum(p.port_number) === a.portNumber
+            );
+            // The list can hold one number twice (say tcp and udp); changing only
+            // the first would be a guess.
+            if (matches.length > 1) {
+              throw new Error(
+                `portNumber ${a.portNumber} matches ${matches.length} entries in ` +
+                  `config.ports of ${a.app}, so the port to change is ambiguous.`,
+              );
+            }
             const idx = portsList.findIndex(
               (p) =>
                 a.portNumber !== undefined &&
@@ -1769,7 +2124,7 @@ export const model = {
             if (newMode === prevMode && sameStrArr(newIps, prevIps)) {
               const handle = await context.writeResource(
                 "app-port-result",
-                `${a.app}:${pkLabel}`,
+                dataName("app-port-result", `${a.app}:${pkLabel}`),
                 {
                   app: a.app,
                   portKey: pkLabel,
@@ -1781,6 +2136,11 @@ export const model = {
                   action: "unchanged",
                   timestamp: lts,
                 },
+              );
+              logInfo(
+                context,
+                "Port binding already at desired state — no change",
+                { app: a.app, portKey: pkLabel },
               );
               return { dataHandles: [handle] };
             }
@@ -1812,7 +2172,7 @@ export const model = {
             ) ?? {};
             const handle = await context.writeResource(
               "app-port-result",
-              `${a.app}:${pkLabel}`,
+              dataName("app-port-result", `${a.app}:${pkLabel}`),
               {
                 app: a.app,
                 portKey: pkLabel,
@@ -1825,6 +2185,10 @@ export const model = {
                 timestamp: lts,
               },
             );
+            logInfo(context, "App port binding updated", {
+              app: a.app,
+              portKey: pkLabel,
+            });
             return { dataHandles: [handle] };
           }
 
@@ -1832,16 +2196,16 @@ export const model = {
           // Locate the target port object in config.network.
           let portKey = a.portKey;
           if (!portKey) {
-            for (const [k, v] of Object.entries(network)) {
-              const p = asObj(v);
-              if (
-                p.port_number !== undefined &&
-                asNum(p.port_number) === a.portNumber
-              ) {
-                portKey = k;
-                break;
-              }
+            const keys = Object.entries(network)
+              .filter(([_, v]) => asNum(asObj(v).port_number) === a.portNumber)
+              .map(([k]) => k);
+            if (keys.length > 1) {
+              throw new Error(
+                `portNumber ${a.portNumber} matches ${keys.length} ports on ` +
+                  `${a.app} (${keys.join(", ")}): select one by portKey.`,
+              );
             }
+            portKey = keys[0];
           }
           if (!portKey || network[portKey] === undefined) {
             throw new Error(
@@ -1863,8 +2227,8 @@ export const model = {
           const newBindMode = a.bindMode ?? prevBindMode;
           const newHostIps = a.hostIps ?? prevHostIps;
 
-          // Reconstruct the FULL port object so no field (port_number,
-          // certificate_id, …) is dropped, then send the ENTIRE network map with only
+          // Reconstruct the full port object so no field (port_number,
+          // certificate_id, …) is dropped, then send the entire network map with only
           // this port changed. Sending the whole `network` avoids depending on how
           // app.update merges nested values, so sibling ports (http_port, ldaps_port)
           // can't be lost regardless of merge depth.
@@ -1890,7 +2254,7 @@ export const model = {
             );
             const handle = await context.writeResource(
               "app-port-result",
-              `${a.app}:${portKey}`,
+              dataName("app-port-result", `${a.app}:${portKey}`),
               {
                 app: a.app,
                 portKey,
@@ -1926,7 +2290,7 @@ export const model = {
           const applied = asObj(after[portKey]);
           const handle = await context.writeResource(
             "app-port-result",
-            `${a.app}:${portKey}`,
+            dataName("app-port-result", `${a.app}:${portKey}`),
             {
               app: a.app,
               portKey,
@@ -1940,6 +2304,7 @@ export const model = {
               timestamp: ts,
             },
           );
+          logInfo(context, "App port binding updated", { app: a.app, portKey });
           return { dataHandles: [handle] };
         } finally {
           session.close();
@@ -1949,9 +2314,11 @@ export const model = {
 
     app_set_networks: {
       description:
-        "Attach an app to a set of docker networks (e.g. join a reverse-proxy app to " +
-        "other apps' `ix-<app>_default` bridges so it can reach them by service name " +
-        "without host-published ports). Verifies the app first; preserves the config of " +
+        "Attach a custom app to a set of docker networks (e.g. join a reverse-proxy " +
+        "app to other apps' `ix-<app>_default` bridges so it can reach them by service " +
+        "name without host-published ports). Custom apps only: an app with no " +
+        "top-level `networks` list in its config (a catalog app) or one installed " +
+        "from compose YAML is refused and nothing is written. Verifies the app first; preserves the config of " +
         "already-attached networks; reversible by re-running with the prior set.",
       arguments: AppSetNetworksArgs,
       execute: async (
@@ -1963,7 +2330,21 @@ export const model = {
         const session = await openSession(g);
         try {
           const app = await resolveApp(session, a.app);
+          refuseComposeApp(app, "app_set_networks");
           const cfg = asObj(app.config);
+          // Only custom (ix-app) apps keep a top-level `networks` list. Catalog apps
+          // keep theirs at `network.networks` with per-container entries; writing a
+          // top-level list to one is accepted and stored but joins nothing, so refuse
+          // before any update is sent.
+          if (!Array.isArray(cfg.networks)) {
+            throw new Error(
+              `app ${
+                JSON.stringify(a.app)
+              } has no top-level networks list in its config, so it is not a ` +
+                "custom app: app_set_networks supports custom apps only (catalog " +
+                "apps keep networks under network.networks). Nothing was changed.",
+            );
+          }
           const current = asArr(cfg.networks).map((n) => asObj(n));
           const prevNames = current.map((n) => String(n.name));
           const ts = new Date().toISOString();
@@ -1971,13 +2352,20 @@ export const model = {
           if (sameStrArr(a.networks, prevNames)) {
             const handle = await context.writeResource(
               "app-networks-result",
-              `${a.app}-networks`,
+              dataName("app-networks-result", a.app),
               {
                 app: a.app,
                 previousNetworks: prevNames,
                 networks: prevNames,
                 action: "unchanged",
                 timestamp: ts,
+              },
+            );
+            logInfo(
+              context,
+              "App networks already at desired set — no change",
+              {
+                app: a.app,
               },
             );
             return { dataHandles: [handle] };
@@ -2008,7 +2396,7 @@ export const model = {
             .map((n) => String(asObj(n).name));
           const handle = await context.writeResource(
             "app-networks-result",
-            `${a.app}-networks`,
+            dataName("app-networks-result", a.app),
             {
               app: a.app,
               previousNetworks: prevNames,
@@ -2017,6 +2405,10 @@ export const model = {
               timestamp: ts,
             },
           );
+          logInfo(context, "App networks updated", {
+            app: a.app,
+            networks: after,
+          });
           return { dataHandles: [handle] };
         } finally {
           session.close();
@@ -2027,7 +2419,7 @@ export const model = {
     nfs_share_set_access: {
       description:
         "Set an NFS export's authorized networks/hosts allowlist (the per-client " +
-        "gate). Verifies the share first. An EMPTY array clears that restriction. " +
+        "gate). Verifies the share first. An empty array clears that restriction. " +
         "Reversible: re-run with the prior values.",
       arguments: NfsShareSetAccessArgs,
       execute: async (
@@ -2052,7 +2444,7 @@ export const model = {
           ) {
             const handle = await context.writeResource(
               "nfs-share-result",
-              `nfs-result-${id}`,
+              dataName("nfs-share-result", id),
               {
                 id,
                 path: String(share.path ?? ""),
@@ -2064,6 +2456,13 @@ export const model = {
                 timestamp: ts,
               },
             );
+            logInfo(
+              context,
+              "NFS share access already at desired state — no change",
+              {
+                id,
+              },
+            );
             return { dataHandles: [handle] };
           }
 
@@ -2071,14 +2470,14 @@ export const model = {
             id,
             path: share.path,
           });
-          await session.call("sharing.nfs.update", [id, {
+          await callChange(session, "sharing.nfs.update", [id, {
             networks: newNetworks,
             hosts: newHosts,
           }]);
           const after = await resolveNfs(session, { id });
           const handle = await context.writeResource(
             "nfs-share-result",
-            `nfs-result-${id}`,
+            dataName("nfs-share-result", id),
             {
               id,
               path: String(after.path ?? share.path ?? ""),
@@ -2090,6 +2489,7 @@ export const model = {
               timestamp: ts,
             },
           );
+          logInfo(context, "NFS share access updated", { id });
           return { dataHandles: [handle] };
         } finally {
           session.close();
@@ -2099,10 +2499,10 @@ export const model = {
 
     nfs_share_delete: {
       description:
-        "DELETE an NFS export rule (e.g. a now-unused share). Verifies the share " +
+        "Delete an NFS export rule (e.g. a now-unused share). Verifies the share " +
         "first and records its removed config (path/networks/hosts) so it can be " +
         "re-created. Idempotent: a share that's already gone records action=absent " +
-        "instead of failing. Removes ONLY the export rule — the underlying " +
+        "instead of failing. Removes only the export rule — the underlying " +
         "dataset/data is untouched. Pass confirmPath to guard against deleting the wrong share.",
       arguments: NfsShareDeleteArgs,
       execute: async (
@@ -2116,16 +2516,21 @@ export const model = {
           const share = await resolveNfsOrNull(session, a);
           if (share === null) {
             // Already gone: idempotent success. The confirmPath guard only
-            // protects against deleting the WRONG existing share, so it doesn't
+            // protects against deleting the wrong existing share, so it doesn't
             // apply when there's nothing to delete.
             const ats = new Date().toISOString();
-            // No share, so no id to name the instance after; a path contains
-            // slashes, which an instance name cannot.
+            // Named `absent:<selector>`, never the deleted record's `<id>`, so a
+            // rerun after a delete leaves the removed config as `data.latest`. A path
+            // is tagged `path:` so it can never take the name of a share id.
             const handle = await context.writeResource(
               "nfs-share-result",
-              `nfs-result-${a.id ?? pathKey(a.path ?? "")}`,
+              dataName(
+                "nfs-share-result",
+                "absent:" + (a.id ?? `path:${a.path ?? ""}`),
+              ),
               {
-                id: a.id ?? 0,
+                // null, not 0: there is no share, and 0 reads like a real id.
+                id: a.id ?? null,
                 path: a.path ?? "",
                 previousNetworks: [],
                 previousHosts: [],
@@ -2135,6 +2540,9 @@ export const model = {
                 timestamp: ats,
               },
             );
+            logInfo(context, "NFS share already absent — nothing to delete", {
+              selector: a.id ?? a.path,
+            });
             return { dataHandles: [handle] };
           }
           const id = asNum(share.id) ?? 0;
@@ -2153,12 +2561,12 @@ export const model = {
           }
 
           logInfo(context, "Deleting NFS export", { id, path });
-          await session.call("sharing.nfs.delete", [id]);
+          await callChange(session, "sharing.nfs.delete", [id]);
 
           // The removed config is captured in previous* so the export can be re-created.
           const handle = await context.writeResource(
             "nfs-share-result",
-            `nfs-result-${id}`,
+            dataName("nfs-share-result", id),
             {
               id,
               path,
@@ -2170,6 +2578,7 @@ export const model = {
               timestamp: ts,
             },
           );
+          logInfo(context, "NFS export deleted", { id, path });
           return { dataHandles: [handle] };
         } finally {
           session.close();
@@ -2179,8 +2588,13 @@ export const model = {
 
     smb_share_set_access: {
       description:
-        "Set an SMB share's hostsallow/hostsdeny. Verifies the share first. An EMPTY " +
-        "hostsallow clears the allowlist. Reversible: re-run with the prior values.",
+        "Set an SMB share's hostsallow/hostsdeny. Verifies the share first. An empty " +
+        "hostsallow clears the allowlist. Re-running with the prior values restores " +
+        "them, but not the purpose preset: a DEFAULT_SHARE moves to NO_PRESET on " +
+        "25.04 or LEGACY_SHARE on 25.10 when host rules are applied, and stays " +
+        "there. Any other purpose that holds no host lists (VEEAM_REPOSITORY_SHARE " +
+        "on 25.04) is refused, as moving it would drop its features. The result " +
+        "records previousPurpose.",
       arguments: SmbShareSetAccessArgs,
       execute: async (
         rawArgs,
@@ -2192,20 +2606,21 @@ export const model = {
         try {
           const share = await resolveSmb(session, a);
           const id = asNum(share.id) ?? 0;
-          const prevAllow = strArr(share.hostsallow);
-          const prevDeny = strArr(share.hostsdeny);
+          const prev = smbHostLists(share);
+          const prevAllow = prev.allow;
+          const prevDeny = prev.deny;
           const prevPurpose = String(share.purpose ?? "");
           const newAllow = a.hostsallow ?? prevAllow;
           const newDeny = a.hostsdeny ?? prevDeny;
           const ts = new Date().toISOString();
 
-          // A preset that locks hostsallow/hostsdeny discards them on update without an
-          // error. Switch to NO_PRESET (only when host rules are being applied) so the
-          // allowlist is kept. Clearing rules needs no purpose change.
-          const wantHostRules = newAllow.length > 0 || newDeny.length > 0;
-          const releaseLock = wantHostRules &&
-            HOST_LOCKING_PURPOSES.has(prevPurpose);
-          const newPurpose = releaseLock ? "NO_PRESET" : prevPurpose;
+          // Throws, before any write, for a purpose that can't hold host rules.
+          // An empty payload (no lists to clear) is caught by the no-op check below.
+          const { purpose: newPurpose, payload } = smbAccessUpdate(
+            share,
+            newAllow,
+            newDeny,
+          );
 
           if (
             sameStrArr(newAllow, prevAllow) && sameStrArr(newDeny, prevDeny) &&
@@ -2213,10 +2628,11 @@ export const model = {
           ) {
             const handle = await context.writeResource(
               "smb-share-result",
-              `smb-result-${id}`,
+              dataName("smb-share-result", id),
               {
                 id,
                 name: String(share.name ?? ""),
+                path: String(share.path ?? ""),
                 previousHostsallow: prevAllow,
                 previousHostsdeny: prevDeny,
                 hostsallow: newAllow,
@@ -2227,42 +2643,42 @@ export const model = {
                 timestamp: ts,
               },
             );
+            logInfo(
+              context,
+              "SMB share access already at desired state — no change",
+              {
+                id,
+              },
+            );
             return { dataHandles: [handle] };
           }
 
           logInfo(context, "Updating SMB share access", {
             id,
             name: share.name,
-            releaseLock,
+            purpose: newPurpose,
           });
-          // sharing.smb.update has PATCH semantics (SmbShareUpdate uses
-          // ForUpdateMetaclass upstream, so every field is optional and omitted
-          // ones keep their stored value). Send only what changes. Include purpose
-          // only when releasing a host-locking preset, so non-locked shares keep
-          // their existing preset untouched.
-          const payload: Record<string, unknown> = {
-            hostsallow: newAllow,
-            hostsdeny: newDeny,
-          };
-          if (releaseLock) payload.purpose = "NO_PRESET";
-          await session.call("sharing.smb.update", [id, payload]);
+          await callChange(session, "sharing.smb.update", [id, payload]);
           const after = await resolveSmb(session, { id });
+          const afterLists = smbHostLists(after);
           const handle = await context.writeResource(
             "smb-share-result",
-            `smb-result-${id}`,
+            dataName("smb-share-result", id),
             {
               id,
               name: String(after.name ?? share.name ?? ""),
+              path: String(after.path ?? share.path ?? ""),
               previousHostsallow: prevAllow,
               previousHostsdeny: prevDeny,
-              hostsallow: strArr(after.hostsallow),
-              hostsdeny: strArr(after.hostsdeny),
+              hostsallow: afterLists.allow,
+              hostsdeny: afterLists.deny,
               previousPurpose: prevPurpose,
               purpose: String(after.purpose ?? newPurpose),
               action: "updated",
               timestamp: ts,
             },
           );
+          logInfo(context, "SMB share access updated", { id });
           return { dataHandles: [handle] };
         } finally {
           session.close();
@@ -2272,10 +2688,10 @@ export const model = {
 
     smb_share_delete: {
       description:
-        "DELETE an SMB share (e.g. a now-unused share). Verifies the share first " +
+        "Delete an SMB share (e.g. a now-unused share). Verifies the share first " +
         "and records its removed config (name/path/hostsallow/hostsdeny/purpose) so it " +
         "can be re-created. Idempotent: a share that's already gone records action=absent " +
-        "instead of failing. Removes ONLY the share definition — the underlying " +
+        "instead of failing. Removes only the share definition — the underlying " +
         "dataset/data is untouched. Pass confirmName to guard against deleting the wrong share.",
       arguments: SmbShareDeleteArgs,
       execute: async (
@@ -2289,17 +2705,24 @@ export const model = {
           const share = await resolveSmbOrNull(session, a);
           if (share === null) {
             // Already gone: idempotent success. The confirmName guard only
-            // protects against deleting the WRONG existing share, so it doesn't
+            // protects against deleting the wrong existing share, so it doesn't
             // apply when there's nothing to delete.
             const ats = new Date().toISOString();
-            // No share, so no id to name the instance after; a share name may
-            // hold characters an instance name cannot.
+            // Named `absent:<selector>`, never the deleted record's `<id>`, so a
+            // rerun after a delete leaves the removed config as `data.latest`. A
+            // share name is tagged `name:` so a share called "6" can never take the
+            // name of share id 6.
             const handle = await context.writeResource(
               "smb-share-result",
-              `smb-result-${a.id ?? pathKey(a.name ?? "")}`,
+              dataName(
+                "smb-share-result",
+                "absent:" + (a.id ?? `name:${a.name ?? ""}`),
+              ),
               {
-                id: a.id ?? 0,
+                // null, not 0: there is no share, and 0 reads like a real id.
+                id: a.id ?? null,
                 name: a.name ?? "",
+                path: "",
                 previousHostsallow: [],
                 previousHostsdeny: [],
                 hostsallow: [],
@@ -2310,6 +2733,9 @@ export const model = {
                 timestamp: ats,
               },
             );
+            logInfo(context, "SMB share already absent — nothing to delete", {
+              selector: a.id ?? a.name,
+            });
             return { dataHandles: [handle] };
           }
           const id = asNum(share.id) ?? 0;
@@ -2328,17 +2754,19 @@ export const model = {
           }
 
           logInfo(context, "Deleting SMB share", { id, name });
-          await session.call("sharing.smb.delete", [id]);
+          await callChange(session, "sharing.smb.delete", [id]);
 
           // The removed config is captured in previous* so the share can be re-created.
+          const removed = smbHostLists(share);
           const handle = await context.writeResource(
             "smb-share-result",
-            `smb-result-${id}`,
+            dataName("smb-share-result", id),
             {
               id,
               name,
-              previousHostsallow: strArr(share.hostsallow),
-              previousHostsdeny: strArr(share.hostsdeny),
+              path: String(share.path ?? ""),
+              previousHostsallow: removed.allow,
+              previousHostsdeny: removed.deny,
               hostsallow: [],
               hostsdeny: [],
               previousPurpose: String(share.purpose ?? ""),
@@ -2347,6 +2775,7 @@ export const model = {
               timestamp: ts,
             },
           );
+          logInfo(context, "SMB share deleted", { id, name });
           return { dataHandles: [handle] };
         } finally {
           session.close();
