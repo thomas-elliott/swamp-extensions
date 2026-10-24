@@ -2375,3 +2375,61 @@ Deno.test("record_ensure stops at a failed write and surfaces Technitium's error
     __setTechnitiumTransport(null);
   }
 });
+
+Deno.test("record_ensure leaves a matching record alone when no TTL is given", async () => {
+  const { calls } = fakeName([
+    { type: "A", ttl: 300, rData: { ipAddress: "192.0.2.1" } },
+  ]);
+  try {
+    const { context, written } = makeContext();
+    await method("record_ensure").execute(
+      ensureA("192.0.2.1", "replace"),
+      context,
+    );
+    assertEquals(calls.map((c) => c.method), ["GET"]);
+    assertEquals(written[0].data.action, "unchanged");
+  } finally {
+    __setTechnitiumTransport(null);
+  }
+});
+
+Deno.test("record_ensure add mode leaves a round-robin set alone", async () => {
+  const { calls } = fakeName([
+    { type: "A", ttl: 300, rData: { ipAddress: "192.0.2.1" } },
+    { type: "A", ttl: 300, rData: { ipAddress: "192.0.2.2" } },
+  ]);
+  try {
+    const { context, written } = makeContext();
+    await method("record_ensure").execute(
+      ensureA("192.0.2.1", "add", 300),
+      context,
+    );
+    assertEquals(calls.map((c) => c.method), ["GET"]);
+    assertEquals(written[0].data.action, "unchanged");
+  } finally {
+    __setTechnitiumTransport(null);
+  }
+});
+
+Deno.test("record_ensure builds a round-robin set from two add entries", async () => {
+  const { records } = fakeName([]);
+  try {
+    const { context, written } = makeContext();
+    await method("record_ensure").execute(
+      {
+        records: [
+          ...ensureA("192.0.2.1", "add").records,
+          ...ensureA("192.0.2.2", "add").records,
+        ],
+      },
+      context,
+    );
+    assertEquals(records.map((r) => r.rData.ipAddress), [
+      "192.0.2.1",
+      "192.0.2.2",
+    ]);
+    assertEquals(written.map((w) => w.data.action), ["created", "created"]);
+  } finally {
+    __setTechnitiumTransport(null);
+  }
+});
