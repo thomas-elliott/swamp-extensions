@@ -27,7 +27,7 @@ the URL, so it stays out of proxy and access logs. This needs Technitium 15 or
 later; earlier versions are not supported.
 
 ```sh
-swamp vault put technitium api_token '<your-permanent-token>'
+swamp vault put technitium api_token   # prompts for the token
 ```
 
 ## Configuration
@@ -96,7 +96,7 @@ swamp model method run dns-home cache_flush
   `unchanged` (another type, or a `catalog` it is not in, is still an error),
   and `zone_delete` on a zone that does not exist reports it `deleted`.
 - **`record_*`** — `record_list`, `record_get`, `record_add`, `record_update`,
-  `record_delete`. Type-specific fields go in `rData` (e.g. `{ipAddress}` for A,
+  `record_ensure`, `record_delete`. Type-specific fields go in `rData` (e.g. `{ipAddress}` for A,
   `{cname}` for CNAME, `{exchange, preference}` for MX), under the parameter
   names Technitium's add endpoint takes (`uriPriority` for URI, `naptrOrder` for
   NAPTR). Updates carry the new values in `newRData`. For **CNAME** and
@@ -120,6 +120,33 @@ swamp model method run dns-home cache_flush
   SSHFP and TLSA enum fields (e.g. DS `algorithm`, TLSA `tlsaSelector`) can be
   given as a number or a name; Technitium reads them back as names, and a number
   is matched to its name. A FWD record's `proxyPassword` is never stored.
+
+  `record_ensure` is the write to use in a workflow step, because it is safe to
+  run again. `record_add` fails when the record exists (for most types) and
+  `record_update` fails when it does not. `record_ensure` takes a list of
+  records and, for each, adds it if missing, updates it if its TTL differs, and
+  otherwise leaves it alone with action `unchanged`. Each entry needs a `mode`,
+  which decides what happens to other records of the same type at the same name:
+  - `replace` makes this the only one (Technitium's add with `overwrite`). Any
+    others are removed and stored with action `deleted`. Use it for "this host's
+    A record" or a CNAME.
+  - `add` leaves the others alone and adds this one beside them. Use it for
+    round-robin A records or several MX or NS records.
+
+  A `replace` entry must be the only entry for its name and type in a call;
+  otherwise the call fails before writing anything.
+
+  Only `rData` and `ttl` are compared. A record that matches is `unchanged` even
+  if it is disabled or has a comment. Structured values (SVCB and HTTPS
+  `svcParams`, APL lists) are not compared, because you send them as a string
+  and Technitium reads them back parsed; a change only to those reads as
+  `unchanged`, so use `record_update` for it. A `replace` that writes clears the
+  record's comment and expiry and enables it. Technitium gives every record of
+  one type at one name the same TTL, so setting `ttl` changes it for all of
+  them. Leave `ttl` out to keep the current TTL. Records are written one at a
+  time, so if one fails, the ones before it are already written; running again
+  finishes the rest. A changed value still gets a new data name, because names
+  are built from the record (see [Data model](#data-model)).
 - **`allowed_*` / `blocked_*`** — manage the built-in Allowed/Blocked zones:
   `_add`, `_delete`, `_list`, `_flush`. `_list` returns every domain in the
   zone, or under `domain` if you pass one. Technitium's list endpoint shows one

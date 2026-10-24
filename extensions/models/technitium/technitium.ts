@@ -975,6 +975,144 @@ function findRecord(
     .find((r) => rDataMatches(want, r.rData, type));
 }
 
+/** A record after a write, as the server stored it, ready to name and store. */
+type WrittenRecord = {
+  zone: string;
+  name: string;
+  ttl?: number;
+  disabled?: boolean;
+  rData?: Record<string, unknown>;
+};
+
+/**
+ * Add a record and read it back. With `overwrite`, Technitium replaces every
+ * record of the type at the name with this one.
+ */
+async function addRecord(
+  g: GlobalArgsT,
+  args: z.infer<typeof RecordAddArgs>,
+  overwrite = false,
+): Promise<WrittenRecord> {
+  const params: Params = { domain: args.domain, type: args.type };
+  if (args.zone) params.zone = args.zone;
+  if (args.ttl !== undefined) params.ttl = args.ttl;
+  if (overwrite) params.overwrite = true;
+  if (args.type.toUpperCase() === "APP") {
+    spreadAppRData(params, args.rData);
+  } else {
+    spreadRData(params, args.rData);
+  }
+  const resp = await apiCall(g, "POST", "/zones/records/add", params);
+  // Name and store the record as Technitium reports it, so the name
+  // matches the one record_list and record_get write.
+  const { zone, record } = await verifyRecordWrite(
+    g,
+    "added",
+    args.domain,
+    args.type,
+    args.rData,
+    args.zone,
+    writtenRecord(resp, "addedRecord", args.domain),
+  );
+  return {
+    zone,
+    name: record?.name ?? args.domain,
+    // The server's TTL, which is its default when none was passed.
+    ttl: record?.ttl ?? args.ttl,
+    disabled: record?.disabled,
+    rData: record?.rData ?? args.rData,
+  };
+}
+
+/** Update a record, keeping the fields not passed, and read it back. */
+async function updateRecord(
+  g: GlobalArgsT,
+  args: z.infer<typeof RecordUpdateArgs>,
+): Promise<WrittenRecord> {
+  const isApp = args.type.toUpperCase() === "APP";
+  // `records/update` resets every field it is not sent: ttl to the server
+  // default, disable to false, comments and expiryTtl to empty. Read the
+  // record first so changing one field leaves the others as they were.
+  // APP records are matched by domain+type alone (only one exists per name).
+  const existing = (await getDomainRecords(g, args.domain, args.zone))
+    .records.filter((r) => r.type.toUpperCase() === args.type.toUpperCase())
+    .find((r) => isApp || rDataMatches(args.rData, r.rData, args.type));
+  if (!existing) {
+    throw new Error(
+      `record_update: no ${args.type} record at ${args.domain} matches the given rData`,
+    );
+  }
+  const ttl = args.ttl ?? existing.ttl;
+  const disable = args.disable ?? existing.disabled;
+  const comments = args.comments ?? existing.comments;
+  const expiryTtl = args.expiryTtl ?? existing.expiryTtl;
+  const params: Params = { domain: args.domain, type: args.type };
+  if (args.zone) params.zone = args.zone;
+  if (ttl !== undefined) params.ttl = ttl;
+  if (disable !== undefined) params.disable = disable;
+  if (comments !== undefined) params.comments = comments;
+  if (expiryTtl !== undefined) params.expiryTtl = expiryTtl;
+  if (args.newDomain) params.newDomain = args.newDomain;
+  // An APP update rewrites the whole record from the params, and a
+  // missing `recordData` becomes empty data. Start from the record as it
+  // is, so a `newRData` without `data` (or none at all) keeps the content.
+  const appRData = isApp
+    ? { ...existing.rData, ...(args.newRData ?? args.rData) }
+    : undefined;
+  if (isApp) {
+    // APP records have no `new*` params: write the desired final state directly.
+    spreadAppRData(params, appRData);
+  } else if (hasNoNewParams(args.type)) {
+    // Technitium has no newCname/newDname: it reads the new target from
+    // `cname`/`dname` and replaces the name's only record with it.
+    spreadRData(params, args.newRData ?? args.rData);
+  } else {
+    spreadRData(params, args.rData);
+    if (args.newRData) Object.assign(params, prefixNew(args.newRData));
+  }
+  const resp = await apiCall(g, "POST", "/zones/records/update", params);
+  // Name and store the record as Technitium reports it (see addRecord).
+  const { zone, record } = await verifyRecordWrite(
+    g,
+    "updated",
+    args.newDomain ?? args.domain,
+    args.type,
+    appRData ?? args.newRData ?? args.rData,
+    args.zone,
+    writtenRecord(resp, "updatedRecord", args.newDomain ?? args.domain),
+  );
+  return {
+    zone,
+    name: record?.name ?? args.newDomain ?? args.domain,
+    ttl,
+    disabled: disable,
+    rData: record?.rData ?? args.newRData ?? args.rData,
+  };
+}
+
+/** Store a record as `zoneRecord` under the name every record method uses. */
+function writeZoneRecord(
+  context: Pick<MethodContext<GlobalArgsT>, "writeResource">,
+  rec: WrittenRecord,
+  type: string,
+  action: z.infer<typeof Action>,
+): Promise<DataHandle> {
+  return context.writeResource(
+    "zoneRecord",
+    recordInstanceName(rec.zone, rec.name, type, rec.rData),
+    {
+      zone: rec.zone,
+      name: rec.name,
+      type,
+      ttl: rec.ttl,
+      disabled: rec.disabled,
+      rData: rec.rData,
+      action,
+      observedAt: new Date().toISOString(),
+    },
+  );
+}
+
 /**
  * Every domain in the built-in Allowed or Blocked zone at or under `root`.
  * `/allowed/list` and `/blocked/list` browse a label tree one node at a time:
@@ -1318,6 +1456,23 @@ const RecordDeleteArgs = z.object({
   rData: RData.optional(),
 });
 
+const RecordEnsureArgs = z.object({
+  records: z.array(
+    RecordAddArgs.extend({
+      rData: RData,
+      ttl: z.number().int().optional().describe(
+        "TTL to ensure; the current TTL is kept when omitted",
+      ),
+      // No default: replace removes round-robin siblings, so the caller says
+      // which they mean.
+      mode: z.enum(["replace", "add"]).describe(
+        "replace: this becomes the only record of its type at the name. " +
+          "add: other records of the type at the name are left alone.",
+      ),
+    }),
+  ).min(1),
+});
+
 const RecordGetArgs = z.object({
   zone: z.string().optional().describe(
     "Zone name; inferred by Technitium if omitted",
@@ -1475,13 +1630,20 @@ const SettingsRestoreArgs = z.object({
 /** The `@thomas/technitium` swamp model: schema, methods, and lifecycle for managing a Technitium DNS server. */
 export const model = {
   type: "@thomas/technitium",
-  version: "2026.10.11.1",
+  version: "2026.10.25.1",
   globalArguments: GlobalArgs,
   upgrades: [
     {
       toVersion: "2026.10.11.1",
       description:
         "Global arguments are unchanged. Stored data is renamed to <spec>:<key> (or <spec>), with DNS names keeping their dots; records under the old names are left as they are and are not migrated. The API token goes only in the Authorization header, so Technitium before 15 is not supported. Several methods change behaviour; see the README's Breaking changes.",
+      upgradeAttributes: (
+        old: Record<string, unknown>,
+      ): Record<string, unknown> => old,
+    },
+    {
+      toVersion: "2026.10.25.1",
+      description: "No change to global arguments or stored data.",
       upgradeAttributes: (
         old: Record<string, unknown>,
       ): Record<string, unknown> => old,
@@ -2159,52 +2321,20 @@ export const model = {
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const g: GlobalArgsT = context.globalArgs;
-        const params: Params = { domain: args.domain, type: args.type };
-        if (args.zone) params.zone = args.zone;
-        if (args.ttl !== undefined) params.ttl = args.ttl;
-        if (args.type.toUpperCase() === "APP") {
-          spreadAppRData(params, args.rData);
-        } else {
-          spreadRData(params, args.rData);
-        }
         logInfo(context, "Adding {type} record at {domain}", {
           domain: args.domain,
           type: args.type,
         });
-        const resp = await apiCall(g, "POST", "/zones/records/add", params);
-        // Name and store the record as Technitium reports it, so the name
-        // matches the one record_list and record_get write.
-        const { zone, record } = await verifyRecordWrite(
-          g,
-          "added",
-          args.domain,
-          args.type,
-          args.rData,
-          args.zone,
-          writtenRecord(resp, "addedRecord", args.domain),
-        );
-        const name = record?.name ?? args.domain;
-        const rData = record?.rData ?? args.rData;
+        const rec = await addRecord(g, args);
         logInfo(context, "Added {type} record at {name}", {
-          name,
+          name: rec.name,
           type: args.type,
         });
-        const handle = await context.writeResource(
-          "zoneRecord",
-          recordInstanceName(zone, name, args.type, rData),
-          {
-            zone,
-            name,
-            type: args.type,
-            // The server's TTL, which is its default when none was passed.
-            ttl: record?.ttl ?? args.ttl,
-            disabled: record?.disabled,
-            rData,
-            action: "created",
-            observedAt: new Date().toISOString(),
-          },
-        );
-        return { dataHandles: [handle] };
+        return {
+          dataHandles: [
+            await writeZoneRecord(context, rec, args.type, "created"),
+          ],
+        };
       },
     },
 
@@ -2217,85 +2347,126 @@ export const model = {
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const g: GlobalArgsT = context.globalArgs;
-        const isApp = args.type.toUpperCase() === "APP";
-        // `records/update` resets every field it is not sent: ttl to the server
-        // default, disable to false, comments and expiryTtl to empty. Read the
-        // record first so changing one field leaves the others as they were.
-        // APP records are matched by domain+type alone (only one exists per name).
-        const existing = (await getDomainRecords(g, args.domain, args.zone))
-          .records.filter((r) =>
-            r.type.toUpperCase() === args.type.toUpperCase()
-          )
-          .find((r) => isApp || rDataMatches(args.rData, r.rData, args.type));
-        if (!existing) {
-          throw new Error(
-            `record_update: no ${args.type} record at ${args.domain} matches the given rData`,
-          );
-        }
-        const ttl = args.ttl ?? existing.ttl;
-        const disable = args.disable ?? existing.disabled;
-        const comments = args.comments ?? existing.comments;
-        const expiryTtl = args.expiryTtl ?? existing.expiryTtl;
-        const params: Params = { domain: args.domain, type: args.type };
-        if (args.zone) params.zone = args.zone;
-        if (ttl !== undefined) params.ttl = ttl;
-        if (disable !== undefined) params.disable = disable;
-        if (comments !== undefined) params.comments = comments;
-        if (expiryTtl !== undefined) params.expiryTtl = expiryTtl;
-        if (args.newDomain) params.newDomain = args.newDomain;
-        // An APP update rewrites the whole record from the params, and a
-        // missing `recordData` becomes empty data. Start from the record as it
-        // is, so a `newRData` without `data` (or none at all) keeps the content.
-        const appRData = isApp
-          ? { ...existing.rData, ...(args.newRData ?? args.rData) }
-          : undefined;
-        if (isApp) {
-          // APP records have no `new*` params: write the desired final state directly.
-          spreadAppRData(params, appRData);
-        } else if (hasNoNewParams(args.type)) {
-          // Technitium has no newCname/newDname: it reads the new target from
-          // `cname`/`dname` and replaces the name's only record with it.
-          spreadRData(params, args.newRData ?? args.rData);
-        } else {
-          spreadRData(params, args.rData);
-          if (args.newRData) Object.assign(params, prefixNew(args.newRData));
-        }
         logInfo(context, "Updating {type} record at {domain}", {
           domain: args.domain,
           type: args.type,
         });
-        const resp = await apiCall(g, "POST", "/zones/records/update", params);
-        // Name and store the record as Technitium reports it (see record_add).
-        const { zone, record } = await verifyRecordWrite(
-          g,
-          "updated",
-          args.newDomain ?? args.domain,
-          args.type,
-          appRData ?? args.newRData ?? args.rData,
-          args.zone,
-          writtenRecord(resp, "updatedRecord", args.newDomain ?? args.domain),
-        );
-        const name = record?.name ?? args.newDomain ?? args.domain;
-        const rData = record?.rData ?? args.newRData ?? args.rData;
+        const rec = await updateRecord(g, args);
         logInfo(context, "Updated {type} record at {name}", {
-          name,
+          name: rec.name,
           type: args.type,
         });
-        const handle = await context.writeResource(
-          "zoneRecord",
-          recordInstanceName(zone, name, args.type, rData),
-          {
-            zone,
-            name,
-            type: args.type,
-            ttl,
-            disabled: disable,
-            rData,
-            action: "updated",
-            observedAt: new Date().toISOString(),
-          },
-        );
-        return { dataHandles: [handle] };
+        return {
+          dataHandles: [
+            await writeZoneRecord(context, rec, args.type, "updated"),
+          ],
+        };
+      },
+    },
+
+    record_ensure: {
+      description:
+        "Make records match the given data and TTL, safe to rerun: adds a record that is missing, updates one whose TTL differs, and leaves one that already matches (action `unchanged`). Each entry's `mode` decides what happens to other records of its type at its name: `replace` makes it the only one (the others are removed and stored as `deleted`); `add` leaves them as they are. Fans out over `records` in one run.",
+      arguments: RecordEnsureArgs,
+      execute: async (
+        args: z.infer<typeof RecordEnsureArgs>,
+        context,
+      ): Promise<{ dataHandles: DataHandle[] }> => {
+        const g: GlobalArgsT = context.globalArgs;
+        // A replace makes its record the only one of its type at the name, so
+        // any other entry for that name and type contradicts it. Refuse before
+        // writing anything rather than let the later entry undo the earlier.
+        const byName = new Map<string, string[]>();
+        for (const spec of args.records) {
+          const key = `${dnsKey(spec.domain)} ${spec.type.toUpperCase()}`;
+          byName.set(key, [...(byName.get(key) ?? []), spec.mode]);
+        }
+        for (const [key, modes] of byName) {
+          if (modes.length > 1 && modes.includes("replace")) {
+            throw new Error(
+              `record_ensure: ${key} appears ${modes.length} times and at least once with mode replace; a replace must be the only entry for its name and type`,
+            );
+          }
+        }
+        const handles: DataHandle[] = [];
+        for (const spec of args.records) {
+          const type = spec.type.toUpperCase();
+          const live = await getDomainRecords(g, spec.domain, spec.zone);
+          const sameType = live.records.filter((r) =>
+            r.type.toUpperCase() === type
+          );
+          const match = findRecord(sameType, type, spec.rData);
+          const ttlMatches = spec.ttl === undefined || match?.ttl === spec.ttl;
+          // In replace mode any other record of the type is a difference too.
+          const othersAllowed = spec.mode === "add" || sameType.length === 1;
+          if (match && ttlMatches && othersAllowed) {
+            handles.push(
+              await writeZoneRecord(
+                context,
+                { ...match, zone: live.zone },
+                type,
+                "unchanged",
+              ),
+            );
+            continue;
+          }
+          // Technitium gives every record of a type at a name one TTL, and an
+          // add without a TTL resets it to the server default for all of
+          // them. Keep the current TTL unless the caller set one.
+          const ttl = spec.ttl ?? match?.ttl ?? sameType[0]?.ttl;
+          let rec: WrittenRecord;
+          let action: "created" | "updated";
+          if (spec.mode === "replace") {
+            logInfo(context, "Replacing {type} records at {domain}", {
+              domain: spec.domain,
+              type,
+            });
+            rec = await addRecord(g, { ...spec, type, ttl }, true);
+            action = sameType.length > 0 ? "updated" : "created";
+            // The overwrite removed every other record of the type. Store
+            // them as deleted so their old data does not read as current.
+            const kept = canonicalRData(rec.rData);
+            for (const old of sameType) {
+              if (canonicalRData(old.rData) === kept) continue;
+              handles.push(
+                await writeZoneRecord(
+                  context,
+                  { ...old, zone: live.zone },
+                  type,
+                  "deleted",
+                ),
+              );
+            }
+          } else if (match) {
+            // Only the TTL differs. A second add of the same record fails
+            // for CNAME, so update it in place.
+            logInfo(context, "Setting the TTL of a {type} record at {domain}", {
+              domain: spec.domain,
+              type,
+            });
+            rec = await updateRecord(g, {
+              zone: spec.zone,
+              domain: spec.domain,
+              type,
+              ttl,
+              rData: spec.rData,
+              newRData: spec.rData,
+            });
+            action = "updated";
+          } else {
+            logInfo(context, "Adding {type} record at {domain}", {
+              domain: spec.domain,
+              type,
+            });
+            rec = await addRecord(g, { ...spec, type, ttl });
+            action = "created";
+          }
+          handles.push(await writeZoneRecord(context, rec, type, action));
+        }
+        logInfo(context, "Ensured {count} records", {
+          count: args.records.length,
+        });
+        return { dataHandles: handles };
       },
     },
 
