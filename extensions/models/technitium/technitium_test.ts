@@ -2132,3 +2132,246 @@ Deno.test("zone and listEntry expire after 30 days, like zoneRecord", () => {
   assertEquals(resources.zone.lifetime, "30d");
   assertEquals(resources.listEntry.lifetime, "30d");
 });
+
+// ----- record_ensure -------------------------------------------------------
+
+type FakeRecord = { type: string; ttl: number; rData: Record<string, unknown> };
+
+/**
+ * A stateful stand-in for one name's records, behaving as Technitium was seen
+ * to on a live server: an add without `overwrite` joins the records of its type
+ * and sets the TTL of all of them, `overwrite` replaces them, and an update
+ * changes the matched record in place.
+ */
+function fakeName(initial: FakeRecord[]) {
+  const records = initial.map((r) => ({ ...r, rData: { ...r.rData } }));
+  const calls: Call[] = [];
+  scriptTransport(calls, (c) => {
+    const p = c.params ?? {};
+    const type = String(p.type);
+    if (c.path.endsWith("/zones/records/add")) {
+      const ttl = Number(p.ttl ?? 3600);
+      const added = { type, ttl, rData: { ipAddress: String(p.ipAddress) } };
+      if (p.overwrite) {
+        for (let i = records.length - 1; i >= 0; i--) {
+          if (records[i].type === type) records.splice(i, 1);
+        }
+      }
+      for (const r of records) if (r.type === type) r.ttl = ttl;
+      records.push(added);
+      return { addedRecord: { name: "www.example.com", ...added } };
+    }
+    if (c.path.endsWith("/zones/records/update")) {
+      const r = records.find((r) =>
+        r.type === type && r.rData.ipAddress === p.ipAddress
+      )!;
+      r.ttl = Number(p.ttl);
+      return { updatedRecord: { name: "www.example.com", ...r } };
+    }
+    return {
+      zone: { name: "example.com" },
+      records: records.map((r) => ({ name: "www.example.com", ...r })),
+    };
+  });
+  return { calls, records };
+}
+
+const ensureA = (ipAddress: string, mode: string, ttl?: number) => ({
+  records: [{
+    domain: "www.example.com",
+    type: "A",
+    rData: { ipAddress },
+    ttl,
+    mode,
+  }],
+});
+
+Deno.test("record_ensure writes nothing when the record already matches", async () => {
+  const { calls } = fakeName([
+    { type: "A", ttl: 300, rData: { ipAddress: "192.0.2.1" } },
+  ]);
+  try {
+    const { context, written } = makeContext();
+    await method("record_ensure").execute(
+      ensureA("192.0.2.1", "replace", 300),
+      context,
+    );
+    assertEquals(calls.map((c) => c.method), ["GET"]);
+    assertEquals(written[0].data.action, "unchanged");
+    assertEquals(
+      written[0].name,
+      recordInstanceName("example.com", "www.example.com", "A", {
+        ipAddress: "192.0.2.1",
+      }),
+    );
+  } finally {
+    __setTechnitiumTransport(null);
+  }
+});
+
+Deno.test("record_ensure add mode adds beside the others and keeps their TTL", async () => {
+  const { calls, records } = fakeName([
+    { type: "A", ttl: 600, rData: { ipAddress: "192.0.2.1" } },
+  ]);
+  try {
+    const { context, written } = makeContext();
+    await method("record_ensure").execute(ensureA("192.0.2.2", "add"), context);
+    const post = calls.find((c) => c.method === "POST")!;
+    assertEquals(post.path, "/zones/records/add");
+    assertEquals(post.params?.ttl, 600);
+    assert(!post.params?.overwrite, "add mode does not overwrite");
+    assertEquals(records.map((r) => [r.rData.ipAddress, r.ttl]), [
+      ["192.0.2.1", 600],
+      ["192.0.2.2", 600],
+    ]);
+    assertEquals(written[0].data.action, "created");
+  } finally {
+    __setTechnitiumTransport(null);
+  }
+});
+
+Deno.test("record_ensure add mode updates a matching record whose TTL differs", async () => {
+  const { calls, records } = fakeName([
+    { type: "A", ttl: 600, rData: { ipAddress: "192.0.2.1" } },
+  ]);
+  try {
+    const { context, written } = makeContext();
+    await method("record_ensure").execute(
+      ensureA("192.0.2.1", "add", 120),
+      context,
+    );
+    const post = calls.find((c) => c.method === "POST")!;
+    assertEquals(post.path, "/zones/records/update");
+    assertEquals(records[0].ttl, 120);
+    assertEquals(written[0].data.action, "updated");
+    assertEquals(written[0].data.ttl, 120);
+  } finally {
+    __setTechnitiumTransport(null);
+  }
+});
+
+Deno.test("record_ensure replace mode overwrites and stores the removed records as deleted", async () => {
+  const { calls, records } = fakeName([
+    { type: "A", ttl: 300, rData: { ipAddress: "192.0.2.1" } },
+    { type: "A", ttl: 300, rData: { ipAddress: "192.0.2.2" } },
+  ]);
+  try {
+    const { context, written } = makeContext();
+    await method("record_ensure").execute(
+      ensureA("192.0.2.1", "replace"),
+      context,
+    );
+    const post = calls.find((c) => c.method === "POST")!;
+    assertEquals(post.params?.overwrite, true);
+    assertEquals(post.params?.ttl, 300);
+    assertEquals(records.map((r) => r.rData.ipAddress), ["192.0.2.1"]);
+    assertEquals(
+      written.map((w) => [w.data.rData, w.data.action]),
+      [
+        [{ ipAddress: "192.0.2.2" }, "deleted"],
+        [{ ipAddress: "192.0.2.1" }, "updated"],
+      ],
+    );
+  } finally {
+    __setTechnitiumTransport(null);
+  }
+});
+
+Deno.test("record_ensure creates a missing record, then reports it unchanged on a rerun", async () => {
+  fakeName([]);
+  try {
+    const first = makeContext();
+    await method("record_ensure").execute(
+      ensureA("192.0.2.1", "replace", 300),
+      first.context,
+    );
+    assertEquals(first.written[0].data.action, "created");
+    const second = makeContext();
+    await method("record_ensure").execute(
+      ensureA("192.0.2.1", "replace", 300),
+      second.context,
+    );
+    assertEquals(second.written[0].data.action, "unchanged");
+    assertEquals(second.written[0].name, first.written[0].name);
+  } finally {
+    __setTechnitiumTransport(null);
+  }
+});
+
+Deno.test("record_ensure requires a mode on every record", async () => {
+  fakeName([]);
+  try {
+    const { context } = makeContext();
+    await assertRejects(() =>
+      method("record_ensure").execute(
+        { records: [{ domain: "www.example.com", type: "A", rData: {} }] },
+        context,
+      )
+    );
+  } finally {
+    __setTechnitiumTransport(null);
+  }
+});
+
+Deno.test("record_ensure refuses a replace that shares its name and type with another entry", async () => {
+  const { calls } = fakeName([]);
+  try {
+    const { context, written } = makeContext();
+    await assertRejects(
+      () =>
+        method("record_ensure").execute(
+          {
+            records: [
+              ...ensureA("192.0.2.1", "add").records,
+              ...ensureA("192.0.2.2", "replace").records,
+            ],
+          },
+          context,
+        ),
+      "a replace must be the only entry",
+    );
+    assertEquals(calls.length, 0);
+    assertEquals(written.length, 0);
+  } finally {
+    __setTechnitiumTransport(null);
+  }
+});
+
+Deno.test("record_ensure stops at a failed write and surfaces Technitium's error", async () => {
+  __setTechnitiumTransport((_g, _m, p) =>
+    p === "/zones/records/add"
+      ? Promise.reject(
+        new Error("Technitium POST /zones/records/add: Record already exists."),
+      )
+      : Promise.resolve({
+        zone: { name: "example.com" },
+        records: [{
+          name: "www.example.com",
+          type: "CNAME",
+          ttl: 3600,
+          rData: { cname: "a.example.com" },
+        }],
+      })
+  );
+  try {
+    const { context, written } = makeContext();
+    await assertRejects(
+      () =>
+        method("record_ensure").execute(
+          {
+            records: [{
+              domain: "www.example.com",
+              type: "CNAME",
+              rData: { cname: "b.example.com" },
+              mode: "add",
+            }],
+          },
+          context,
+        ),
+      "Record already exists",
+    );
+    assertEquals(written.length, 0);
+  } finally {
+    __setTechnitiumTransport(null);
+  }
+});
