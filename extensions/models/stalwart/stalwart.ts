@@ -13,7 +13,8 @@ import type {
 
 /**
  * `@thomas/stalwart`: non-destructive administration of a Stalwart mail server
- * (v0.16+) over its JMAP-over-HTTP management API.
+ * (0.16, and v1 checked against its schema) over its JMAP-over-HTTP
+ * management API.
  *
  * Scope: this holds a mail-admin credential, so the methods are limited and
  * non-destructive. None deletes an account, domain, group or list, and no
@@ -582,18 +583,23 @@ async function jmapSet(
  * Execute a Stalwart server action by *creating* an `x:Action` with the given
  * `@type` (e.g. `ReloadSettings`, `ReloadTlsCertificates`). Actions are
  * create-only and cannot be updated or destroyed. Throws on failure.
+ *
+ * Returns the warnings the server reported. Stalwart v1 answers
+ * `ReloadSettings` with `{ warnings: string[] }`; 0.16 sends none.
  */
 async function runAction(
   g: GlobalArgsT,
   accountId: string | undefined,
   atType: string,
-): Promise<void> {
+): Promise<string[]> {
   const res = await jmapSet(g, JMAP_TYPES.action, {
     accountId,
     create: { "c0": { "@type": atType } },
   });
   const err = setItemError(res, "c0");
   if (err) throw new Error(`Action ${atType} failed: ${err}`);
+  const created = ((res.created ?? {}) as Json).c0 as Json | undefined;
+  return Array.isArray(created?.warnings) ? created.warnings.map(String) : [];
 }
 
 /**
@@ -678,6 +684,31 @@ function asOptString(v: unknown): string | undefined {
 }
 
 /**
+ * The name of a domain's on/off flag as this server spells it: `isEnabled` in
+ * Stalwart 0.16, `enable` in v1. Read from the domain itself, so callers must
+ * fetch domains with every property. Throws when neither is present, rather
+ * than guess which name to write.
+ */
+function domainEnabledKey(d: Json): "enable" | "isEnabled" {
+  if (typeof d.enable === "boolean") return "enable";
+  if (typeof d.isEnabled === "boolean") return "isEnabled";
+  throw new Error(
+    `Domain ${d.name ?? d.id} has neither enable (v1) nor isEnabled (0.16)`,
+  );
+}
+
+/**
+ * A domain's state for `domain_list`: `unknown` when it has neither flag, so
+ * one odd domain does not stop the listing. `domain_set_state` refuses such a
+ * domain instead, through {@link domainEnabledKey}.
+ */
+function domainState(d: Json): "active" | "inactive" | "unknown" {
+  const flag = d.enable ?? d.isEnabled;
+  if (typeof flag !== "boolean") return "unknown";
+  return flag ? "active" : "inactive";
+}
+
+/**
  * Whether an account's `permissions` union is the empty `Replace` that
  * `account_set_state` uses to disable it.
  */
@@ -717,6 +748,15 @@ function redactSecrets(v: unknown): unknown {
     out[k] = k === "secret" ? REDACTED : redactSecrets(x);
   }
   return out;
+}
+
+/** Whether `v` holds a secret: an object with a `secret` key, at any depth. */
+function holdsSecret(v: unknown): boolean {
+  if (Array.isArray(v)) return v.some(holdsSecret);
+  if (!v || typeof v !== "object") return false;
+  return Object.entries(v as Json).some(([k, x]) =>
+    k === "secret" || holdsSecret(x)
+  );
 }
 
 /**
@@ -968,11 +1008,20 @@ const SettingsGetArgs = z.object({
 
 const SettingsSetArgs = z.object({
   kind: z.enum(SETTINGS_KINDS).describe("Which settings singleton to update"),
-  // Sensitive because a patch can carry a secret (e.g. jmap `webPushKey`);
-  // swamp then masks it wherever it redacts method arguments.
-  patch: jsonObject.meta({ sensitive: true }).describe(
+  // Not marked sensitive: swamp would then mask every string, number and
+  // field name in it wherever they appear, the settings record included.
+  // Secrets come in only through webPushKey.
+  patch: jsonObject.describe(
     'Top-level fields to set, e.g. {"usePermissiveCors":true}. Fields not ' +
-      "named are kept. Stalwart replaces a list or map value whole.",
+      "named are kept. Stalwart replaces a list or map value whole. A patch " +
+      'holding a secret (any {"secret": …} value) is refused: use webPushKey.',
+  ),
+  // The one secret field in the six settings singletons (0.16 and v1), so it
+  // can be marked sensitive on its own.
+  webPushKey: z.string().meta({ sensitive: true }).optional().describe(
+    "jmap only: the Web Push key, stored as a Text secret. Pass it as a " +
+      "vault reference. It is sent on every run, as the server may not " +
+      "return it to compare.",
   ),
   reload: z.boolean().default(true).describe(
     "Run a settings reload afterwards, even when nothing changed, so the " +
@@ -1063,7 +1112,7 @@ const ROLE_PRESETS: Record<string, { description: string; enabled: string[] }> =
         "sysSpamTrainingSampleGet",
         "sysSpamTrainingSampleQuery",
         "sysSpamTrainingSampleCreate",
-        "sysSpamTrainingSampleUpdate",
+        // No sysSpamTrainingSampleUpdate: Stalwart v1 has no such permission.
         "actionClassifySpam",
         "sysCertificateGet",
         "sysCertificateQuery",
@@ -1206,7 +1255,7 @@ function globalsOf(context: Pick<Ctx, "globalArgs" | "logger">): GlobalArgsT {
  */
 export const model = {
   type: "@thomas/stalwart",
-  version: "2026.10.11.1",
+  version: "2026.10.29.1",
   globalArguments: GlobalArgs,
   upgrades: [
     {
@@ -1223,6 +1272,14 @@ export const model = {
         }
         return old;
       },
+    },
+    {
+      toVersion: "2026.10.29.1",
+      description:
+        "Supports Stalwart v1 as well as 0.16. Global arguments are unchanged. The swamp-admin preset no longer grants sysSpamTrainingSampleUpdate, which v1 removed. settings_set's patch is no longer marked sensitive, so the settings record keeps its field names; a patch holding a secret is refused, and jmap's Web Push key is set with the new sensitive webPushKey argument. settings_set refuses system includeSecrets: true.",
+      upgradeAttributes: (
+        old: Record<string, unknown>,
+      ): Record<string, unknown> => old,
     },
   ],
   checks: {
@@ -1353,11 +1410,9 @@ export const model = {
         const g = globalsOf(context);
         const accountId = await resolveAccountId(g);
         logInfo(context, "Listing domains");
-        const rows = await listAll(g, JMAP_TYPES.domain, accountId, [
-          "id",
-          "name",
-          "isEnabled",
-        ]);
+        // Every property, because the on/off flag's name differs between
+        // 0.16 and v1 (see domainState).
+        const rows = await listAll(g, JMAP_TYPES.domain, accountId);
         const ts = nowIso();
         const handles: DataHandle[] = [];
         for (const d of rows) {
@@ -1368,7 +1423,7 @@ export const model = {
               {
                 id: String(d.id ?? ""),
                 name: String(d.name ?? ""),
-                state: d.isEnabled === false ? "inactive" : "active",
+                state: domainState(d),
                 action: "observed",
                 timestamp: ts,
               },
@@ -1713,8 +1768,9 @@ export const model = {
             delete fields.id;
             const summary = JSON.stringify(fields);
             // The report body sits under `report`. DMARC names the policy
-            // domain and range once; TLS-RPT names the domain per policy, and
-            // calls the range start `dateRangeStart` rather than `...Begin`.
+            // domain and range once; TLS-RPT names the domain per policy. The
+            // range start is `dateRangeStart`, except in 0.16 DMARC reports,
+            // which call it `dateRangeBegin`.
             const body = (r.report ?? {}) as Json;
             // A Stalwart List is sent as an index-keyed object, not an array.
             const policy =
@@ -1994,7 +2050,9 @@ export const model = {
         // The alias list to send, when aliases were passed. Stalwart replaces
         // the whole list on update, so an alias the account already has keeps
         // its description and its enabled flag (one disabled in the UI stays
-        // disabled); a new alias is enabled.
+        // disabled). The flag is copied under the name the server sent:
+        // `enabled` in Stalwart 0.16, `enable` in v1. A new alias carries no
+        // flag, and both versions default it to enabled.
         let aliasList: Json | undefined;
         if (a.aliases) {
           const current = Object.values(
@@ -2004,10 +2062,10 @@ export const model = {
           let i = 0;
           for (const alias of desiredAliases.values()) {
             const kept = current.find((c) => aliasKey(c) === aliasKey(alias));
-            const entry: Json = {
-              ...alias,
-              enabled: typeof kept?.enabled === "boolean" ? kept.enabled : true,
-            };
+            const entry: Json = { ...alias };
+            for (const flag of ["enable", "enabled"]) {
+              if (typeof kept?.[flag] === "boolean") entry[flag] = kept[flag];
+            }
             if (typeof kept?.description === "string") {
               entry.description = kept.description;
             }
@@ -2345,8 +2403,8 @@ export const model = {
     // ───────────── reversible state ─────────────
     domain_set_state: {
       description:
-        "Enable or disable a domain (reversible, via `isEnabled`). Checks the " +
-        "domain exists first; idempotent.",
+        "Enable or disable a domain (reversible, via `enable`, or `isEnabled` " +
+        "on Stalwart 0.16). Checks the domain exists first; idempotent.",
       arguments: DomainSetStateArgs,
       execute: async (
         rawArgs,
@@ -2359,23 +2417,21 @@ export const model = {
           domain: a.domain,
           state: a.state,
         });
-        const rows = await listAll(g, JMAP_TYPES.domain, accountId, [
-          "id",
-          "name",
-          "isEnabled",
-        ]);
+        // Every property, so domainEnabledKey can tell 0.16 from v1.
+        const rows = await listAll(g, JMAP_TYPES.domain, accountId);
         const dom = rows.find((d) =>
           String(d.name).toLowerCase() === a.domain.toLowerCase()
         );
         if (!dom) throw new Error(`Domain not found: ${a.domain}`);
+        const key = domainEnabledKey(dom);
         const want = a.state === "active";
         let action: "reactivated" | "deactivated" | "unchanged";
-        if (dom.isEnabled === want) {
+        if (dom[key] === want) {
           action = "unchanged";
         } else {
           const res = await jmapSet(g, JMAP_TYPES.domain, {
             accountId,
-            update: { [String(dom.id)]: { isEnabled: want } },
+            update: { [String(dom.id)]: { [key]: want } },
           });
           const err = setItemError(res, String(dom.id));
           if (err) throw new Error(`Could not set domain state: ${err}`);
@@ -2511,12 +2567,36 @@ export const model = {
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const a = SettingsSetArgs.parse(rawArgs);
+        if (a.webPushKey !== undefined && a.kind !== "jmap") {
+          throw new Error("webPushKey is a jmap setting; use kind jmap");
+        }
+        // patch is not sensitive, so swamp would store a secret in it in clear.
+        if (holdsSecret(a.patch)) {
+          throw new Error(
+            'patch holds a secret value (a {"secret": …} object), which swamp ' +
+              "would store in clear. Set the jmap Web Push key with the " +
+              "webPushKey argument, from a vault reference.",
+          );
+        }
+        // Stalwart v1's system includeSecrets makes every management API reply
+        // carry passwords and keys in clear, which this credential must not
+        // switch on.
+        if (a.kind === "system" && a.patch.includeSecrets === true) {
+          throw new Error(
+            "Refusing includeSecrets: true, which makes Stalwart return " +
+              "secrets in every management API reply",
+          );
+        }
+        const update: Json = { ...a.patch };
+        if (a.webPushKey !== undefined) {
+          update.webPushKey = { "@type": "Text", secret: a.webPushKey };
+        }
         const g = globalsOf(context);
         const accountId = await resolveAccountId(g);
         const type = SETTINGS_TYPES[a.kind];
         logInfo(context, "Updating {kind} settings: {fields}", {
           kind: a.kind,
-          fields: Object.keys(a.patch),
+          fields: Object.keys(update),
         });
         const readSingleton = async (): Promise<Json> => {
           const list = await jmapGet(g, type, {
@@ -2529,14 +2609,14 @@ export const model = {
           return list[0];
         };
         let current = await readSingleton();
-        const changed = Object.entries(a.patch).some(([k, v]) =>
+        const changed = Object.entries(update).some(([k, v]) =>
           JSON.stringify(current[k]) !== JSON.stringify(v)
         );
         let action: "updated" | "unchanged" = "unchanged";
         if (changed) {
           const res = await jmapSet(g, type, {
             accountId,
-            update: { [SINGLETON_ID]: a.patch },
+            update: { [SINGLETON_ID]: update },
           });
           const err = setItemError(res, SINGLETON_ID);
           if (err) {
@@ -2551,7 +2631,11 @@ export const model = {
         // change and then failed to reload, and a retry finds nothing to change.
         if (a.reload) {
           try {
-            await runAction(g, accountId, "ReloadSettings");
+            for (
+              const warning of await runAction(g, accountId, "ReloadSettings")
+            ) {
+              logWarning(context, "Reload warning: {warning}", { warning });
+            }
           } catch (e) {
             throw new Error(
               `The ${a.kind} settings are saved but the reload failed, so ` +
@@ -2588,7 +2672,9 @@ export const model = {
         const g = globalsOf(context);
         const accountId = await resolveAccountId(g);
         logInfo(context, "Reloading settings");
-        await runAction(g, accountId, "ReloadSettings");
+        for (const warning of await runAction(g, accountId, "ReloadSettings")) {
+          logWarning(context, "Reload warning: {warning}", { warning });
+        }
         const handle = await context.writeResource(
           "state-result",
           dataName("state-result", "reload"),
