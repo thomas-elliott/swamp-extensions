@@ -1161,11 +1161,13 @@ Deno.test("domain_list: a domain with neither flag is listed as unknown", async 
 });
 
 Deno.test("reload: logs the warnings a v1 server returns", async () => {
+  // v1 sends warnings as a set, which goes on the wire as a map of
+  // member -> true (seen live: an empty reload answers `warnings: {}`).
   makeTypedJmap(
     {},
     (type) =>
       type === "x:Action"
-        ? { created: { c0: { id: "a1", warnings: ["bad listener"] } } }
+        ? { created: { c0: { id: "a1", warnings: { "bad listener": true } } } }
         : undefined,
   );
   try {

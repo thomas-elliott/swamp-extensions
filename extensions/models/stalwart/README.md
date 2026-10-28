@@ -1,7 +1,7 @@
 # @thomas/stalwart
 
 **Non-destructive** administration of a [Stalwart](https://stalw.art) mail
-server (0.16, and v1 checked against its schema) for swamp, over its
+server (0.16 and v1) for swamp, over its
 **JMAP-over-HTTP management API**. Use it to create mailboxes and aliases,
 configure groups/lists/roles, check server health and DMARC/TLS reports, change
 server settings (including the spam classifier's) and run maintenance actions
@@ -153,14 +153,13 @@ swamp data query 'modelName == "stalwart" && name == "account:alice@example.com"
 In CEL: `data.latest("stalwart", "account:alice@example.com").attributes.roles`.
 
 > Stalwart does not publish its JMAP management method and type names. They were
-> confirmed against a live 0.16 server and are pinned in the `USING` /
-> `JMAP_TYPES` constants in `stalwart.ts`. They have not yet been checked
-> against a live v1 server; run `session_dump` and `jmap_probe` there to do so.
+> confirmed against live 0.16 and v1 servers and are pinned in the `USING` /
+> `JMAP_TYPES` constants in `stalwart.ts`. To check them against another
+> version, run `session_dump` and `jmap_probe` there.
 
 ## Stalwart v1
 
-v1 support is checked against Stalwart's published v1 schema, not yet against a
-live v1 server. v1 renamed some fields (see
+Every method has been run against a live v1 server. v1 renamed some fields (see
 [`SCHEMA_CHANGES.md`](https://github.com/stalwartlabs/stalwart-migrate/blob/main/SCHEMA_CHANGES.md)
 in `stalwart-migrate`), and the extension handles the ones it uses:
 
@@ -169,9 +168,10 @@ in `stalwart-migrate`), and the extension handles the ones it uses:
 - An alias's on/off flag is `enabled` in 0.16 and `enable` in v1.
   `account_ensure` keeps it under the name the server sent.
 - A DMARC report's range start is `dateRangeBegin` in 0.16 and `dateRangeStart`
-  in v1. `report_query` reads either.
-- A v1 settings reload can return warnings. `settings_set` and `reload` log each
-  one as a warning.
+  in v1. `report_query` reads either. The v1 name is checked against the schema
+  only: the test server had no reports.
+- A v1 settings reload can return warnings, sent as a set of strings.
+  `settings_set` and `reload` log each one as a warning.
 
 `settings_set` passes `patch` to Stalwart unchanged, so a patch must use the
 field names of the server's version. In v1, for example, `http`'s

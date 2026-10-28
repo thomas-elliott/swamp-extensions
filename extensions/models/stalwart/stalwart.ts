@@ -13,7 +13,7 @@ import type {
 
 /**
  * `@thomas/stalwart`: non-destructive administration of a Stalwart mail server
- * (0.16, and v1 checked against its schema) over its JMAP-over-HTTP
+ * (0.16 and v1) over its JMAP-over-HTTP
  * management API.
  *
  * Scope: this holds a mail-admin credential, so the methods are limited and
@@ -36,7 +36,7 @@ import type {
  * Auth: a scoped admin API key, sent as `Authorization: Bearer <key>` on every
  * request. No long-lived token is exchanged or stored.
  *
- * Object model (confirmed live against 0.16): individuals use the RFC-standard
+ * Object model (confirmed live against 0.16 and v1): individuals use the RFC-standard
  * `Principal/*`; every registry/management object is served under
  * `urn:stalwart:jmap` with an `x:` prefix (`x:Account`, `x:Domain`, `x:Role`,
  * `x:Http`, …); settings singletons are `/get` by the fixed id `singleton`; and
@@ -259,7 +259,7 @@ const ProbeResult = z.object({
  * JMAP capability URIs sent in the `using` array of every envelope. `core` and
  * `principals` are RFC-standard; `mgmt` (`urn:stalwart:jmap`) is the Stalwart
  * capability that serves every registry/management object. Confirmed against a
- * live 0.16 session resource.
+ * live 0.16 and v1 session resource.
  */
 export const USING = {
   core: "urn:ietf:params:jmap:core",
@@ -269,7 +269,7 @@ export const USING = {
 
 /**
  * Wire type names for the Stalwart JMAP objects this extension uses, confirmed
- * against a live 0.16 server. Every registry/management object is served under
+ * against live 0.16 and v1 servers. Every registry/management object is served under
  * `urn:stalwart:jmap` with an `x:` prefix. Settings singletons are listed in
  * `SETTINGS_TYPES`. Actions (reloads) are run by *creating* an `x:Action` with
  * an `@type` discriminator.
@@ -509,7 +509,7 @@ async function resolveAccountId(g: GlobalArgsT): Promise<string | undefined> {
   const cached = _accountIdCache.get(cacheKey);
   if (cached !== undefined) return cached;
   // The session resource lists accounts under `.accounts` and names the primary
-  // under `.primaryAccounts`. Field shapes confirmed against a live 0.16 server.
+  // under `.primaryAccounts`. Field shapes confirmed against live 0.16 and v1 servers.
   const r = await rest(g, { method: "GET", path: "/.well-known/jmap" });
   const accounts = (r.body.accounts ?? {}) as Json;
   const primary = (r.body.primaryAccounts ?? {}) as Json;
@@ -585,7 +585,8 @@ async function jmapSet(
  * create-only and cannot be updated or destroyed. Throws on failure.
  *
  * Returns the warnings the server reported. Stalwart v1 answers
- * `ReloadSettings` with `{ warnings: string[] }`; 0.16 sends none.
+ * `ReloadSettings` with `warnings`, a set of strings sent as a map
+ * (`{ "<warning>": true }`); 0.16 sends none.
  */
 async function runAction(
   g: GlobalArgsT,
@@ -599,7 +600,7 @@ async function runAction(
   const err = setItemError(res, "c0");
   if (err) throw new Error(`Action ${atType} failed: ${err}`);
   const created = ((res.created ?? {}) as Json).c0 as Json | undefined;
-  return Array.isArray(created?.warnings) ? created.warnings.map(String) : [];
+  return mapKeys(created?.warnings);
 }
 
 /**
@@ -1255,7 +1256,7 @@ function globalsOf(context: Pick<Ctx, "globalArgs" | "logger">): GlobalArgsT {
  */
 export const model = {
   type: "@thomas/stalwart",
-  version: "2026.10.29.1",
+  version: "2026.10.29.2",
   globalArguments: GlobalArgs,
   upgrades: [
     {
@@ -1277,6 +1278,14 @@ export const model = {
       toVersion: "2026.10.29.1",
       description:
         "Supports Stalwart v1 as well as 0.16. Global arguments are unchanged. The swamp-admin preset no longer grants sysSpamTrainingSampleUpdate, which v1 removed. settings_set's patch is no longer marked sensitive, so the settings record keeps its field names; a patch holding a secret is refused, and jmap's Web Push key is set with the new sensitive webPushKey argument. settings_set refuses system includeSecrets: true.",
+      upgradeAttributes: (
+        old: Record<string, unknown>,
+      ): Record<string, unknown> => old,
+    },
+    {
+      toVersion: "2026.10.29.2",
+      description:
+        "settings_set and reload now log the warnings a Stalwart v1 reload returns; they were dropped before. Global arguments and stored data are unchanged.",
       upgradeAttributes: (
         old: Record<string, unknown>,
       ): Record<string, unknown> => old,
