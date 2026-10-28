@@ -1,8 +1,8 @@
 manifestVersion: 1
 name: "@thomas/stalwart"
-version: 2026.10.29.1
+version: 2026.10.29.2
 description: >-
-  Non-destructive administration of a Stalwart mail server (0.16, and v1 checked against its schema) over its
+  Non-destructive administration of a Stalwart mail server (0.16 and v1) over its
   JMAP-over-HTTP management API, authenticated with a scoped admin API key.
   Reads domains, accounts, aliases, groups, DMARC/TLS reports, the outbound
   queue and server health. Creates or updates accounts and aliases, groups,
