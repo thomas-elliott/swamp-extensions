@@ -114,7 +114,8 @@ function jmapOk(name: string, args: Json): Json {
 
 /**
  * A JMAP fake driven by a `type → objects[]` table: `<type>/query` returns the
- * objects' ids (+ total); `<type>/get` returns the objects as `list`; `/set`
+ * objects' ids (+ total); `<type>/get` returns the objects as `list`, cut to
+ * the requested `properties` when given; `/set`
  * updates apply each top-level field to the stored object. The table is
  * copied, so a test can reuse it. `onSet`, when given, sees each set after it
  * is applied and may return a response body to send instead. Also sets the
@@ -155,10 +156,19 @@ function makeTypedJmap(
       const want = new Set(
         (args.ids as string[] | undefined) ?? objs.map((o) => String(o.id)),
       );
+      // Like a real JMAP server, return only the requested properties (and
+      // always the id), so a test sees what a narrowed fetch would miss.
+      const props = args.properties as string[] | undefined;
+      const pick = (o: Json): Json =>
+        props
+          ? Object.fromEntries(
+            Object.entries(o).filter(([k]) => k === "id" || props.includes(k)),
+          )
+          : o;
       return Promise.resolve({
         status: 200,
         body: jmapOk(name, {
-          list: objs.filter((o) => want.has(String(o.id))),
+          list: objs.filter((o) => want.has(String(o.id))).map(pick),
         }),
       });
     }
@@ -855,7 +865,7 @@ Deno.test("account_ensure: creates with resolved domain, aliases, role, password
     assertEquals(c.name, "alice");
     assertEquals(c.domainId, "d1");
     assertEquals(c.aliases, {
-      "0": { name: "a", domainId: "d1", enabled: true },
+      "0": { name: "a", domainId: "d1" },
     });
     assertEquals(c.roles, { "@type": "User" }, "defaults to user role");
     assertEquals(c.credentials, {
@@ -1097,6 +1107,96 @@ Deno.test("account_ensure: refuses an address that belongs to a group, writes no
       );
     }
     assertEquals(setCalls.length, 0, "the group must not be touched");
+  } finally {
+    __setJmap(null);
+    __setRest(null);
+  }
+});
+
+Deno.test("domain_list and domain_set_state: v1 spells the flag enable", async () => {
+  const t = {
+    "x:Domain": [
+      { id: "d1", name: "example.com", enable: true },
+      { id: "d2", name: "example.net", enable: false },
+    ],
+  };
+  makeTypedJmap(t);
+  try {
+    const { context, written } = makeContext();
+    await method("domain_list").execute({}, context);
+    assertEquals(written.map((w) => w.data.state), ["active", "inactive"]);
+  } finally {
+    __setJmap(null);
+    __setRest(null);
+  }
+  const r = makeTypedJmap(t);
+  try {
+    const { context } = makeContext();
+    await method("domain_set_state").execute({
+      domain: "example.com",
+      state: "inactive",
+    }, context);
+    assertEquals((r.setCalls[0].args.update as Json).d1, { enable: false });
+  } finally {
+    __setJmap(null);
+    __setRest(null);
+  }
+});
+
+Deno.test("domain_list: a domain with neither flag is listed as unknown", async () => {
+  makeTypedJmap({
+    "x:Domain": [
+      { id: "d1", name: "example.com" },
+      { id: "d2", name: "example.net", enable: true },
+    ],
+  });
+  try {
+    const { context, written } = makeContext();
+    await method("domain_list").execute({}, context);
+    assertEquals(written.map((w) => w.data.state), ["unknown", "active"]);
+  } finally {
+    __setJmap(null);
+    __setRest(null);
+  }
+});
+
+Deno.test("reload: logs the warnings a v1 server returns", async () => {
+  makeTypedJmap(
+    {},
+    (type) =>
+      type === "x:Action"
+        ? { created: { c0: { id: "a1", warnings: ["bad listener"] } } }
+        : undefined,
+  );
+  try {
+    const { context, written, logs } = makeContext();
+    await method("reload").execute({}, context);
+    assertEquals(
+      logs.filter((l) => l.level === "warn").map((l) => l.props.warning),
+      ["bad listener"],
+    );
+    assertEquals(written[0].data.action, "reloaded");
+  } finally {
+    __setJmap(null);
+    __setRest(null);
+  }
+});
+
+Deno.test("domain_set_state: a domain with neither flag is refused, not guessed", async () => {
+  const { setCalls } = makeTypedJmap({
+    "x:Domain": [{ id: "d1", name: "example.com" }],
+  });
+  try {
+    const { context } = makeContext();
+    await rejects(
+      () =>
+        method("domain_set_state").execute({
+          domain: "example.com",
+          state: "inactive",
+        }, context),
+      /neither enable \(v1\) nor isEnabled \(0\.16\)/,
+    );
+    assertEquals(setCalls.length, 0);
   } finally {
     __setJmap(null);
     __setRest(null);
@@ -1616,7 +1716,7 @@ Deno.test("settings_get: secret values are redacted, wherever they sit", async (
   }
 });
 
-Deno.test("settings_set: a secret in the patch is sent but not recorded", async () => {
+Deno.test("settings_set: webPushKey is sent as a Text secret but not recorded", async () => {
   const { setCalls } = makeTypedJmap({
     "x:Jmap": [{
       id: "singleton",
@@ -1625,15 +1725,84 @@ Deno.test("settings_set: a secret in the patch is sent but not recorded", async 
   });
   try {
     const { context, written } = makeContext();
-    const patch = { webPushKey: { "@type": "Text", secret: "new-value" } };
     await method("settings_set").execute(
-      { kind: "jmap", patch, reload: false },
+      { kind: "jmap", patch: {}, webPushKey: "new-value", reload: false },
       context,
     );
-    assertEquals((setCalls[0].args.update as Json).singleton, patch);
+    assertEquals((setCalls[0].args.update as Json).singleton, {
+      webPushKey: { "@type": "Text", secret: "new-value" },
+    });
     const stored = JSON.stringify(written[0].data);
-    assert(!stored.includes("new-value"), "patched secret not recorded");
+    assert(!stored.includes("new-value"), "new secret not recorded");
     assert(!stored.includes("old-value"), "old secret not recorded");
+  } finally {
+    __setJmap(null);
+    __setRest(null);
+  }
+});
+
+Deno.test("settings_set: a patch holding a secret is refused before any call", async () => {
+  const { setCalls } = makeTypedJmap({ "x:Jmap": [{ id: "singleton" }] });
+  try {
+    const { context, written } = makeContext();
+    await rejects(
+      () =>
+        method("settings_set").execute({
+          kind: "jmap",
+          patch: { webPushKey: { "@type": "Text", secret: "literal" } },
+        }, context),
+      /patch holds a secret value/,
+    );
+    assertEquals(setCalls.length, 0);
+    assertEquals(written.length, 0);
+  } finally {
+    __setJmap(null);
+    __setRest(null);
+  }
+});
+
+Deno.test("settings_set: refuses switching on v1's includeSecrets", async () => {
+  const { setCalls } = makeTypedJmap({
+    "x:SystemSettings": [{ id: "singleton", includeSecrets: false }],
+  });
+  try {
+    const { context } = makeContext();
+    await rejects(
+      () =>
+        method("settings_set").execute({
+          kind: "system",
+          patch: { includeSecrets: true },
+        }, context),
+      /Refusing includeSecrets: true/,
+    );
+    assertEquals(setCalls.length, 0);
+    // Switching it off is allowed.
+    await method("settings_set").execute({
+      kind: "system",
+      patch: { includeSecrets: false },
+      reload: false,
+    }, context);
+    assertEquals(setCalls.length, 0, "already off → no write");
+  } finally {
+    __setJmap(null);
+    __setRest(null);
+  }
+});
+
+Deno.test("settings_set: webPushKey is refused for any kind but jmap", async () => {
+  const { setCalls } = makeTypedJmap({ "x:Http": [{ id: "singleton" }] });
+  try {
+    const { context } = makeContext();
+    await rejects(
+      () =>
+        method("settings_set").execute({
+          kind: "http",
+          patch: {},
+          webPushKey: "k",
+        }, context),
+      /webPushKey is a jmap setting/,
+    );
+    assertEquals(setCalls.length, 0);
   } finally {
     __setJmap(null);
     __setRest(null);
@@ -1924,14 +2093,22 @@ Deno.test("reachable: a zero or negative httpTimeoutMs is rejected", async () =>
   }
 });
 
-Deno.test("settings_set: patch is marked sensitive", () => {
+// swamp masks every string, number and field name of a sensitive argument
+// wherever it appears. Marking the free-form patch sensitive turned the
+// settings record's field names into "***" (seen live), so only the one
+// secret field, webPushKey, is marked.
+Deno.test("settings_set: webPushKey is sensitive, patch is not", () => {
   const shape = (model.methods.settings_set.arguments as unknown as {
     shape: Record<string, z.ZodType>;
   }).shape;
-  const meta = z.globalRegistry.get(shape.patch) as
-    | { sensitive?: boolean }
-    | undefined;
-  assertEquals(meta?.sensitive, true);
+  // An optional field holds its metadata on the type it wraps.
+  const sensitive = (f: z.ZodType) => {
+    const inner = f instanceof z.ZodOptional ? f.unwrap() as z.ZodType : f;
+    return (z.globalRegistry.get(inner) as { sensitive?: boolean } | undefined)
+      ?.sensitive;
+  };
+  assertEquals(sensitive(shape.webPushKey), true);
+  assertEquals(sensitive(shape.patch), undefined);
 });
 
 // ─────────────────────────── logging ───────────────────────────
@@ -2163,7 +2340,7 @@ Deno.test("account_ensure: rewriting the aliases keeps their descriptions", asyn
           enabled: true,
           description: "Old address",
         },
-        "1": { name: "new", domainId: "d1", enabled: true },
+        "1": { name: "new", domainId: "d1" },
       },
     });
   } finally {
@@ -2502,7 +2679,38 @@ Deno.test("account_ensure: rewriting the aliases keeps a disabled alias disabled
     assertEquals((setCalls[0].args.update as Json).u1, {
       aliases: {
         "0": { name: "off", domainId: "d1", enabled: false },
-        "1": { name: "new", domainId: "d1", enabled: true },
+        "1": { name: "new", domainId: "d1" },
+      },
+    });
+  } finally {
+    __setJmap(null);
+    __setRest(null);
+  }
+});
+
+Deno.test("account_ensure: on v1 a disabled alias keeps its enable flag", async () => {
+  const { setCalls } = makeTypedJmap({
+    "x:Domain": [{ id: "d1", name: "a.test" }],
+    "x:Account": [{
+      id: "u1",
+      "@type": "User",
+      name: "me",
+      emailAddress: "me@a.test",
+      domainId: "d1",
+      aliases: { "0": { name: "off", domainId: "d1", enable: false } },
+      roles: { "@type": "User" },
+    }],
+  });
+  try {
+    const { context } = makeContext();
+    await method("account_ensure").execute(
+      { email: "me@a.test", aliases: ["off@a.test", "new@a.test"] },
+      context,
+    );
+    assertEquals((setCalls[0].args.update as Json).u1, {
+      aliases: {
+        "0": { name: "off", domainId: "d1", enable: false },
+        "1": { name: "new", domainId: "d1" },
       },
     });
   } finally {
@@ -2579,7 +2787,7 @@ Deno.test("account_ensure: addresses typed in another case match the server's lo
     assertEquals((setCalls[0].args.update as Json).u1, {
       aliases: {
         "0": { name: "off", domainId: "d1", enabled: false },
-        "1": { name: "new", domainId: "d1", enabled: true },
+        "1": { name: "new", domainId: "d1" },
       },
     });
   } finally {

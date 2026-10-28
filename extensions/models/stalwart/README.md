@@ -1,11 +1,11 @@
 # @thomas/stalwart
 
 **Non-destructive** administration of a [Stalwart](https://stalw.art) mail
-server (v0.16+) for swamp, over its **JMAP-over-HTTP management API**. Use it to
-create mailboxes and aliases, configure groups/lists/roles, check server health
-and DMARC/TLS reports, change server settings (including the spam classifier's)
-and run maintenance actions (reload settings, install/reload certificates)
-without using the web UI.
+server (0.16, and v1 checked against its schema) for swamp, over its
+**JMAP-over-HTTP management API**. Use it to create mailboxes and aliases,
+configure groups/lists/roles, check server health and DMARC/TLS reports, change
+server settings (including the spam classifier's) and run maintenance actions
+(reload settings, install/reload certificates) without using the web UI.
 
 ## Scope
 
@@ -95,7 +95,9 @@ swamp model create @thomas/stalwart stalwart \
   changed, so re-running it after a failed reload makes the change live. Fields
   not in `patch` are kept; a list or map value is replaced whole. The record
   shows the singleton as the server holds it afterwards, with secret values as
-  `"<redacted>"`.
+  `"<redacted>"`. A patch holding a secret is refused. Set `jmap`'s Web Push key
+  with the sensitive `webPushKey` argument, from a vault reference; it is sent
+  on every run. `includeSecrets: true` for `system` is refused.
 - `certificate_install`: install a PEM certificate and key, then reload
   certificates. Your ACME tooling issues the certificate; this method only
   installs it. The record holds the certificate's `issuer`, `sans`, `notBefore`
@@ -152,9 +154,43 @@ In CEL: `data.latest("stalwart", "account:alice@example.com").attributes.roles`.
 
 > Stalwart does not publish its JMAP management method and type names. They were
 > confirmed against a live 0.16 server and are pinned in the `USING` /
-> `JMAP_TYPES` constants in `stalwart.ts`.
+> `JMAP_TYPES` constants in `stalwart.ts`. They have not yet been checked
+> against a live v1 server; run `session_dump` and `jmap_probe` there to do so.
+
+## Stalwart v1
+
+v1 support is checked against Stalwart's published v1 schema, not yet against a
+live v1 server. v1 renamed some fields (see
+[`SCHEMA_CHANGES.md`](https://github.com/stalwartlabs/stalwart-migrate/blob/main/SCHEMA_CHANGES.md)
+in `stalwart-migrate`), and the extension handles the ones it uses:
+
+- A domain's on/off flag is `isEnabled` in 0.16 and `enable` in v1. The
+  `domain_*` methods use whichever name the server returns.
+- An alias's on/off flag is `enabled` in 0.16 and `enable` in v1.
+  `account_ensure` keeps it under the name the server sent.
+- A DMARC report's range start is `dateRangeBegin` in 0.16 and `dateRangeStart`
+  in v1. `report_query` reads either.
+- A v1 settings reload can return warnings. `settings_set` and `reload` log each
+  one as a warning.
+
+`settings_set` passes `patch` to Stalwart unchanged, so a patch must use the
+field names of the server's version. In v1, for example, `http`'s
+`useXForwarded` is now `clientIpSource`, and `imap`'s `timeoutIdle` is now
+`idleTimeout`. v1 does not recognise the old names.
 
 ## Breaking changes
+
+- **`settings_set` refuses a secret in `patch`; use `webPushKey`.** `patch` is
+  no longer marked sensitive, because swamp then masked every field name and
+  value in it, so the settings record showed `"***"` in place of the fields that
+  were set. A patch holding a secret (any `{"secret": …}` value) is now refused.
+  The one secret setting, `jmap`'s Web Push key, has its own sensitive argument,
+  `webPushKey`: pass it as a vault reference.
+- **`settings_set` refuses `includeSecrets: true` for `system`.** In Stalwart v1
+  it makes every management API reply carry passwords and keys in clear.
+- **The `swamp-admin` preset no longer grants `sysSpamTrainingSampleUpdate`.**
+  Stalwart v1 removed that permission. On 0.16, re-running `role_ensure` with
+  the preset removes it from the role. No method in this extension needs it.
 
 - **Data names are now `<spec>:<key>`** (or `<spec>` alone for `health` and
   `session`), with addresses and domains lowercased; see
@@ -203,8 +239,6 @@ In CEL: `data.latest("stalwart", "account:alice@example.com").attributes.roles`.
 - **`settings_set` records the singleton as the server holds it after the
   update.** It used to lay `patch` over the old value, which was wrong for a
   partial nested object, which Stalwart merges into the stored one.
-- **`settings_set`'s `patch` is marked sensitive,** so swamp masks it wherever
-  it redacts method arguments.
 - **`httpTimeoutMs` must be a positive number.** `0` used to abort every request
   at once.
 - **`certificate` records have `issuer` instead of `subject`.** `subject` held
@@ -215,8 +249,8 @@ In CEL: `data.latest("stalwart", "account:alice@example.com").attributes.roles`.
 - **`account_ensure` keeps an alias's enabled flag.** Rewriting the alias list
   used to enable every alias in it, including ones disabled elsewhere.
 - **Addresses passed to the `_ensure` methods are lowercased**, as Stalwart
-  stores them. An alias typed in another case used to be rewritten on every
-  run, and re-enabled if it was disabled.
+  stores them. An alias typed in another case used to be rewritten on every run,
+  and re-enabled if it was disabled.
 - **`role_ensure` refuses the names `admin` and `user`.** A custom role with
   either name could never be assigned by name.
 
