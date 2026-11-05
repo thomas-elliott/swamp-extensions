@@ -15,8 +15,9 @@ These are the only changes it makes:
 - **SMB share access:** set per-share `hostsallow`/`hostsdeny`.
 - **App networks:** set the docker networks a custom app joins, for example to
   let a reverse proxy reach other apps' bridges.
-- **App creation:** create an app from Docker Compose YAML, with its secrets
-  filled in from a vault so the YAML can be committed.
+- **Compose apps:** create an app from Docker Compose YAML, or replace an
+  existing one's YAML, with its secrets filled in from a vault so the YAML can
+  be committed.
 - **Share delete:** remove an NFS or SMB share definition. The dataset and its
   data are left alone, and the removed configuration is recorded so the share
   can be re-created.
@@ -118,15 +119,16 @@ cert also improves the host's security.
 
 ### Mutate (verify-first)
 
-| Method                 | Purpose                                                                                                                                                                                                                                                                                                                                                                                         |
-| ---------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `app_set_port_bind`    | Set one app port's `bindMode` (`published`/`exposed`) and/or `hostIps`. Sends the whole `network` map, or the whole `ports` list for a list-form app (other ports preserved), waits for the `app.update` job, re-reads.                                                                                                                                                                         |
-| `nfs_share_set_access` | Set a share's `networks`/`hosts` (empty array clears the restriction).                                                                                                                                                                                                                                                                                                                          |
-| `smb_share_set_access` | Set a share's `hostsallow`/`hostsdeny` (empty `hostsallow` clears the allowlist). May move the share's preset to `NO_PRESET` or `LEGACY_SHARE`, one way; see [SMB presets](#smb-presets).                                                                                                                                                                                                       |
-| `app_set_networks`     | Set the docker networks a custom app joins (existing entries keep their config). Custom apps only: a catalog app is refused and nothing is written.                                                                                                                                                                                                                                             |
-| `app_create`           | Create an app from Docker Compose YAML and wait for the job, which pulls its images (`waitMs`, default 10 minutes). Each `${NAME}` in the YAML is filled from `secrets.NAME`, with any `$` in the secret doubled so Compose reads it literally; `$${NAME}` and `${NAME:-default}` are left to Compose. Refuses an existing name, a secret with no placeholder and a placeholder with no secret. |
-| `nfs_share_delete`     | Delete an NFS export rule (the dataset is untouched); records the removed config. A share already gone records `absent`.                                                                                                                                                                                                                                                                        |
-| `smb_share_delete`     | Delete an SMB share definition (the dataset is untouched); records the removed config. A share already gone records `absent`.                                                                                                                                                                                                                                                                   |
+| Method                 | Purpose                                                                                                                                                                                                                                                                                                                                                                                                |
+| ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `app_set_port_bind`    | Set one app port's `bindMode` (`published`/`exposed`) and/or `hostIps`. Sends the whole `network` map, or the whole `ports` list for a list-form app (other ports preserved), waits for the `app.update` job, re-reads.                                                                                                                                                                                |
+| `nfs_share_set_access` | Set a share's `networks`/`hosts` (empty array clears the restriction).                                                                                                                                                                                                                                                                                                                                 |
+| `smb_share_set_access` | Set a share's `hostsallow`/`hostsdeny` (empty `hostsallow` clears the allowlist). May move the share's preset to `NO_PRESET` or `LEGACY_SHARE`, one way; see [SMB presets](#smb-presets).                                                                                                                                                                                                              |
+| `app_set_networks`     | Set the docker networks a custom app joins (existing entries keep their config). Custom apps only: a catalog app is refused and nothing is written.                                                                                                                                                                                                                                                    |
+| `app_create`           | Create a compose app from Docker Compose YAML and wait for the job, which pulls its images (`waitMs`, default 10 minutes). Each `${NAME}` in the YAML is filled from `secrets.NAME`, with any `$` in the secret doubled so Compose reads it literally; `$${NAME}` and `${NAME:-default}` are left to Compose. Refuses an existing name, a secret with no placeholder and a placeholder with no secret. |
+| `app_update`           | Replace the compose YAML of a compose app, filling `${NAME}` placeholders as `app_create` does, and wait for the job; every run redeploys the app. The previous compose is not recorded, as it holds the filled secrets: roll back by re-running with the earlier file. Refuses a missing app and a catalog app, which includes the UI's Custom App.                                                   |
+| `nfs_share_delete`     | Delete an NFS export rule (the dataset is untouched); records the removed config. A share already gone records `absent`.                                                                                                                                                                                                                                                                               |
+| `smb_share_delete`     | Delete an SMB share definition (the dataset is untouched); records the removed config. A share already gone records `absent`.                                                                                                                                                                                                                                                                          |
 
 ## Examples
 
@@ -178,8 +180,9 @@ for such an app. A `portNumber` that more than one port uses (say the same
 number over tcp and udp) is refused; pick a keyed port by `portKey` instead.
 `app_set_port_bind` and `app_set_networks` refuse apps installed from compose
 YAML (`customApp: true` in `app_list`): those take a whole compose file on
-update. Host-network apps bind no individual ports; `app_list` reports
-`hostNetwork`, and `exposure_audit` lists them under `hostNetworkApps`.
+update, which is what `app_update` sends. Host-network apps bind no individual
+ports; `app_list` reports `hostNetwork`, and `exposure_audit` lists them under
+`hostNetworkApps`.
 
 A published port counts as reachable on every interface (`exposedToAll`, and
 `exposure_audit`'s `portsOnAllInterfaces`) when its host IPs are empty, or
@@ -273,18 +276,18 @@ include `0.0.0.0` or `::`. TrueNAS binds an empty list to both `0.0.0.0` and
   tailnet-only bind.
 - **A timed-out `app_create` may still create the app.** Check `app_list` before
   re-running: a re-run refuses a name that exists, and records nothing.
-- **`app_create` does not update or delete an app.** A compose app takes a whole
-  new file on update, and a changed file is applied in the TrueNAS UI. The
-  secret values are stored by TrueNAS in the app's configuration, so anyone who
-  can read that configuration can read them.
+- **No app delete.** Remove an app in the TrueNAS UI. The secret values that
+  `app_create` and `app_update` fill in are stored by TrueNAS in the app's
+  configuration, so anyone who can read that configuration can read them.
 - **No service start/stop, no pool/dataset/user/snapshot management.** These are
   out of scope by design, to limit the damage a mistake can cause.
-- **A change that times out may still apply.** `app.update` is asynchronous (a
-  job); the method polls `core.get_jobs` until terminal within `timeoutMs`.
-  Giving up does not cancel the job. The same holds when any change call (an app
-  update, a share update or delete) times out or loses its connection. In each
-  case the error says so and no result is recorded: re-read the target before
-  retrying or reverting.
+- **A change that times out may still apply.** `app.create` and `app.update` are
+  asynchronous (jobs); the method polls `core.get_jobs` until terminal within
+  `timeoutMs` (`waitMs` for `app_create` and `app_update`). Giving up does not
+  cancel the job. The same holds when any change call (an app update, a share
+  update or delete) times out or loses its connection. In each case the error
+  says so and no result is recorded: re-read the target before retrying or
+  reverting.
 - **25.10.1+ Veeam shares may not apply host rules.** Read from the TrueNAS
   source, not tested: it accepts `hostsallow`/`hostsdeny` for a
   `VEEAM_REPOSITORY_SHARE` but does not read them back or apply them. If so,

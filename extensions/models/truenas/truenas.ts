@@ -17,7 +17,7 @@ import type {
  *
  * Scope: read what a TrueNAS host exposes, then restrict it. The mutating methods
  * are deliberately few and limited to app port binds, app docker networks, creating
- * an app from compose YAML, and NFS/SMB share access and deletion; each method's
+ * or updating an app from compose YAML, and NFS/SMB share access and deletion; each method's
  * description says what it changes.
  * It does not change pools, datasets, users, snapshots, replication, or service
  * start/stop. `filesystem_list` reads a directory and `replication_list` reads task
@@ -344,10 +344,10 @@ const AppNetworksResult = z.object({
   timestamp: z.string(),
 });
 
-const AppCreateResult = z.object({
+const AppComposeResult = z.object({
   app: z.string(),
   state: z.string().describe(
-    "App state when the create job finished, e.g. DEPLOYING",
+    "App state when the create or update job finished, e.g. DEPLOYING",
   ),
   action: Action,
   timestamp: z.string(),
@@ -1162,7 +1162,7 @@ const AppStorageArgs = z.object({
   ),
 });
 
-const AppCreateArgs = z.object({
+const AppComposeArgs = z.object({
   name: z.string().regex(/^[a-z]([-a-z0-9]*[a-z0-9])?$/).max(40).describe(
     "App name: lowercase letters, digits and hyphens, at most 40 characters",
   ),
@@ -1178,8 +1178,8 @@ const AppCreateArgs = z.object({
       "replaced as written, so quote the placeholder in the YAML.",
   ),
   waitMs: z.coerce.number().int().positive().default(600000).describe(
-    "How long to wait for the create job. It pulls every image first, so it " +
-      "takes far longer than timeoutMs allows.",
+    "How long to wait for the create or update job. It pulls the images " +
+      "first, so it takes far longer than timeoutMs allows.",
   ),
 });
 
@@ -1300,14 +1300,14 @@ function fillSecrets(compose: string, secrets: Record<string, string>): string {
     throw new Error(
       `no \${NAME} placeholder in the compose for secret(s) ${
         [...unused].join(", ")
-      }. Nothing was created.`,
+      }. Nothing was sent.`,
     );
   }
   if (missing.size > 0) {
     throw new Error(
       `placeholder(s) ${
         [...missing].join(", ")
-      } in the compose have no secret. Nothing was created.`,
+      } in the compose have no secret. Nothing was sent.`,
     );
   }
   return filled;
@@ -1326,6 +1326,28 @@ function redactSecrets(text: string, secrets: string[]): string {
   ]);
   forms.sort((x, y) => y.length - x.length);
   return forms.reduce((t, form) => redact(t, form), text);
+}
+
+/**
+ * Run `app.create` or `app.update` for a compose app and return the app entry the
+ * job reports. Errors are scrubbed of the secrets, since a validation failure can
+ * quote the submitted compose back; a timed-out job gets `retryAdvice` appended.
+ */
+async function runComposeJob(
+  session: RpcSession,
+  method: string,
+  params: unknown[],
+  a: { secrets: Record<string, string>; waitMs: number },
+  retryAdvice: string,
+): Promise<Record<string, unknown>> {
+  try {
+    return asObj(await callJob(session, method, params, a.waitMs));
+  } catch (err) {
+    const raw = err instanceof Error ? err.message : String(err);
+    let message = redactSecrets(raw, Object.values(a.secrets));
+    if (raw.includes(MAY_YET_APPLY)) message += ` ${retryAdvice}`;
+    throw new Error(message);
+  }
 }
 
 /** Find an app by name; throws if absent. */
@@ -1459,7 +1481,7 @@ async function resolveSmbOrNull(
  */
 export const model = {
   type: "@thomas/truenas",
-  version: "2026.11.05.1",
+  version: "2026.11.05.2",
   globalArguments: GlobalArgs,
   upgrades: [
     {
@@ -1483,6 +1505,14 @@ export const model = {
       toVersion: "2026.11.05.1",
       description:
         "Adds app_create. Global arguments and stored data are unchanged.",
+      upgradeAttributes: (
+        old: Record<string, unknown>,
+      ): Record<string, unknown> => old,
+    },
+    {
+      toVersion: "2026.11.05.2",
+      description:
+        "Adds app_update. Global arguments and stored data are unchanged.",
       upgradeAttributes: (
         old: Record<string, unknown>,
       ): Record<string, unknown> => old,
@@ -1591,7 +1621,13 @@ export const model = {
     },
     "app-create-result": {
       description: "Result of an app_create",
-      schema: AppCreateResult,
+      schema: AppComposeResult,
+      lifetime: "infinite",
+      garbageCollection: 10,
+    },
+    "app-update-result": {
+      description: "Result of an app_update",
+      schema: AppComposeResult,
       lifetime: "infinite",
       garbageCollection: 10,
     },
@@ -2418,20 +2454,20 @@ export const model = {
 
     app_create: {
       description:
-        "Create an app from Docker Compose YAML (a TrueNAS custom app installed " +
-        "from YAML), then wait for the create job, which pulls its images. " +
+        "Create a compose app (one installed from Docker Compose YAML, not the " +
+        "UI's Custom App), then wait for the create job, which pulls its images. " +
         "Secrets go in as ${NAME} placeholders filled from `secrets` just before " +
         "sending; they are kept out of the result and of any error. Refuses an " +
         "app name that already exists and a secret whose placeholder is missing, " +
         "before anything is sent. Does not create datasets: make any host path " +
         "the compose binds first.",
-      arguments: AppCreateArgs,
+      arguments: AppComposeArgs,
       execute: async (
         rawArgs,
         context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const g = context.globalArgs;
-        const a = AppCreateArgs.parse(rawArgs);
+        const a = AppComposeArgs.parse(rawArgs);
         const compose = fillSecrets(a.compose, a.secrets);
 
         const session = await openSession(g);
@@ -2448,30 +2484,18 @@ export const model = {
           }
 
           logInfo(context, "Creating app", { app: a.name });
-          let created: Record<string, unknown>;
-          try {
-            created = asObj(
-              await callJob(
-                session,
-                "app.create",
-                [{
-                  app_name: a.name,
-                  custom_app: true,
-                  custom_compose_config_string: compose,
-                }],
-                a.waitMs,
-              ),
-            );
-          } catch (err) {
-            const raw = err instanceof Error ? err.message : String(err);
-            // A validation failure can quote the submitted compose back.
-            let message = redactSecrets(raw, Object.values(a.secrets));
-            if (raw.includes(MAY_YET_APPLY)) {
-              message += " Check app_list before re-running: a re-run " +
-                "refuses an app that already exists.";
-            }
-            throw new Error(message);
-          }
+          const created = await runComposeJob(
+            session,
+            "app.create",
+            [{
+              app_name: a.name,
+              custom_app: true,
+              custom_compose_config_string: compose,
+            }],
+            a,
+            "Check app_list before re-running: a re-run refuses an app that " +
+              "already exists.",
+          );
 
           const handle = await context.writeResource(
             "app-create-result",
@@ -2486,6 +2510,74 @@ export const model = {
           logInfo(context, "App created", {
             app: a.name,
             state: created.state,
+          });
+          return { dataHandles: [handle] };
+        } finally {
+          session.close();
+        }
+      },
+    },
+
+    app_update: {
+      description:
+        "Replace the compose YAML of a compose app (one installed from YAML, " +
+        "such as by app_create), filling ${NAME} placeholders from `secrets` as app_create " +
+        "does, then wait for the update job. TrueNAS redeploys the app. The " +
+        "previous compose is not recorded, because it holds the filled secrets: " +
+        "to roll back, re-run with the earlier file. Refuses a missing app and a " +
+        "catalog app, including the UI's Custom App, before anything is sent.",
+      arguments: AppComposeArgs,
+      execute: async (
+        rawArgs,
+        context,
+      ): Promise<{ dataHandles: DataHandle[] }> => {
+        const g = context.globalArgs;
+        const a = AppComposeArgs.parse(rawArgs);
+        const compose = fillSecrets(a.compose, a.secrets);
+
+        const session = await openSession(g);
+        try {
+          const apps = asArr(
+            await session.call("app.query", [[["name", "=", a.name]]]),
+          );
+          if (apps.length === 0) {
+            throw new Error(
+              `app ${JSON.stringify(a.name)} not found. Nothing was changed.`,
+            );
+          }
+          if (asObj(apps[0]).custom_app !== true) {
+            throw new Error(
+              `app ${
+                JSON.stringify(a.name)
+              } was not installed from compose YAML (a catalog app, or the UI's ` +
+                "Custom App), so app_update cannot replace its compose. Nothing " +
+                "was changed.",
+            );
+          }
+
+          logInfo(context, "Updating app compose", { app: a.name });
+          const updated = await runComposeJob(
+            session,
+            "app.update",
+            [a.name, { custom_compose_config_string: compose }],
+            a,
+            "Check its state with app_list. Re-running sends the same compose again " +
+              "and redeploys the app.",
+          );
+
+          const handle = await context.writeResource(
+            "app-update-result",
+            dataName("app-update-result", a.name),
+            {
+              app: a.name,
+              state: String(updated.state ?? "UNKNOWN"),
+              action: "updated",
+              timestamp: new Date().toISOString(),
+            },
+          );
+          logInfo(context, "App compose updated", {
+            app: a.name,
+            state: updated.state,
           });
           return { dataHandles: [handle] };
         } finally {

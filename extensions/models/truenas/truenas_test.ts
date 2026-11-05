@@ -1125,6 +1125,124 @@ Deno.test("app_create: a timed-out create says to check app_list before re-runni
   }
 });
 
+// ─────────────────────────── app_update ───────────────────────────
+
+/** A fake TrueNAS holding `app`, where app.update runs `job`. */
+function updateSession(
+  app: Record<string, unknown> | null,
+  job: Record<string, unknown>,
+) {
+  let sentArgs: unknown[] | undefined;
+  const fake = makeFakeSession((m, params) => {
+    if (m === "app.query") return app ? [app] : [];
+    if (m === "app.update") {
+      sentArgs = params;
+      return 9;
+    }
+    if (m === "core.get_jobs") return [{ id: 9, ...job }];
+    return undefined;
+  });
+  return { fake, sentArgs: () => sentArgs };
+}
+
+Deno.test("app_update: sends the whole compose with placeholders filled", async () => {
+  const { fake, sentArgs } = updateSession(
+    { name: "cache", custom_app: true },
+    { state: "SUCCESS", result: { name: "cache", state: "RUNNING" } },
+  );
+  __setTruenasSession(fake.factory);
+  try {
+    const { context, written } = makeContext();
+    await method("app_update").execute(
+      { name: "cache", compose: "a: ${X}\n", secrets: { X: "v$1" } },
+      context,
+    );
+    assertEquals(sentArgs(), [
+      "cache",
+      { custom_compose_config_string: "a: v$$1\n" },
+    ]);
+    assertEquals(written[0].data.action, "updated");
+    assertEquals(written[0].data.state, "RUNNING");
+  } finally {
+    __setTruenasSession(null);
+  }
+});
+
+Deno.test("app_update: refuses a missing app and a non-compose app, sending nothing", async () => {
+  const cases: Array<[Record<string, unknown> | null, RegExp]> = [
+    [null, /not found/],
+    // The UI's "Custom App" is the ix-app catalog app, so custom_app is false.
+    [{ name: "cache", custom_app: false }, /not installed from compose YAML/],
+  ];
+  for (const [app, reason] of cases) {
+    // The job would succeed, so a missing refusal fails here rather than hangs.
+    const { fake } = updateSession(app, { state: "SUCCESS", result: {} });
+    __setTruenasSession(fake.factory);
+    try {
+      const { context } = makeContext();
+      await rejects(
+        () =>
+          method("app_update").execute(
+            { name: "cache", compose: "a: 1\n" },
+            context,
+          ),
+        reason,
+      );
+      assertEquals(find(fake.calls, "app.update"), undefined);
+    } finally {
+      __setTruenasSession(null);
+    }
+  }
+});
+
+Deno.test("app_update: a timed-out update says how to check and what a re-run does", async () => {
+  const { fake } = updateSession({ name: "cache", custom_app: true }, {
+    state: "RUNNING",
+  });
+  __setTruenasSession(fake.factory);
+  try {
+    const { context } = makeContext();
+    const message = await errorFrom(() =>
+      method("app_update").execute(
+        { name: "cache", compose: "a: 1\n", waitMs: 1 },
+        context,
+      )
+    );
+    assert(message.includes("app_list"), `got: ${message}`);
+    assert(message.includes("redeploys"), `got: ${message}`);
+  } finally {
+    __setTruenasSession(null);
+  }
+});
+
+Deno.test("app_update: a failed job's error carries no secret", async () => {
+  const { fake } = updateSession(
+    { name: "cache", custom_app: true },
+    { state: "FAILED", error: "bad value: hunter2-secret" },
+  );
+  __setTruenasSession(fake.factory);
+  try {
+    const { context } = makeContext();
+    const message = await errorFrom(() =>
+      method("app_update").execute(
+        {
+          name: "cache",
+          compose: "a: ${X}\n",
+          secrets: { X: "hunter2-secret" },
+        },
+        context,
+      )
+    );
+    assert(
+      message.includes("FAILED"),
+      `expected a job failure, got: ${message}`,
+    );
+    assert(!message.includes("hunter2"), `secret leaked: ${message}`);
+  } finally {
+    __setTruenasSession(null);
+  }
+});
+
 // ─────────────────────────── app_set_networks ───────────────────────────
 
 Deno.test("app_set_networks: adds bridges, preserves existing config, sends full list", async () => {
