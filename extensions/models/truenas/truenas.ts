@@ -20,8 +20,9 @@ import type {
  * or updating an app from compose YAML, and NFS/SMB share access and deletion; each method's
  * description says what it changes.
  * It does not change pools, datasets, users, snapshots, replication, or service
- * start/stop. `filesystem_list` reads a directory and `replication_list` reads task
- * definitions; neither writes, and no verb runs or edits a replication task. Service
+ * start/stop. `filesystem_list` reads a directory, and `replication_list` and
+ * `scheduled_tasks` read task definitions; none writes, and no verb runs or edits a
+ * task. Service
  * start/stop is an explicit gap because a stopped ssh/nfs service risks a lockout or
  * outage. Every mutating verb verifies its target by id/name first and records the
  * prior state on its result.
@@ -253,6 +254,44 @@ const ReplicationTask = z.object({
   state: z.string().optional().describe("Last run state (FINISHED/ERROR/…)"),
   lastRunAt: z.string().optional(),
   lastError: z.string().optional(),
+  action: Action,
+  timestamp: z.string(),
+});
+
+/** A task TrueNAS runs on a schedule. One shape for every kind, so a single query covers them all. */
+const ScheduledTask = z.object({
+  kind: z.string().describe(
+    "scrub | cron | snapshot | smart | cloudsync | rsync",
+  ),
+  id: z.number(),
+  enabled: z.boolean(),
+  schedule: z.string().describe(
+    "minute hour dom month dow, in the NAS's local time (see `timezone`)",
+  ),
+  timezone: z.string().describe(
+    "The NAS's timezone, which every schedule uses",
+  ),
+  target: z.string().describe(
+    "What the task acts on: pool, dataset, disks, path or command",
+  ),
+  description: z.string(),
+  thresholdDays: z.number().optional().describe(
+    "Scrub only: the task skips a run unless the pool's last scrub is older than this",
+  ),
+  lastRunState: z.string().optional(),
+  lastRunAt: z.string().optional(),
+  action: Action,
+  timestamp: z.string(),
+});
+
+/** A pool's most recent scrub or resilver, from `pool.query`'s `scan`. */
+const PoolScan = z.object({
+  pool: z.string(),
+  function: z.string().optional().describe("SCRUB | RESILVER"),
+  state: z.string().optional().describe("SCANNING | FINISHED | CANCELED"),
+  startedAt: z.string().optional(),
+  endedAt: z.string().optional(),
+  errors: z.number().optional(),
   action: Action,
   timestamp: z.string(),
 });
@@ -1080,6 +1119,105 @@ function shapeReplication(
   };
 }
 
+/** The TrueNAS query behind each kind of scheduled task. */
+const SCHEDULED_TASK_QUERIES: Array<[string, string]> = [
+  ["scrub", "pool.scrub.query"],
+  ["cron", "cronjob.query"],
+  ["snapshot", "pool.snapshottask.query"],
+  ["smart", "smart.test.query"],
+  ["cloudsync", "cloudsync.query"],
+  ["rsync", "rsynctask.query"],
+];
+
+/** A TrueNAS schedule object as cron text. A missing field means "every". */
+function cronString(schedule: unknown, minute?: string): string {
+  const s = asObj(schedule);
+  return [minute ?? s.minute, s.hour, s.dom, s.month, s.dow]
+    .map((f) => String(f ?? "*")).join(" ");
+}
+
+function shapeScheduledTask(
+  kind: string,
+  raw: unknown,
+  timezone: string,
+  ts: string,
+): z.infer<typeof ScheduledTask> {
+  const r = asObj(raw);
+  const common = {
+    kind,
+    id: asNum(r.id) ?? 0,
+    enabled: asBool(r.enabled),
+    schedule: cronString(r.schedule),
+    timezone,
+    action: "observed" as const,
+    timestamp: ts,
+  };
+  switch (kind) {
+    case "scrub":
+      return {
+        ...common,
+        target: String(r.pool_name ?? ""),
+        description: String(r.description ?? ""),
+        thresholdDays: asNum(r.threshold),
+      };
+    case "cron":
+      return {
+        ...common,
+        target: String(r.command ?? ""),
+        description: String(r.description ?? ""),
+      };
+    case "snapshot": {
+      const state = asObj(r.state);
+      return {
+        ...common,
+        target: String(r.dataset ?? ""),
+        description: asBool(r.recursive) ? "recursive" : "",
+        lastRunState: asStr(state.state),
+        lastRunAt: isoDate(state.datetime),
+      };
+    }
+    case "smart":
+      return {
+        ...common,
+        // SMART schedules have no minute field; smartd starts them on the hour.
+        schedule: cronString(r.schedule, "0"),
+        target: asBool(r.all_disks) ? "all disks" : strArr(r.disks).join(","),
+        description: [r.type, r.desc].filter(Boolean).join(" "),
+      };
+    case "cloudsync": {
+      const job = asObj(r.job);
+      return {
+        ...common,
+        target: String(r.path ?? ""),
+        description: String(r.description ?? ""),
+        lastRunState: asStr(job.state),
+        lastRunAt: isoDate(job.time_finished),
+      };
+    }
+    default: // rsync
+      return {
+        ...common,
+        target: String(r.path ?? ""),
+        description: String(r.desc ?? ""),
+      };
+  }
+}
+
+function shapePoolScan(raw: unknown, ts: string): z.infer<typeof PoolScan> {
+  const r = asObj(raw);
+  const scan = asObj(r.scan);
+  return {
+    pool: String(r.name ?? ""),
+    function: asStr(scan.function),
+    state: asStr(scan.state),
+    startedAt: isoDate(scan.start_time),
+    endedAt: isoDate(scan.end_time),
+    errors: asNum(scan.errors),
+    action: "observed",
+    timestamp: ts,
+  };
+}
+
 /**
  * The data name for a record: `<spec>` for one record per model, `<spec>:<key>`
  * for a keyed one. swamp keys stored data by model + name, not by spec, so the
@@ -1481,7 +1619,7 @@ async function resolveSmbOrNull(
  */
 export const model = {
   type: "@thomas/truenas",
-  version: "2026.11.05.2",
+  version: "2026.11.05.3",
   globalArguments: GlobalArgs,
   upgrades: [
     {
@@ -1513,6 +1651,14 @@ export const model = {
       toVersion: "2026.11.05.2",
       description:
         "Adds app_update. Global arguments and stored data are unchanged.",
+      upgradeAttributes: (
+        old: Record<string, unknown>,
+      ): Record<string, unknown> => old,
+    },
+    {
+      toVersion: "2026.11.05.3",
+      description:
+        "Adds scheduled_tasks. Global arguments and stored data are unchanged.",
       upgradeAttributes: (
         old: Record<string, unknown>,
       ): Record<string, unknown> => old,
@@ -1604,6 +1750,20 @@ export const model = {
       description:
         "A replication task (source/target datasets, schedule, last run)",
       schema: ReplicationTask,
+      lifetime: "1h",
+      garbageCollection: 5,
+    },
+    "scheduled-task": {
+      description:
+        "A task the NAS runs on a schedule (scrub, cron, snapshot, SMART, cloud sync, rsync)",
+      schema: ScheduledTask,
+      lifetime: "1h",
+      garbageCollection: 5,
+    },
+    "pool-scan": {
+      description:
+        "A pool's most recent scrub or resilver, with start and end times",
+      schema: PoolScan,
       lifetime: "1h",
       garbageCollection: 5,
     },
@@ -2076,6 +2236,62 @@ export const model = {
             );
           }
           logInfo(context, "Recorded replication tasks", {
+            count: handles.length,
+          });
+          return { dataHandles: handles };
+        } finally {
+          session.close();
+        }
+      },
+    },
+
+    scheduled_tasks: {
+      description:
+        "List every task the NAS runs on a schedule (scrubs, cron jobs, snapshot tasks, " +
+        "SMART tests, cloud sync and rsync), with the NAS's timezone, plus each pool's " +
+        "last scrub or resilver with its start and end time (factory: one " +
+        "`scheduled-task` per task, one `pool-scan` per pool). Read-only. Answers what " +
+        "was running on the NAS at a given time.",
+      arguments: Empty,
+      execute: async (
+        _rawArgs,
+        context,
+      ): Promise<{ dataHandles: DataHandle[] }> => {
+        const g = context.globalArgs;
+        const session = await openSession(g);
+        try {
+          const general = asObj(
+            await session.call("system.general.config", []),
+          );
+          const timezone = String(general.timezone ?? "unknown");
+          const ts = new Date().toISOString();
+          const handles: DataHandle[] = [];
+          for (const [kind, query] of SCHEDULED_TASK_QUERIES) {
+            logInfo(context, "Querying scheduled tasks", { kind });
+            const rows = asArr(await session.call(query, [[]]));
+            for (const raw of rows) {
+              const shaped = shapeScheduledTask(kind, raw, timezone, ts);
+              handles.push(
+                await context.writeResource(
+                  "scheduled-task",
+                  dataName("scheduled-task", `${kind}-${shaped.id}`),
+                  shaped,
+                ),
+              );
+            }
+          }
+          const pools = asArr(await session.call("pool.query", [[]]));
+          for (const raw of pools) {
+            const shaped = shapePoolScan(raw, ts);
+            handles.push(
+              await context.writeResource(
+                "pool-scan",
+                dataName("pool-scan", shaped.pool),
+                shaped,
+              ),
+            );
+          }
+          logInfo(context, "Recorded scheduled tasks and pool scans", {
             count: handles.length,
           });
           return { dataHandles: handles };

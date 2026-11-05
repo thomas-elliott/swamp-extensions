@@ -3021,3 +3021,75 @@ Deno.test("upgrade 2026.10.11.1: drops insecureSkipTlsVerify and a non-positive 
   );
   assertEquals(up({ endpoint: "nas" }), { endpoint: "nas" });
 });
+
+Deno.test("scheduled_tasks: every kind lands as one scheduled-task, plus a pool-scan per pool", async () => {
+  const rows: Record<string, unknown> = {
+    "system.general.config": { timezone: "Pacific/Auckland" },
+    "pool.scrub.query": [{
+      id: 1,
+      pool_name: "Primary",
+      threshold: 35,
+      description: "",
+      enabled: true,
+      schedule: { minute: "00", hour: "00", dom: "*", month: "*", dow: "7" },
+    }],
+    "cronjob.query": [{
+      id: 2,
+      command: "kopia-metrics.py",
+      enabled: true,
+      schedule: {
+        minute: "0",
+        hour: "4,10,16,22",
+        dom: "*",
+        month: "*",
+        dow: "*",
+      },
+    }],
+    "pool.snapshottask.query": [],
+    "smart.test.query": [{
+      id: 3,
+      all_disks: true,
+      type: "LONG",
+      desc: "monthly",
+      schedule: { hour: "3", dom: "1", month: "*", dow: "*" },
+    }],
+    "cloudsync.query": [],
+    "rsynctask.query": [],
+    "pool.query": [{
+      name: "Primary",
+      scan: {
+        function: "SCRUB",
+        state: "FINISHED",
+        start_time: { $date: 1785585769000 },
+        end_time: { $date: 1785589369000 },
+        errors: 0,
+      },
+    }],
+  };
+  const fake = makeFakeSession((m) => rows[m]);
+  __setTruenasSession(fake.factory);
+  try {
+    const { context, written } = makeContext();
+    await method("scheduled_tasks").execute({}, context);
+    assertEquals(written.map((w) => w.name), [
+      "scheduled-task:scrub-1",
+      "scheduled-task:cron-2",
+      "scheduled-task:smart-3",
+      "pool-scan:Primary",
+    ]);
+    const scrub = written[0].data;
+    assertEquals(scrub.schedule, "00 00 * * 7");
+    assertEquals(scrub.timezone, "Pacific/Auckland");
+    assertEquals(scrub.thresholdDays, 35);
+    assertEquals(
+      written[2].data.schedule,
+      "0 3 1 * *",
+      "SMART has no minute field",
+    );
+    assertEquals(written[2].data.target, "all disks");
+    assertEquals(written[3].data.startedAt, "2026-08-01T12:02:49.000Z");
+    assertEquals(written[3].data.endedAt, "2026-08-01T13:02:49.000Z");
+  } finally {
+    __setTruenasSession(null);
+  }
+});

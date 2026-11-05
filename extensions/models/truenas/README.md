@@ -115,6 +115,7 @@ cert also improves the host's security.
 | `filesystem_list`  | Directory entries (`filesystem.listdir`) with type/size and a mountpoint flag (= a child dataset). Takes one path or a JSON list (fan-out: one session per run). An absent path records `exists=false` rather than failing, so it can check whether a backup or app source path has gone missing.                                               |
 | `app_storage`      | An app's host-path binds — container mount path ← NAS path, and where each sits in the app config. Shows whether an app mounts one parent directory or each source individually.                                                                                                                                                                |
 | `replication_list` | Replication tasks: source/target datasets, `recursive`, schedule, destination readonly policy, whether dataset **properties** are sent, and last-run state. Read-only; never runs or edits a task. Shows what writes into a destination dataset and when. A receive remounts the destination, which invalidates any container bind-mount of it. |
+| `scheduled_tasks`  | Every task the NAS runs on a schedule (scrubs, cron jobs, snapshot tasks, SMART tests, cloud sync, rsync) with its schedule and the NAS's timezone, plus each pool's last scrub or resilver with start and end times. Read-only. Shows what was running on the NAS at a given time.                                                             |
 | `exposure_audit`   | A single summary of published ports across all apps, host-network apps, ports on every interface, unrestricted NFS/SMB shares, a plaintext-LDAP flag, and the non-wildcard bindable IPs. System services (SSH, SMB, NFS, the web UI) are not included; use `service_list`.                                                                      |
 
 ### Mutate (verify-first)
@@ -147,6 +148,10 @@ swamp data query 'modelName == "nas" && name == "dir-listing:%2Fmnt%2FBackup"' -
 # What replicates into a destination dataset, and how? (read-only)
 swamp model method run nas replication_list
 swamp data query 'modelName == "nas" && attributes.targetDataset.startsWith("Backup/")'
+
+# What runs on the NAS on a schedule, and when did each pool last scrub? (read-only)
+swamp model method run nas scheduled_tasks
+swamp data query 'modelName == "nas" && name.startsWith("pool-scan:")'
 
 # Close lldap's plaintext LDAP + LDAPS — container-internal only
 swamp model method run nas app_set_port_bind --input app=lldap --input portKey=ldap_port  --input bindMode=exposed
