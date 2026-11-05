@@ -938,6 +938,193 @@ Deno.test("nfs_share_set_access: ambiguous path is rejected", async () => {
   }
 });
 
+// ─────────────────────────── app_create ───────────────────────────
+
+const COMPOSE = [
+  "services:",
+  "  web:",
+  "    image: nginx",
+  "    environment:",
+  '      TOKEN: "${HUB_TOKEN}"',
+  '      TOKEN_AGAIN: "${HUB_TOKEN}"',
+  '      USER: "${HUB_USER}"',
+  '      LEFT_ALONE: "$${LITERAL} ${WITH_DEFAULT:-x}"',
+  "",
+].join("\n");
+
+/** A fake TrueNAS where no app exists yet and app.create runs `job`. */
+function createSession(job: Record<string, unknown>) {
+  let sent: Record<string, unknown> = {};
+  const fake = makeFakeSession((m, params) => {
+    if (m === "app.query") return [];
+    if (m === "app.create") {
+      sent = params[0] as Record<string, unknown>;
+      return 7;
+    }
+    if (m === "core.get_jobs") return [{ id: 7, ...job }];
+    return undefined;
+  });
+  return { fake, sent: () => sent };
+}
+
+async function errorFrom(run: () => Promise<unknown>): Promise<string> {
+  try {
+    await run();
+  } catch (e) {
+    return (e as Error).message;
+  }
+  throw new Error("expected the method to throw");
+}
+
+Deno.test("app_create: fills each placeholder with its secret, exactly as written", async () => {
+  const { fake, sent } = createSession({
+    state: "SUCCESS",
+    result: { name: "cache", state: "DEPLOYING" },
+  });
+  __setTruenasSession(fake.factory);
+  try {
+    const { context, written } = makeContext();
+    await method("app_create").execute(
+      {
+        name: "cache",
+        compose: COMPOSE,
+        // `$&` and `$$` are replacement patterns to String.replace, and the
+        // `${HUB_USER}` inside must not be filled a second time.
+        secrets: { HUB_TOKEN: "p$&q$$r${HUB_USER}", HUB_USER: "hubuser" },
+      },
+      context,
+    );
+    assertEquals(sent().app_name, "cache");
+    assertEquals(sent().custom_app, true);
+    // Compose reads `$$` as a literal `$`, so each `$` in a secret is doubled.
+    assertEquals(
+      sent().custom_compose_config_string,
+      [
+        "services:",
+        "  web:",
+        "    image: nginx",
+        "    environment:",
+        '      TOKEN: "p$$&q$$$$r$${HUB_USER}"',
+        '      TOKEN_AGAIN: "p$$&q$$$$r$${HUB_USER}"',
+        '      USER: "hubuser"',
+        '      LEFT_ALONE: "$${LITERAL} ${WITH_DEFAULT:-x}"',
+        "",
+      ].join("\n"),
+    );
+    assertEquals(written[0].data.action, "created");
+    assertEquals(written[0].data.state, "DEPLOYING");
+  } finally {
+    __setTruenasSession(null);
+  }
+});
+
+Deno.test("app_create: refuses an app that already exists and creates nothing", async () => {
+  const fake = makeFakeSession((m) => {
+    if (m === "app.query") return [{ name: "cache", custom_app: true }];
+    return undefined;
+  });
+  __setTruenasSession(fake.factory);
+  try {
+    const { context } = makeContext();
+    await rejects(
+      () =>
+        method("app_create").execute(
+          {
+            name: "cache",
+            compose: COMPOSE,
+            secrets: { HUB_TOKEN: "t", HUB_USER: "u" },
+          },
+          context,
+        ),
+      /already exists/,
+    );
+    assertEquals(find(fake.calls, "app.create"), undefined);
+  } finally {
+    __setTruenasSession(null);
+  }
+});
+
+Deno.test("app_create: refuses a secret with no placeholder, and a placeholder with no secret", async () => {
+  const fake = makeFakeSession((m) => (m === "app.query" ? [] : undefined));
+  __setTruenasSession(fake.factory);
+  try {
+    const { context } = makeContext();
+    await rejects(
+      () =>
+        method("app_create").execute(
+          {
+            name: "cache",
+            compose: COMPOSE,
+            secrets: { HUB_TOKN: "x", HUB_TOKEN: "t", HUB_USER: "u" },
+          },
+          context,
+        ),
+      /HUB_TOKN/,
+    );
+    await rejects(
+      () =>
+        method("app_create").execute(
+          { name: "cache", compose: COMPOSE, secrets: { HUB_TOKEN: "t" } },
+          context,
+        ),
+      /HUB_USER/,
+    );
+    assertEquals(find(fake.calls, "app.create"), undefined);
+  } finally {
+    __setTruenasSession(null);
+  }
+});
+
+Deno.test("app_create: a failed job's error carries no secret, whatever form it is echoed in", async () => {
+  // One secret inside another, and one TrueNAS echoes JSON-escaped and $-doubled.
+  const secrets = { SHORT: "abcd", LONG: 'abcdXYZ"$tail' };
+  const { fake } = createSession({
+    state: "FAILED",
+    error: 'bad: abcdXYZ\\"$tail / abcdXYZ"$$tail / abcd',
+  });
+  __setTruenasSession(fake.factory);
+  try {
+    const { context } = makeContext();
+    const message = await errorFrom(() =>
+      method("app_create").execute(
+        { name: "cache", compose: "a: ${SHORT}\nb: ${LONG}\n", secrets },
+        context,
+      )
+    );
+    assert(
+      message.includes("FAILED"),
+      `expected a job failure, got: ${message}`,
+    );
+    for (const fragment of ["abcd", "XYZ", "tail"]) {
+      assert(!message.includes(fragment), `"${fragment}" leaked: ${message}`);
+    }
+  } finally {
+    __setTruenasSession(null);
+  }
+});
+
+Deno.test("app_create: a timed-out create says to check app_list before re-running", async () => {
+  const { fake } = createSession({ state: "RUNNING" });
+  __setTruenasSession(fake.factory);
+  try {
+    const { context } = makeContext();
+    const message = await errorFrom(() =>
+      method("app_create").execute(
+        {
+          name: "cache",
+          compose: COMPOSE,
+          secrets: { HUB_TOKEN: "t", HUB_USER: "u" },
+          waitMs: 1,
+        },
+        context,
+      )
+    );
+    assert(message.includes("app_list"), `got: ${message}`);
+  } finally {
+    __setTruenasSession(null);
+  }
+});
+
 // ─────────────────────────── app_set_networks ───────────────────────────
 
 Deno.test("app_set_networks: adds bridges, preserves existing config, sends full list", async () => {

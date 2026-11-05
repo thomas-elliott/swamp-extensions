@@ -16,8 +16,9 @@ import type {
  * between the two: 25.10 moved the host lists under `options` (see {@link smbAccessUpdate}).
  *
  * Scope: read what a TrueNAS host exposes, then restrict it. The mutating methods
- * are deliberately few and limited to app port binds, app docker networks, and NFS/SMB
- * share access and deletion; each method's description says what it changes.
+ * are deliberately few and limited to app port binds, app docker networks, creating
+ * an app from compose YAML, and NFS/SMB share access and deletion; each method's
+ * description says what it changes.
  * It does not change pools, datasets, users, snapshots, replication, or service
  * start/stop. `filesystem_list` reads a directory and `replication_list` reads task
  * definitions; neither writes, and no verb runs or edits a replication task. Service
@@ -66,6 +67,7 @@ type GlobalArgsT = z.infer<typeof GlobalArgs>;
 /** Lifecycle outcome recorded on result/observation resources. */
 const Action = z.enum([
   "observed",
+  "created",
   "updated",
   "unchanged",
   "deleted",
@@ -338,6 +340,15 @@ const AppNetworksResult = z.object({
   app: z.string(),
   previousNetworks: z.array(z.string()),
   networks: z.array(z.string()),
+  action: Action,
+  timestamp: z.string(),
+});
+
+const AppCreateResult = z.object({
+  app: z.string(),
+  state: z.string().describe(
+    "App state when the create job finished, e.g. DEPLOYING",
+  ),
   action: Action,
   timestamp: z.string(),
 });
@@ -1151,6 +1162,27 @@ const AppStorageArgs = z.object({
   ),
 });
 
+const AppCreateArgs = z.object({
+  name: z.string().regex(/^[a-z]([-a-z0-9]*[a-z0-9])?$/).max(40).describe(
+    "App name: lowercase letters, digits and hyphens, at most 40 characters",
+  ),
+  compose: z.string().min(1).describe(
+    "The app's Docker Compose YAML. Write each secret as a ${NAME} placeholder " +
+      "and supply it in `secrets`, so the file can be committed.",
+  ),
+  secrets: z.record(z.string(), z.string()).default({}).meta({
+    sensitive: true,
+  }).describe(
+    "Placeholder name to secret value, each from a vault: " +
+      "secrets.HUB_TOKEN=${{ vault.get(<vault>, <key>) }}. Every ${NAME} is " +
+      "replaced as written, so quote the placeholder in the YAML.",
+  ),
+  waitMs: z.coerce.number().int().positive().default(600000).describe(
+    "How long to wait for the create job. It pulls every image first, so it " +
+      "takes far longer than timeoutMs allows.",
+  ),
+});
+
 const AppSetNetworksArgs = z.object({
   app: z.string().describe("App name (from app_list)"),
   networks: z.array(z.string()).describe(
@@ -1237,6 +1269,64 @@ const SmbShareDeleteArgs = z.object({
 );
 
 // ─────────────────────────── resolve helpers (verify-first) ───────────────────────────
+
+/** `${NAME}` in compose YAML, with any `$` before it captured. */
+const PLACEHOLDER = /(\$?)\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g;
+
+/**
+ * Fill each `${NAME}` placeholder in compose YAML with `secrets[NAME]`, in one
+ * pass so a filled value is never searched again. Compose reads `$$` as a literal
+ * `$`, so `$${NAME}` is left alone and every `$` in a secret is doubled. Throws,
+ * before anything is sent, on a secret with no placeholder or a placeholder with
+ * no secret: either would deploy a wrong or empty value. A placeholder with a
+ * default (`${NAME:-x}`) is Compose's own and is left alone.
+ */
+function fillSecrets(compose: string, secrets: Record<string, string>): string {
+  const unused = new Set(Object.keys(secrets));
+  const missing = new Set<string>();
+  const filled = compose.replace(
+    PLACEHOLDER,
+    (match: string, escape: string, name: string) => {
+      if (escape) return match;
+      if (!Object.hasOwn(secrets, name)) {
+        missing.add(name);
+        return match;
+      }
+      unused.delete(name);
+      return secrets[name].replaceAll("$", () => "$$");
+    },
+  );
+  if (unused.size > 0) {
+    throw new Error(
+      `no \${NAME} placeholder in the compose for secret(s) ${
+        [...unused].join(", ")
+      }. Nothing was created.`,
+    );
+  }
+  if (missing.size > 0) {
+    throw new Error(
+      `placeholder(s) ${
+        [...missing].join(", ")
+      } in the compose have no secret. Nothing was created.`,
+    );
+  }
+  return filled;
+}
+
+/**
+ * Remove secrets from an error message. Each is matched as written, as sent (`$`
+ * doubled) and JSON-escaped, the forms TrueNAS can echo; longest first, so a
+ * secret inside another cannot leave the rest of the longer one showing.
+ */
+function redactSecrets(text: string, secrets: string[]): string {
+  const forms = secrets.flatMap((s) => [
+    s,
+    s.replaceAll("$", () => "$$"),
+    JSON.stringify(s).slice(1, -1),
+  ]);
+  forms.sort((x, y) => y.length - x.length);
+  return forms.reduce((t, form) => redact(t, form), text);
+}
 
 /** Find an app by name; throws if absent. */
 async function resolveApp(
@@ -1369,7 +1459,7 @@ async function resolveSmbOrNull(
  */
 export const model = {
   type: "@thomas/truenas",
-  version: "2026.10.11.1",
+  version: "2026.11.05.1",
   globalArguments: GlobalArgs,
   upgrades: [
     {
@@ -1388,6 +1478,14 @@ export const model = {
         }
         return rest;
       },
+    },
+    {
+      toVersion: "2026.11.05.1",
+      description:
+        "Adds app_create. Global arguments and stored data are unchanged.",
+      upgradeAttributes: (
+        old: Record<string, unknown>,
+      ): Record<string, unknown> => old,
     },
   ],
   checks: {
@@ -1488,6 +1586,12 @@ export const model = {
     "app-port-result": {
       description: "Result of an app_set_port_bind change",
       schema: AppPortResult,
+      lifetime: "infinite",
+      garbageCollection: 10,
+    },
+    "app-create-result": {
+      description: "Result of an app_create",
+      schema: AppCreateResult,
       lifetime: "infinite",
       garbageCollection: 10,
     },
@@ -2305,6 +2409,84 @@ export const model = {
             },
           );
           logInfo(context, "App port binding updated", { app: a.app, portKey });
+          return { dataHandles: [handle] };
+        } finally {
+          session.close();
+        }
+      },
+    },
+
+    app_create: {
+      description:
+        "Create an app from Docker Compose YAML (a TrueNAS custom app installed " +
+        "from YAML), then wait for the create job, which pulls its images. " +
+        "Secrets go in as ${NAME} placeholders filled from `secrets` just before " +
+        "sending; they are kept out of the result and of any error. Refuses an " +
+        "app name that already exists and a secret whose placeholder is missing, " +
+        "before anything is sent. Does not create datasets: make any host path " +
+        "the compose binds first.",
+      arguments: AppCreateArgs,
+      execute: async (
+        rawArgs,
+        context,
+      ): Promise<{ dataHandles: DataHandle[] }> => {
+        const g = context.globalArgs;
+        const a = AppCreateArgs.parse(rawArgs);
+        const compose = fillSecrets(a.compose, a.secrets);
+
+        const session = await openSession(g);
+        try {
+          const existing = asArr(
+            await session.call("app.query", [[["name", "=", a.name]]]),
+          );
+          if (existing.length > 0) {
+            throw new Error(
+              `app ${
+                JSON.stringify(a.name)
+              } already exists. Nothing was created.`,
+            );
+          }
+
+          logInfo(context, "Creating app", { app: a.name });
+          let created: Record<string, unknown>;
+          try {
+            created = asObj(
+              await callJob(
+                session,
+                "app.create",
+                [{
+                  app_name: a.name,
+                  custom_app: true,
+                  custom_compose_config_string: compose,
+                }],
+                a.waitMs,
+              ),
+            );
+          } catch (err) {
+            const raw = err instanceof Error ? err.message : String(err);
+            // A validation failure can quote the submitted compose back.
+            let message = redactSecrets(raw, Object.values(a.secrets));
+            if (raw.includes(MAY_YET_APPLY)) {
+              message += " Check app_list before re-running: a re-run " +
+                "refuses an app that already exists.";
+            }
+            throw new Error(message);
+          }
+
+          const handle = await context.writeResource(
+            "app-create-result",
+            dataName("app-create-result", a.name),
+            {
+              app: a.name,
+              state: String(created.state ?? "UNKNOWN"),
+              action: "created",
+              timestamp: new Date().toISOString(),
+            },
+          );
+          logInfo(context, "App created", {
+            app: a.name,
+            state: created.state,
+          });
           return { dataHandles: [handle] };
         } finally {
           session.close();
