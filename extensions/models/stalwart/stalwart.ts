@@ -1256,7 +1256,7 @@ function globalsOf(context: Pick<Ctx, "globalArgs" | "logger">): GlobalArgsT {
  */
 export const model = {
   type: "@thomas/stalwart",
-  version: "2026.10.29.2",
+  version: "2026.11.16.1",
   globalArguments: GlobalArgs,
   upgrades: [
     {
@@ -1286,6 +1286,14 @@ export const model = {
       toVersion: "2026.10.29.2",
       description:
         "settings_set and reload now log the warnings a Stalwart v1 reload returns; they were dropped before. Global arguments and stored data are unchanged.",
+      upgradeAttributes: (
+        old: Record<string, unknown>,
+      ): Record<string, unknown> => old,
+    },
+    {
+      toVersion: "2026.11.16.1",
+      description:
+        "Adds update_apps, which downloads the admin and account web UI again. Global arguments and stored data are unchanged.",
       upgradeAttributes: (
         old: Record<string, unknown>,
       ): Record<string, unknown> => old,
@@ -2696,6 +2704,36 @@ export const model = {
           },
         );
         logInfo(context, "Settings reloaded");
+        return { dataHandles: [handle] };
+      },
+    },
+    update_apps: {
+      description:
+        "Download the web applications (the admin and account UI) again, " +
+        "bypassing the copy cached in the blob store.",
+      arguments: Empty,
+      execute: async (
+        _rawArgs,
+        context,
+      ): Promise<{ dataHandles: DataHandle[] }> => {
+        // Stalwart serves the bundle cached in its blob store and never fetches
+        // a new one itself, so a stale or broken bundle stays until this runs.
+        const g = globalsOf(context);
+        const accountId = await resolveAccountId(g);
+        logInfo(context, "Updating web applications");
+        await runAction(g, accountId, "UpdateApps");
+        const handle = await context.writeResource(
+          "state-result",
+          dataName("state-result", "update-apps"),
+          {
+            kind: "server",
+            id: "applications",
+            state: "updated",
+            action: "updated",
+            timestamp: nowIso(),
+          },
+        );
+        logInfo(context, "Web applications updated");
         return { dataHandles: [handle] };
       },
     },

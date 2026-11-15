@@ -824,6 +824,24 @@ Deno.test("settings_set: changes the field, then reloads", async () => {
   }
 });
 
+Deno.test("update_apps: creates an UpdateApps action and reports updated", async () => {
+  const { setCalls } = makeTypedJmap({});
+  try {
+    const { context, written } = makeContext();
+    await method("update_apps").execute({}, context);
+    assertEquals(setCalls[0].type, "x:Action");
+    assertEquals(
+      ((setCalls[0].args.create as Json).c0 as Json)["@type"],
+      "UpdateApps",
+    );
+    assertEquals(written[0].data.action, "updated");
+    assertEquals(written[0].data.id, "applications");
+  } finally {
+    __setJmap(null);
+    __setRest(null);
+  }
+});
+
 Deno.test("reload: creates a ReloadSettings action and reports reloaded", async () => {
   const { setCalls } = makeTypedJmap({});
   try {

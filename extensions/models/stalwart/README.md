@@ -5,7 +5,7 @@ server (0.16 and v1) for swamp, over its
 **JMAP-over-HTTP management API**. Use it to create mailboxes and aliases,
 configure groups/lists/roles, check server health and DMARC/TLS reports, change
 server settings (including the spam classifier's) and run maintenance actions
-(reload settings, install/reload certificates) without using the web UI.
+(reload settings, install/reload certificates, re-download the web UI) without using the web UI.
 
 ## Scope
 
@@ -109,7 +109,7 @@ domains is refused.
 
 **Reversible state changes:** `domain_set_state`, `account_set_state`.
 
-**Maintenance:** `reload`, `reload_certificates`.
+**Maintenance:** `reload`, `reload_certificates`, `update_apps` (download the admin and account web UI again, bypassing the cached copy).
 
 ```bash
 # Check the server is healthy and see what the API key can do.
@@ -138,7 +138,7 @@ case-insensitive.
 | `settings`     | `settings:<kind>`, e.g. `settings:http`                                                                                                                    |
 | `certificate`  | `certificate:<id>`                                                                                                                                         |
 | `probe`        | `probe:<type>`, e.g. `probe:x:Domain`                                                                                                                      |
-| `state-result` | `state-result:domain:<domain>`, `state-result:account:<address>`, `state-result:role:<address>`, `state-result:reload`, `state-result:reload-certificates` |
+| `state-result` | `state-result:domain:<domain>`, `state-result:account:<address>`, `state-result:role:<address>`, `state-result:reload`, `state-result:reload-certificates`, `state-result:update-apps` |
 | `health`       | `health`                                                                                                                                                   |
 | `session`      | `session`                                                                                                                                                  |
 
