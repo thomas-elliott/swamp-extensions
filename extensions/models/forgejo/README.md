@@ -27,8 +27,8 @@ exception (`pr_merge`):
 - **Write-only source credentials.** `mirror_ensure`'s `authToken` (for private
   GitHub sources) is supplied via a vault reference, sent once to
   `/repos/migrate`, and never read back, stored in the data model, or logged.
-  Credentials written into `cloneAddr` itself (`https://user:token@…`) are sent
-  to `/repos/migrate` too, but are stripped from every log line and error.
+  Credentials written into the user-info part of the `cloneAddr` URL are sent to
+  `/repos/migrate` too, but are stripped from every log line and error.
 - **Refuses unreconcilable drift.** A mirror's source URL is fixed at migration
   time; asking `mirror_ensure` for a different source on an existing mirror is
   an error; it is not ignored. A name collision with a non-mirror repo is
@@ -141,6 +141,16 @@ swamp model method run forgejo branch_protection_ensure \
   --input enablePush=true --input enablePushWhitelist=true \
   --input 'pushWhitelistUsernames=["ci-bot"]' \
   --input 'protectedFilePatterns=.woodpecker.yml;.woodpecker/**'
+
+# Owners push straight to main; everyone else needs one approval from a
+# team member whose approval counts. Team lists work on organization repos only.
+swamp model method run forgejo branch_protection_ensure \
+  --input owner=apps --input name=web --input rule=main \
+  --input enablePush=true --input enablePushWhitelist=true \
+  --input 'pushWhitelistTeams=["Owners"]' \
+  --input requiredApprovals=1 --input blockOnRejectedReviews=true \
+  --input enableApprovalsWhitelist=true \
+  --input 'approvalsWhitelistTeams=["Owners","Reviewers"]'
 
 # Find-or-create a GitHub pull-mirror (the workhorse).
 swamp model method run forgejo mirror_ensure \

@@ -1,6 +1,6 @@
 manifestVersion: 1
 name: "@thomas/forgejo"
-version: 2026.10.11.1
+version: 2026.11.18.1
 description: >-
   Administration of a Forgejo (or Gitea) server over its /api/v1 REST API,
   authenticated with a scoped access token. Find or create organizations and
@@ -13,6 +13,7 @@ description: >-
   delete methods: an empty repository left by a failed migration is reported,
   not deleted. Secrets are never output: mirror source credentials are
   write-only, and webhook operations neither read nor write the hook secret.
+license: MIT
 repository: https://github.com/thomas-elliott/swamp-extensions
 paths:
   base: manifest

@@ -780,8 +780,8 @@ function protectionBody(
   const body: Json = {};
   // Lists are compared as sets: Forgejo returns whitelist names in its own
   // order, not the order they were sent in, so comparing by position would
-  // report drift on every run. Logins are case-insensitive; status-check
-  // contexts are not.
+  // report drift on every run. Logins and team names are case-insensitive;
+  // status-check contexts are not.
   const sameSet = (fold: boolean) => (a: unknown, b: unknown): boolean => {
     const norm = (v: unknown) =>
       new Set(
@@ -833,9 +833,50 @@ function protectionBody(
     sameSet(true),
   );
   diff(
+    "push_whitelist_teams",
+    desired.pushWhitelistTeams,
+    current?.push_whitelist_teams,
+    sameSet(true),
+  );
+  diff(
+    "enable_merge_whitelist",
+    desired.enableMergeWhitelist,
+    Boolean(current?.enable_merge_whitelist),
+  );
+  diff(
+    "merge_whitelist_usernames",
+    desired.mergeWhitelistUsernames,
+    current?.merge_whitelist_usernames,
+    sameSet(true),
+  );
+  diff(
+    "merge_whitelist_teams",
+    desired.mergeWhitelistTeams,
+    current?.merge_whitelist_teams,
+    sameSet(true),
+  );
+  diff(
     "required_approvals",
     desired.requiredApprovals,
     Number(current?.required_approvals ?? 0),
+  );
+  diff(
+    "enable_approvals_whitelist",
+    desired.enableApprovalsWhitelist,
+    Boolean(current?.enable_approvals_whitelist),
+  );
+  // Forgejo's field name is singular here, unlike the other whitelists.
+  diff(
+    "approvals_whitelist_username",
+    desired.approvalsWhitelistUsernames,
+    current?.approvals_whitelist_username,
+    sameSet(true),
+  );
+  diff(
+    "approvals_whitelist_teams",
+    desired.approvalsWhitelistTeams,
+    current?.approvals_whitelist_teams,
+    sameSet(true),
   );
   diff(
     "require_signed_commits",
@@ -1233,8 +1274,32 @@ const ProtectionSettingsShape = {
   pushWhitelistUsernames: z.array(z.string()).optional().describe(
     "Logins allowed to push directly. Converged as an exact set.",
   ),
+  pushWhitelistTeams: z.array(z.string()).optional().describe(
+    "Teams allowed to push directly. Converged as an exact set. " +
+      "Organization repositories only.",
+  ),
+  enableMergeWhitelist: z.boolean().optional().describe(
+    "Limit who may merge PRs into this branch to the merge whitelists.",
+  ),
+  mergeWhitelistUsernames: z.array(z.string()).optional().describe(
+    "Logins allowed to merge. Converged as an exact set.",
+  ),
+  mergeWhitelistTeams: z.array(z.string()).optional().describe(
+    "Teams allowed to merge. Converged as an exact set. " +
+      "Organization repositories only.",
+  ),
   requiredApprovals: z.coerce.number().int().min(0).optional().describe(
     "Approving reviews required before merge.",
+  ),
+  enableApprovalsWhitelist: z.boolean().optional().describe(
+    "Count only approvals from the approvals whitelists.",
+  ),
+  approvalsWhitelistUsernames: z.array(z.string()).optional().describe(
+    "Logins whose approvals count. Converged as an exact set.",
+  ),
+  approvalsWhitelistTeams: z.array(z.string()).optional().describe(
+    "Teams whose approvals count. Converged as an exact set. " +
+      "Organization repositories only.",
   ),
   requireSignedCommits: z.boolean().optional(),
   applyToAdmins: z.boolean().optional().describe(
@@ -1254,7 +1319,14 @@ type ProtectionDesired = {
   enablePush?: boolean;
   enablePushWhitelist?: boolean;
   pushWhitelistUsernames?: string[];
+  pushWhitelistTeams?: string[];
+  enableMergeWhitelist?: boolean;
+  mergeWhitelistUsernames?: string[];
+  mergeWhitelistTeams?: string[];
   requiredApprovals?: number;
+  enableApprovalsWhitelist?: boolean;
+  approvalsWhitelistUsernames?: string[];
+  approvalsWhitelistTeams?: string[];
   requireSignedCommits?: boolean;
   applyToAdmins?: boolean;
   blockOnRejectedReviews?: boolean;
@@ -2125,6 +2197,28 @@ export const model = {
         const g = context.globalArgs;
         const full = `${a.owner}/${a.name}`;
         const base = `${repoPath(a.owner, a.name)}/branch_protections`;
+        // Forgejo resolves team names only on an organization's repo and
+        // silently ignores them elsewhere, so a team list on a user's repo
+        // would be sent and reported "updated" on every run without ever
+        // landing. Refuse it before anything is written.
+        const teamLists = [
+          a.pushWhitelistTeams,
+          a.mergeWhitelistTeams,
+          a.approvalsWhitelistTeams,
+        ];
+        if (teamLists.some((t) => t !== undefined)) {
+          const org = await callTolerant(g, {
+            method: "GET",
+            path: `/api/v1/orgs/${enc(a.owner)}`,
+          }, [404]);
+          if (org.status === 404) {
+            throw new Error(
+              `"${a.owner}" is not an organization: team whitelists apply ` +
+                `only to organization repositories. Use the *Usernames ` +
+                `lists for ${full}.`,
+            );
+          }
+        }
         const probe = await callTolerant(g, {
           method: "GET",
           path: `${base}/${enc(a.rule)}`,

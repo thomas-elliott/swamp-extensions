@@ -2188,6 +2188,110 @@ Deno.test("branch_protection_ensure converges a whitelist as an exact set", asyn
   }
 });
 
+// Forgejo ignores team names on a user's repo, so sending them would report
+// "updated" on every run without the rule ever changing.
+Deno.test("branch_protection_ensure refuses team lists on a user's repo", async () => {
+  // Every GET is a 404: /orgs/alice does not exist, so alice is a user.
+  const { caller, calls } = makeFakeApi(() => undefined);
+  __setCaller(caller);
+  try {
+    const { context, written } = makeContext();
+    await rejects(
+      () =>
+        method("branch_protection_ensure").execute(
+          {
+            owner: "alice",
+            name: "agent-scratch",
+            rule: "main",
+            approvalsWhitelistTeams: ["Owners"],
+          },
+          context,
+        ),
+      /not an organization/,
+    );
+    assert(!calls.some((c) => c.method !== "GET"), "nothing may be written");
+    assertEquals(written.length, 0);
+  } finally {
+    __setCaller(null);
+  }
+});
+
+Deno.test("branch_protection_ensure sends the team, merge and approvals whitelists on create", async () => {
+  // The org exists; the rule does not yet.
+  const { caller, calls } = makeFakeApi((c) =>
+    c.method === "GET"
+      ? (c.path === "/api/v1/orgs/apps" ? { username: "apps" } : undefined)
+      : { rule_name: "main" }
+  );
+  __setCaller(caller);
+  try {
+    const { context } = makeContext();
+    await method("branch_protection_ensure").execute(
+      {
+        owner: "apps",
+        name: "web",
+        rule: "main",
+        pushWhitelistTeams: ["Owners"],
+        enableMergeWhitelist: true,
+        mergeWhitelistUsernames: ["amy"],
+        mergeWhitelistTeams: ["Owners"],
+        enableApprovalsWhitelist: true,
+        approvalsWhitelistUsernames: ["zed"],
+        approvalsWhitelistTeams: ["Reviewers"],
+      },
+      context,
+    );
+    const body = calls.find((c) => c.method === "POST")?.body as Record<
+      string,
+      unknown
+    >;
+    assertEquals(body.push_whitelist_teams, ["Owners"]);
+    assertEquals(body.enable_merge_whitelist, true);
+    assertEquals(body.merge_whitelist_usernames, ["amy"]);
+    assertEquals(body.merge_whitelist_teams, ["Owners"]);
+    assertEquals(body.enable_approvals_whitelist, true);
+    // Forgejo's JSON name is singular for this one list.
+    assertEquals(body.approvals_whitelist_username, ["zed"]);
+    assertEquals(body.approvals_whitelist_teams, ["Reviewers"]);
+  } finally {
+    __setCaller(null);
+  }
+});
+
+// Forgejo returns team names in its own order and case, so neither reads as drift;
+// a changed member still does.
+Deno.test("branch_protection_ensure compares team lists as sets", async () => {
+  const { caller, calls } = makeFakeApi((c) =>
+    c.method === "GET"
+      ? {
+        rule_name: "main",
+        push_whitelist_teams: ["owners", "release"],
+        approvals_whitelist_teams: ["owners"],
+      }
+      : { rule_name: "main" }
+  );
+  __setCaller(caller);
+  try {
+    const { context } = makeContext();
+    await method("branch_protection_ensure").execute(
+      {
+        owner: "apps",
+        name: "web",
+        rule: "main",
+        pushWhitelistTeams: ["Release", "Owners"],
+        approvalsWhitelistTeams: ["Owners", "Agents"],
+      },
+      context,
+    );
+    const patch = calls.find((c) => c.method === "PATCH");
+    assertEquals(Object.keys(patch?.body as Record<string, unknown>), [
+      "approvals_whitelist_teams",
+    ]);
+  } finally {
+    __setCaller(null);
+  }
+});
+
 Deno.test("branch_protection_list writes one resource per rule", async () => {
   const { caller } = makeFakeApi(() => [
     { rule_name: "main", enable_push: false },
