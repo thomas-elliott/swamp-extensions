@@ -768,6 +768,13 @@ function toProtectionInfo(
   };
 }
 
+/** True when two name lists hold the same names, ignoring order and case. */
+function sameNames(a: string[], b: string[]): boolean {
+  const x = new Set(a.map((s) => s.toLowerCase()));
+  const y = new Set(b.map((s) => s.toLowerCase()));
+  return x.size === y.size && [...x].every((s) => y.has(s));
+}
+
 /**
  * Build a branch-protection payload from the supplied fields only, mapping
  * camelCase args to the API's snake_case. With no `current` rule (a create)
@@ -2197,28 +2204,6 @@ export const model = {
         const g = context.globalArgs;
         const full = `${a.owner}/${a.name}`;
         const base = `${repoPath(a.owner, a.name)}/branch_protections`;
-        // Forgejo resolves team names only on an organization's repo and
-        // silently ignores them elsewhere, so a team list on a user's repo
-        // would be sent and reported "updated" on every run without ever
-        // landing. Refuse it before anything is written.
-        const teamLists = [
-          a.pushWhitelistTeams,
-          a.mergeWhitelistTeams,
-          a.approvalsWhitelistTeams,
-        ];
-        if (teamLists.some((t) => t !== undefined)) {
-          const org = await callTolerant(g, {
-            method: "GET",
-            path: `/api/v1/orgs/${enc(a.owner)}`,
-          }, [404]);
-          if (org.status === 404) {
-            throw new Error(
-              `"${a.owner}" is not an organization: team whitelists apply ` +
-                `only to organization repositories. Use the *Usernames ` +
-                `lists for ${full}.`,
-            );
-          }
-        }
         const probe = await callTolerant(g, {
           method: "GET",
           path: `${base}/${enc(a.rule)}`,
@@ -2258,11 +2243,41 @@ export const model = {
             action = "unchanged";
           }
         }
+        const info = toProtectionInfo(full, rule, action);
         const handle = await context.writeResource(
           "branch_protection",
           dataName("branch_protection", ...repoKey(full), a.rule),
-          toProtectionInfo(full, rule, action),
+          info,
         );
+        // Forgejo drops team names it cannot apply without an error: every
+        // team on a user's repo, and a team with no access to the repo. The
+        // rule as written is recorded above; a dropped team fails the run
+        // so it is not mistaken for converged, and would not converge on a
+        // re-run either.
+        const teamChecks: [string, string[] | undefined, string[]][] = [
+          ["pushWhitelistTeams", a.pushWhitelistTeams, info.pushWhitelistTeams],
+          [
+            "mergeWhitelistTeams",
+            a.mergeWhitelistTeams,
+            info.mergeWhitelistTeams,
+          ],
+          [
+            "approvalsWhitelistTeams",
+            a.approvalsWhitelistTeams,
+            info.approvalsWhitelistTeams,
+          ],
+        ];
+        for (const [field, wanted, applied] of teamChecks) {
+          if (wanted !== undefined && !sameNames(wanted, applied)) {
+            throw new Error(
+              `Forgejo did not apply ${field} on ${full} (${a.rule}): ` +
+                `asked for [${wanted.join(", ")}], the rule has ` +
+                `[${applied.join(", ")}]. Team lists apply only to an ` +
+                `organization's repositories, and only to teams with ` +
+                `access to the repository.`,
+            );
+          }
+        }
         return { dataHandles: [handle] };
       },
     },

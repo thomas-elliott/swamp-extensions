@@ -2188,11 +2188,15 @@ Deno.test("branch_protection_ensure converges a whitelist as an exact set", asyn
   }
 });
 
-// Forgejo ignores team names on a user's repo, so sending them would report
-// "updated" on every run without the rule ever changing.
-Deno.test("branch_protection_ensure refuses team lists on a user's repo", async () => {
-  // Every GET is a 404: /orgs/alice does not exist, so alice is a user.
-  const { caller, calls } = makeFakeApi(() => undefined);
+// Forgejo drops team names it cannot apply (every team on a user's repo)
+// without an error, so a run must not report that as converged.
+Deno.test("branch_protection_ensure fails when Forgejo drops a team list", async () => {
+  // No rule yet; the created rule comes back without the team.
+  const { caller } = makeFakeApi((c) =>
+    c.method === "GET"
+      ? undefined
+      : { rule_name: "main", approvals_whitelist_teams: [] }
+  );
   __setCaller(caller);
   try {
     const { context, written } = makeContext();
@@ -2207,21 +2211,25 @@ Deno.test("branch_protection_ensure refuses team lists on a user's repo", async 
           },
           context,
         ),
-      /not an organization/,
+      /did not apply approvalsWhitelistTeams/,
     );
-    assert(!calls.some((c) => c.method !== "GET"), "nothing may be written");
-    assertEquals(written.length, 0);
+    // The rule as Forgejo holds it is still recorded.
+    assertEquals(written.length, 1);
+    assertEquals(written[0].data.approvalsWhitelistTeams, []);
   } finally {
     __setCaller(null);
   }
 });
 
 Deno.test("branch_protection_ensure sends the team, merge and approvals whitelists on create", async () => {
-  // The org exists; the rule does not yet.
+  // No rule yet; the created rule comes back with the teams applied.
   const { caller, calls } = makeFakeApi((c) =>
-    c.method === "GET"
-      ? (c.path === "/api/v1/orgs/apps" ? { username: "apps" } : undefined)
-      : { rule_name: "main" }
+    c.method === "GET" ? undefined : {
+      rule_name: "main",
+      push_whitelist_teams: ["Owners"],
+      merge_whitelist_teams: ["Owners"],
+      approvals_whitelist_teams: ["Reviewers"],
+    }
   );
   __setCaller(caller);
   try {
@@ -2268,7 +2276,11 @@ Deno.test("branch_protection_ensure compares team lists as sets", async () => {
         push_whitelist_teams: ["owners", "release"],
         approvals_whitelist_teams: ["owners"],
       }
-      : { rule_name: "main" }
+      : {
+        rule_name: "main",
+        push_whitelist_teams: ["owners", "release"],
+        approvals_whitelist_teams: ["owners", "agents"],
+      }
   );
   __setCaller(caller);
   try {
