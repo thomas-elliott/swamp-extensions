@@ -214,7 +214,7 @@ const SettingsInfo = z.object({
 
 const StateResult = z.object({
   kind: z.string().describe(
-    "account | account-role | domain | server | certificates",
+    "account | account-password | account-role | domain | server | certificates",
   ),
   id: z.string(),
   state: z.string(),
@@ -672,6 +672,15 @@ async function listAll(
     `${type}/query returned more than ${MAX_LIST_PAGES} pages; ` +
       "refusing to return a partial list",
   );
+}
+
+/**
+ * The index after the highest one in a `List<T>` wire object, which Stalwart
+ * sends as a map keyed "0", "1", …; an entry added there is appended.
+ */
+function nextListKey(list: Record<string, unknown>): string {
+  const indexes = Object.keys(list).map(Number).filter(Number.isInteger);
+  return String(indexes.length ? Math.max(...indexes) + 1 : 0);
 }
 
 /** Keys of a Stalwart `Map<T>`/`List<T>` wire object (`{}` → `[]`). */
@@ -1210,6 +1219,15 @@ const AccountSetStateArgs = z.object({
   ),
 });
 
+const AccountSetPasswordArgs = z.object({
+  account: z.string().describe(
+    "Account: full address, or a local part that only one account has",
+  ),
+  password: z.string().min(1).meta({ sensitive: true }).describe(
+    "New password (hashed by Stalwart; never read back). Pass a vault reference.",
+  ),
+});
+
 // ─────────────────────────── model ───────────────────────────
 
 type Ctx = MethodContext<GlobalArgsT>;
@@ -1256,7 +1274,7 @@ function globalsOf(context: Pick<Ctx, "globalArgs" | "logger">): GlobalArgsT {
  */
 export const model = {
   type: "@thomas/stalwart",
-  version: "2026.11.16.1",
+  version: "2026.11.19.1",
   globalArguments: GlobalArgs,
   upgrades: [
     {
@@ -1294,6 +1312,14 @@ export const model = {
       toVersion: "2026.11.16.1",
       description:
         "Adds update_apps, which downloads the admin and account web UI again. Global arguments and stored data are unchanged.",
+      upgradeAttributes: (
+        old: Record<string, unknown>,
+      ): Record<string, unknown> => old,
+    },
+    {
+      toVersion: "2026.11.19.1",
+      description:
+        "Adds account_set_password, which sets an existing account's password. Global arguments and stored data are unchanged.",
       upgradeAttributes: (
         old: Record<string, unknown>,
       ): Record<string, unknown> => old,
@@ -2533,6 +2559,104 @@ export const model = {
         logInfo(context, "Account {account}: {action}", {
           account: accountKey(acct),
           action,
+        });
+        return { dataHandles: [handle] };
+      },
+    },
+    account_set_password: {
+      description:
+        "Set an individual account's login password, replacing any it had. " +
+        "Changes only the secret of its Password credential (or adds one when " +
+        "it has none), so app passwords, API keys and the password's OTP and " +
+        "IP settings are kept. Not idempotent: Stalwart cannot be asked whether " +
+        "the password already matches, so every run writes it. The old " +
+        "password cannot be recovered. The password is never read back or " +
+        "recorded.",
+      arguments: AccountSetPasswordArgs,
+      execute: async (
+        rawArgs,
+        context,
+      ): Promise<{ dataHandles: DataHandle[] }> => {
+        const a = AccountSetPasswordArgs.parse(rawArgs);
+        const g = globalsOf(context);
+        const accountId = await resolveAccountId(g);
+        logInfo(context, "Setting the password of {account}", {
+          account: a.account,
+        });
+        // Find the account without its credentials, then read the credentials
+        // of that one account only, rather than of every account.
+        const accounts = await listAll(g, JMAP_TYPES.account, accountId, [
+          "id",
+          "@type",
+          "name",
+          "emailAddress",
+        ]);
+        const acct = findAccount(accounts, a.account);
+        if (acct["@type"] !== "User") {
+          throw new Error(
+            `${
+              accountKey(acct)
+            } is not an individual account, so it has no password`,
+          );
+        }
+        const [full] = await jmapGet(g, JMAP_TYPES.account, {
+          accountId,
+          ids: [String(acct.id)],
+          properties: ["id", "credentials"],
+        });
+        // `credentials` is a List<Credential>, sent as a map of index → entry.
+        // Patching only the Password entry's secret, rather than the whole
+        // list, keeps the account's app passwords and API keys. A missing
+        // list must not be read as empty: appending at index 0 would then
+        // overwrite whatever entry is really there.
+        const creds = full?.credentials;
+        if (!creds || typeof creds !== "object") {
+          throw new Error(
+            `Stalwart did not return the credentials of ${
+              accountKey(acct)
+            }, so the password entry cannot be found safely`,
+          );
+        }
+        const credList = creds as Record<string, Json>;
+        const passwordKeys = Object.keys(credList).filter((k) =>
+          credList[k]?.["@type"] === "Password"
+        );
+        // With two Password entries, changing one would leave the other's
+        // password still able to log in.
+        if (passwordKeys.length > 1) {
+          throw new Error(
+            `${accountKey(acct)} has ${passwordKeys.length} passwords; ` +
+              "remove the extra ones in Stalwart first",
+          );
+        }
+        const passwordKey = passwordKeys[0];
+        const patch: Json = passwordKey !== undefined
+          ? { [`credentials/${passwordKey}/secret`]: a.password }
+          : {
+            [`credentials/${nextListKey(credList)}`]: {
+              "@type": "Password",
+              secret: a.password,
+            },
+          };
+        const res = await jmapSet(g, JMAP_TYPES.account, {
+          accountId,
+          update: { [String(acct.id)]: patch },
+        });
+        const err = setItemError(res, String(acct.id));
+        if (err) throw new Error(`Could not set the password: ${err}`);
+        const handle = await context.writeResource(
+          "state-result",
+          dataName("state-result", `password:${accountKey(acct)}`),
+          {
+            kind: "account-password",
+            id: accountKey(acct),
+            state: passwordKey !== undefined ? "replaced" : "added",
+            action: passwordKey !== undefined ? "updated" : "created",
+            timestamp: nowIso(),
+          },
+        );
+        logInfo(context, "Password of {account} set", {
+          account: accountKey(acct),
         });
         return { dataHandles: [handle] };
       },

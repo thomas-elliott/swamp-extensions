@@ -1286,6 +1286,132 @@ Deno.test("account_set_state: disable replaces permissions with an empty set", a
   }
 });
 
+Deno.test("account_set_password: patches only the Password secret, keeping other credentials", async () => {
+  const { setCalls } = makeTypedJmap({
+    "x:Account": [{
+      id: "a1",
+      "@type": "User",
+      name: "x",
+      emailAddress: "x@example.com",
+      credentials: {
+        "0": { "@type": "AppPassword", description: "phone" },
+        "1": { "@type": "Password", allowedIps: {} },
+      },
+    }],
+  });
+  try {
+    const { context, written } = makeContext();
+    await method("account_set_password").execute(
+      { account: "x@example.com", password: "new-secret" },
+      context,
+    );
+    assertEquals((setCalls[0].args.update as Json).a1, {
+      "credentials/1/secret": "new-secret",
+    });
+    assertEquals(written[0].data.action, "updated");
+    // The record names the account, never the password.
+    assertEquals(JSON.stringify(written).includes("new-secret"), false);
+  } finally {
+    __setJmap(null);
+    __setRest(null);
+  }
+});
+
+Deno.test("account_set_password: an account with no password gets one appended", async () => {
+  const { setCalls } = makeTypedJmap({
+    "x:Account": [{
+      id: "a1",
+      "@type": "User",
+      name: "x",
+      emailAddress: "x@example.com",
+      // Keys with a gap, so the new entry must go after the highest index
+      // rather than at the count of entries, which would overwrite "2".
+      credentials: {
+        "0": { "@type": "ApiKey", description: "ci" },
+        "2": { "@type": "AppPassword", description: "phone" },
+      },
+    }],
+  });
+  try {
+    const { context, written } = makeContext();
+    await method("account_set_password").execute(
+      { account: "x", password: "new-secret" },
+      context,
+    );
+    assertEquals((setCalls[0].args.update as Json).a1, {
+      "credentials/3": { "@type": "Password", secret: "new-secret" },
+    });
+    assertEquals(written[0].data.action, "created");
+  } finally {
+    __setJmap(null);
+    __setRest(null);
+  }
+});
+
+// Each case must be refused before anything is written: guessing would risk
+// overwriting an app password or leaving an old password able to log in.
+for (
+  const [label, credentials, error] of [
+    ["credentials not returned", undefined, /did not return the credentials/],
+    ["two Password entries", {
+      "0": { "@type": "Password" },
+      "1": { "@type": "Password" },
+    }, /has 2 passwords/],
+  ] as const
+) {
+  Deno.test(`account_set_password: ${label} is refused`, async () => {
+    const acct: Json = {
+      id: "a1",
+      "@type": "User",
+      name: "x",
+      emailAddress: "x@example.com",
+    };
+    if (credentials) acct.credentials = credentials;
+    const { setCalls } = makeTypedJmap({ "x:Account": [acct] });
+    try {
+      const { context } = makeContext();
+      await rejects(
+        () =>
+          method("account_set_password").execute(
+            { account: "x@example.com", password: "p" },
+            context,
+          ),
+        error,
+      );
+      assertEquals(setCalls.length, 0);
+    } finally {
+      __setJmap(null);
+      __setRest(null);
+    }
+  });
+}
+
+Deno.test("account_set_password: a group is refused", async () => {
+  const { setCalls } = makeTypedJmap({
+    "x:Account": [{
+      id: "g1",
+      name: "team",
+      emailAddress: "team@example.com",
+      "@type": "Group",
+    }],
+  });
+  try {
+    const { context } = makeContext();
+    await rejects(
+      () =>
+        method("account_set_password").execute(
+          { account: "team@example.com", password: "p" },
+          context,
+        ),
+      /not an individual account/,
+    );
+    assertEquals(setCalls.length, 0);
+  } finally {
+    __setJmap(null);
+    __setRest(null);
+  }
+});
+
 Deno.test("group_list: only @type=Group accounts; mailing_list_list maps recipients", async () => {
   makeTypedJmap({
     "x:Domain": [{ id: "d1", name: "X.test" }, { id: "d2", name: "y.test" }],

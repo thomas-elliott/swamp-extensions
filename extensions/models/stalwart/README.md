@@ -80,9 +80,10 @@ swamp model create @thomas/stalwart stalwart \
 
 - `account_ensure`: an individual mailbox with its `aliases`, role, group
   membership (`memberOf`) and description. An optional password is set once, on
-  create; for an existing account it is ignored and a warning is logged. When
-  the alias list is rewritten, an alias the account already has keeps its
-  description and its enabled flag; a new alias is enabled.
+  create; for an existing account it is ignored and a warning is logged (use
+  `account_set_password`). When the alias list is rewritten, an alias the
+  account already has keeps its description and its enabled flag; a new alias
+  is enabled.
 - `group_ensure`, `mailing_list_ensure`: by address.
 - `role_ensure`: by name, from a `preset` (`swamp-admin` | `automated-mailbox`)
   or an explicit permission list. The names `admin` and `user` are refused,
@@ -103,9 +104,19 @@ swamp model create @thomas/stalwart stalwart \
   installs it. The record holds the certificate's `issuer`, `sans`, `notBefore`
   and `notAfter`.
 
-`role_assign` and `account_set_state` take a full address, or a bare local part
-when only one account has it. A local part shared by accounts on different
-domains is refused.
+**Passwords:** `account_set_password` sets an individual account's login
+password, replacing any it had. It changes only the secret of the account's
+Password credential, or adds one when there is none, so app passwords, API keys
+and the password's OTP and IP settings are kept. It writes on every run, because
+Stalwart cannot be asked whether the password already matches, and the old
+password cannot be recovered. A group is refused, and so is an account with
+more than one password or whose credentials Stalwart does not return. Pass the
+password as a vault reference; the record (`state-result:password:<address>`)
+never holds it.
+
+`role_assign`, `account_set_state` and `account_set_password` take a full
+address, or a bare local part when only one account has it. A local part shared
+by accounts on different domains is refused.
 
 **Reversible state changes:** `domain_set_state`, `account_set_state`.
 
@@ -138,7 +149,7 @@ case-insensitive.
 | `settings`     | `settings:<kind>`, e.g. `settings:http`                                                                                                                    |
 | `certificate`  | `certificate:<id>`                                                                                                                                         |
 | `probe`        | `probe:<type>`, e.g. `probe:x:Domain`                                                                                                                      |
-| `state-result` | `state-result:domain:<domain>`, `state-result:account:<address>`, `state-result:role:<address>`, `state-result:reload`, `state-result:reload-certificates`, `state-result:update-apps` |
+| `state-result` | `state-result:domain:<domain>`, `state-result:account:<address>`, `state-result:password:<address>`, `state-result:role:<address>`, `state-result:reload`, `state-result:reload-certificates`, `state-result:update-apps` |
 | `health`       | `health`                                                                                                                                                   |
 | `session`      | `session`                                                                                                                                                  |
 

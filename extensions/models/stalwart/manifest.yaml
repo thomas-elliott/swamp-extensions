@@ -1,6 +1,6 @@
 manifestVersion: 1
 name: "@thomas/stalwart"
-version: 2026.11.16.1
+version: 2026.11.19.1
 description: >-
   Non-destructive administration of a Stalwart mail server (0.16 and v1) over its
   JMAP-over-HTTP management API, authenticated with a scoped admin API key.
